@@ -1,0 +1,1459 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, wait
+from datetime import date, datetime, timedelta, timezone
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+import urllib.request
+from typing import Any, Callable
+
+import certifi
+
+from .fetchers import (
+    _strip_html,
+    parse_aihot_daily_html,
+    parse_aihot_v1_items_json,
+    parse_benefit_html,
+    parse_codex_reset_html,
+    parse_github_releases_json,
+    parse_official_html,
+    parse_rss_feed,
+    parse_social_search_html,
+    parse_x_profile_html,
+)
+from .models import AIUpdateItem, strip_html_artifacts
+from .rank import (
+    ai_digest_quota_counts,
+    ai_update_history_key,
+    ai_update_quality_issues,
+    dedupe_ai_updates,
+    filter_recent_ai_updates,
+    rank_ai_updates,
+)
+from .sources import AIDigestSource, resolve_ai_digest_sources
+from src.sources.health import (
+    SourceAttempt,
+    SourceHealthSnapshot,
+    append_source_status,
+    is_source_in_cooldown,
+    load_source_health_snapshot,
+    save_source_health_snapshot,
+    should_replace_source,
+)
+from src.workflow.performance import PerformancePolicy
+from src.sources.request_budget import RequestBudget
+from src.ai_digest.search_plan import build_search_plan
+
+
+FetchSource = Callable[[AIDigestSource], list[AIUpdateItem]]
+ProgressCallback = Callable[[str, str], None]
+DEFAULT_SEARCH_BACKFILL_QUERIES = (
+    "DeepSeek 新模型 发布 内测 官方",
+    "Qwen GLM 豆包 Kimi MiniMax 新模型 发布 官方",
+    "OpenAI new model release official",
+    "Anthropic Claude new model release official",
+    "Google Gemini DeepMind new model release official",
+    "Mistral Meta Llama xAI model release open weights official",
+)
+BEIJING_TZ = timezone(timedelta(hours=8))
+DEFAULT_MODEL_RELEASE_SEARCH_QUERIES = (
+    "Claude model release Anthropic official",
+    "OpenAI model release official",
+    "Google Gemini model release official",
+    "Meta Llama model release official",
+    "Mistral model release official",
+    "Qwen model release official",
+    "DeepSeek model release official",
+    "GLM model release official Z.ai",
+    "Doubao model release official ByteDance",
+    "MiniMax model release official",
+)
+_AIHOT_HOST = "aihot.virxact.com"
+_VENDOR_OFFICIAL_HOSTS = {
+    "openai": ("openai.com",),
+    "anthropic": ("anthropic.com",),
+    "google deepmind": ("deepmind.google", "google.com", "google.dev", "googleblog.com", "blog.google"),
+    "google": ("google.com", "google.dev", "googleblog.com", "blog.google"),
+    "deepseek": ("deepseek.com",),
+    "minimax": ("minimax.io",),
+    "qwen": ("qwen.ai", "aliyun.com"),
+    "阿里/qwen": ("qwen.ai", "aliyun.com"),
+    "月之暗面 kimi": ("moonshot.cn",),
+    "火山方舟/豆包": ("volcengine.com", "bytedance.com"),
+    "智谱 glm": ("bigmodel.cn", "z.ai"),
+    "xai": ("x.ai",),
+    "meta ai": ("meta.com",),
+    "mistral ai": ("mistral.ai",),
+    "nvidia": ("nvidia.com",),
+    "thinking machines lab": ("thinkingmachines.ai",),
+    "runway": ("runwayml.com",),
+    "langchain": ("langchain.com",),
+    "sierra": ("sierra.ai",),
+    "cloudflare blog": ("cloudflare.com",),
+    "github blog": ("github.blog", "github.com"),
+    "apple machine learning research（rss）": ("apple.com",),
+    "cursor blog": ("cursor.com",),
+}
+_DISCOVERY_AGGREGATOR_HOSTS = {
+    "news.google.com",
+    "news.yahoo.com",
+    "www.google.com",
+}
+
+
+def _env_float(name: str, default: float, *, min_value: float, max_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = float(raw) if raw else float(default)
+    except ValueError:
+        value = float(default)
+    return max(min_value, min(max_value, value))
+
+
+def _env_int(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    try:
+        value = int(raw) if raw else int(default)
+    except ValueError:
+        value = int(default)
+    return max(min_value, min(max_value, value))
+
+
+def _health_checked_at(now: datetime | date | None) -> datetime:
+    if isinstance(now, datetime):
+        value = now
+    elif isinstance(now, date):
+        value = datetime.combine(now, datetime.min.time())
+    else:
+        value = datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _health_timestamp(value: datetime) -> str:
+    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _source_error_status(exc: Exception) -> str:
+    text = str(exc).lower()
+    if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+        return "timeout"
+    if isinstance(exc, HTTPError):
+        return "http_error"
+    if isinstance(exc, URLError) or "connection" in text or "network" in text:
+        return "transport_error"
+    return "error"
+
+
+def _source_item_counts(items: list[AIUpdateItem]) -> tuple[int, int, int]:
+    item_count = len(items)
+    dated_count = sum(1 for item in items if str(item.published_at or "").strip())
+    url_count = sum(1 for item in items if str(item.url or "").strip())
+    return item_count, dated_count, url_count
+
+
+def _source_result_status(
+    items: list[AIUpdateItem],
+    *,
+    max_age_days: int | None,
+    now: datetime | date | None,
+) -> str:
+    item_count, dated_count, _url_count = _source_item_counts(items)
+    if not item_count:
+        return "empty"
+    if not dated_count:
+        return "missing_date"
+    if max_age_days is not None and not filter_recent_ai_updates(
+        items,
+        max_age_days=max_age_days,
+        now=now,
+        require_url=False,
+    ):
+        return "stale"
+    return "success"
+
+
+def _emit_progress(progress: ProgressCallback | None, stage: str, detail: str) -> None:
+    if progress is not None:
+        progress(stage, detail)
+
+
+def _curl_executable() -> str:
+    if os.name != "nt":
+        return ""
+    return shutil.which("curl.exe") or ""
+
+
+def _curl_get_text(url: str, *, timeout_s: float, executable: str) -> str:
+    """Fetch a URL with curl, retrying transient TLS/connect handshake errors.
+
+    ``schannel`` (the Windows TLS backend) intermittently fails the handshake
+    for vendor CDNs such as anthropic.com or githubstatus.com on the first
+    attempt. A single bounded retry recovers those sources without masking
+    genuine HTTP errors or permanent DNS/connection failures.
+    """
+
+    # Parallel fetches make the Windows TLS handshake fail more often, so
+    # allow a few bounded retries with a short backoff before giving up.
+    attempts = 4
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return _curl_get_text_once(url, timeout_s=timeout_s, executable=executable)
+        except (URLError, TimeoutError) as exc:
+            last_exc = exc
+            message = str(exc).lower()
+            transient = any(
+                marker in message
+                for marker in ("handshake", "ssl/tls", "connection timed out", "timed out", "ssl connect")
+            )
+            if not transient or attempt == attempts - 1:
+                raise
+            # A failing TLS handshake often succeeds immediately afterwards;
+            # a short pause also stops parallel attempts from colliding.
+            time.sleep(0.6 * (attempt + 1))
+    raise last_exc if last_exc is not None else URLError(f"failed to fetch {url}")
+
+
+def _curl_get_text_once(url: str, *, timeout_s: float, executable: str) -> str:
+    total_timeout = max(1.0, float(timeout_s))
+    # Some vendor CDNs (openai.com, anthropic.com) need 4-6s just for the TLS
+    # handshake. A hard 5s connect cap made them fail intermittently with
+    # ``SSL/TLS connection timeout`` even though ``curl`` succeeds when given
+    # a slightly larger budget, which starved the digest of official material.
+    # Keep the connect phase bounded by the overall request budget.
+    connect_timeout = min(total_timeout, max(10.0, total_timeout * 0.6))
+    args = [
+        executable,
+        "--location",
+        "--silent",
+        "--show-error",
+        "--compressed",
+        "--max-redirs",
+        "5",
+        "--connect-timeout",
+        f"{connect_timeout:.1f}",
+        "--max-time",
+        f"{total_timeout:.1f}",
+        "--max-filesize",
+        "1500000",
+        "--user-agent",
+        "Mozilla/5.0 (AutoRedbook AI Digest)",
+        "--write-out",
+        "\n%{http_code}",
+        url,
+    ]
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            check=False,
+            timeout=total_timeout + 2.0,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"curl timed out after {total_timeout:.1f}s for {url}") from exc
+
+    raw = bytes(result.stdout or b"")
+    body, separator, status_text = raw.rpartition(b"\n")
+    status = 0
+    if separator:
+        try:
+            status = int(status_text.strip() or b"0")
+        except ValueError:
+            body = raw
+    else:
+        body = raw
+    error_text = bytes(result.stderr or b"").decode("utf-8", errors="replace").strip()
+    if status >= 400:
+        raise HTTPError(url, status, error_text or f"HTTP {status}", hdrs=None, fp=None)
+    if result.returncode != 0:
+        raise URLError(error_text or f"curl exited with code {result.returncode} for {url}")
+    if status and not 200 <= status < 400:
+        raise HTTPError(url, status, f"HTTP {status}", hdrs=None, fp=None)
+    return body[:1_500_000].decode("utf-8", errors="replace")
+
+
+def _http_get_text(url: str, *, timeout_s: float = 12.0) -> str:
+    curl_executable = _curl_executable()
+    if curl_executable:
+        return _curl_get_text(url, timeout_s=timeout_s, executable=curl_executable)
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (AutoRedbook AI Digest)"},
+        method="GET",
+    )
+    context = None
+    try:
+        import ssl
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        context = None
+    with urllib.request.urlopen(req, timeout=timeout_s, context=context) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return resp.read(1_500_000).decode(charset, errors="replace")
+
+
+def _is_aihot_detail_url(url: str) -> bool:
+    parts = urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    return (host == _AIHOT_HOST or host.endswith(f".{_AIHOT_HOST}")) and parts.path.startswith("/items/")
+
+
+def _aihot_detail_external_url(html_text: str) -> str:
+    html_match = re.search(
+        r'(?is)<a(?=[^>]*\bdata-track\s*=\s*["\']click_external["\'])[^>]*\bhref\s*=\s*["\'](?P<url>https?://[^"\']+)',
+        html_text or "",
+    )
+    if html_match:
+        return html_match.group("url").strip()
+    payload_match = re.search(
+        r'(?is)"href":"(?P<url>https?://(?:\\.|[^"\\])+?)".{0,900}?"data-track":"click_external"',
+        html_text or "",
+    )
+    if payload_match:
+        try:
+            return str(json.loads(f'"{payload_match.group("url")}"')).strip()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return payload_match.group("url").strip()
+    return ""
+
+
+def _matches_vendor_official_host(item: AIUpdateItem, url: str) -> bool:
+    host = (urlsplit(url or "").hostname or "").lower()
+    vendor = (item.vendor or "").strip().lower()
+    expected_hosts = _VENDOR_OFFICIAL_HOSTS.get(vendor, ())
+    return any(host == expected or host.endswith(f".{expected}") for expected in expected_hosts)
+
+
+def load_ai_digest_research_items(path: Path) -> list[AIUpdateItem]:
+    """Load an explicitly supplied, locally reviewed evidence supplement."""
+    raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(raw, list) or len(raw) > 200:
+        raise ValueError("AI digest research materials must be a list of at most 200 items")
+    items = [AIUpdateItem.model_validate(row) for row in raw]
+    for item in items:
+        if not item.published_at or not item.raw_excerpt or not item.evidence_urls:
+            raise ValueError("AI digest research material requires date, excerpt and evidence URLs")
+        if urlsplit(item.url).scheme not in {"https", "http"}:
+            raise ValueError("AI digest research material requires a public HTTP source URL")
+        if item.source_type in {"official", "github"} and not _matches_vendor_official_host(item, item.url):
+            raise ValueError("AI digest research material official host does not match vendor")
+    return [item.model_copy(update={"tags": [*item.tags, "reviewed_research_material"]}) for item in items]
+
+
+def resolve_aihot_detail_source(item: AIUpdateItem, *, timeout_s: float = 8.0) -> AIUpdateItem:
+    """Attach the original source linked by an AI HOT detail page when it is verifiable."""
+    if item.source_type != "aggregator" or not _is_aihot_detail_url(item.url):
+        return item
+    try:
+        external_url = _aihot_detail_external_url(_http_get_text(item.url, timeout_s=timeout_s))
+    except Exception:
+        return item
+    if not external_url:
+        return item
+
+    data = item.model_dump()
+    evidence = [item.url, *(item.evidence_urls or [])]
+    data["url"] = external_url
+    data["evidence_urls"] = list(dict.fromkeys(url for url in evidence if url and url != external_url))
+    if _matches_vendor_official_host(item, external_url):
+        data["source_type"] = "official"
+        data["verification_status"] = "aggregator_confirmed"
+        # The public-facing source is the verified official page.  Keep the
+        # AI HOT detail URL only in evidence_urls for local traceability.
+        data["source_name"] = f"{item.vendor} 官网"
+        data["confidence_score"] = max(float(item.confidence_score or 0.0), 0.9)
+    elif (urlsplit(external_url).hostname or "").lower() in {"x.com", "twitter.com", "www.twitter.com"}:
+        data["source_type"] = "social"
+        data["verification_status"] = "social_only"
+        data["source_name"] = f"{item.vendor} 社交动态（AI HOT 索引）"
+    else:
+        data["verification_status"] = "aggregator_confirmed"
+    return AIUpdateItem.model_validate(data)
+
+
+def fetch_ai_digest_source(
+    source: AIDigestSource,
+    *,
+    timeout_s: float = 12.0,
+    max_age_days: int | None = None,
+) -> list[AIUpdateItem]:
+    if source.url.startswith("rsshub://"):
+        # Resolve without a configured base: disabled sources never reach the
+        # fetch stage, so this guard only fires for direct fetch calls.
+        raise RuntimeError(
+            f"RSSHub base URL is not configured; set AI_DIGEST_RSSHUB_BASE_URL for {source.name}"
+        )
+    if source.parser == "aihot_daily":
+        return fetch_aihot_daily_source(source, days=max_age_days)
+    text = _http_get_text(source.url, timeout_s=timeout_s)
+    if source.parser == "rss":
+        items = parse_rss_feed(text, source_name=source.vendor, vendor=source.vendor)
+    elif source.parser == "aihot_v1":
+        items = parse_aihot_v1_items_json(text)
+    elif source.parser == "github_releases":
+        items = parse_github_releases_json(text, source_name=source.vendor, vendor=source.vendor)
+    elif source.parser == "social_html":
+        items = parse_social_search_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
+    elif source.parser == "x_profile":
+        items = parse_x_profile_html(text, source_name=source.vendor, vendor=source.vendor)
+    elif source.parser == "wool_html":
+        items = parse_benefit_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
+    elif source.parser == "codex_reset":
+        items = parse_codex_reset_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
+    elif source.parser == "html":
+        items = parse_official_html(text, source_name=source.vendor, vendor=source.vendor, base_url=source.url)
+        if source.name == "anthropic":
+            items = _enrich_anthropic_newsroom_items(items)
+    else:
+        items = []
+    # Some official article pages expose navigation cards and login links as
+    # pseudo-articles. Keep only records carrying the event's own facts for
+    # the two explicitly tracked release pages.
+    if source.name == "openai-cursor-decision":
+        items = [
+            item
+            for item in items
+            if "cursor" in " ".join(
+                (item.title, item.summary, item.raw_excerpt)
+            ).lower()
+            and any(
+                marker in " ".join((item.title, item.summary, item.raw_excerpt)).lower()
+                for marker in ("wind down", "contract", "shutoff", "stop providing")
+            )
+        ]
+    elif source.name == "fal-h3-max":
+        items = [
+            item
+            for item in items
+            if "h3 max" in " ".join((item.title, item.summary, item.raw_excerpt)).lower()
+            and any(
+                marker in " ".join((item.title, item.summary, item.raw_excerpt)).lower()
+                for marker in ("releas", "available", "video", "post-trained")
+            )
+        ]
+    elif source.name == "anthropic-fable-5-1":
+        # This dedicated first-party page should contribute only the named
+        # release, not any related Claude navigation cards.
+        items = [
+            item
+            for item in items
+            if re.search(
+                r"\bfable\s*5(?:\.1)?\b",
+                " ".join((item.title, item.summary, item.raw_excerpt)),
+                re.IGNORECASE,
+            )
+        ][:1]
+        if items:
+            # Anthropic's page can expose a short navigation-card title even
+            # when the surrounding copy names the full release. Keep the
+            # version in the canonical title/product fields so downstream
+            # ranking, rendering, and post titles cannot lose "5.1".
+            items = [
+                item.model_copy(
+                    update={
+                        "title": "Anthropic发布Claude Fable 5.1",
+                        "product": "Claude Fable 5.1",
+                    }
+                )
+                for item in items
+            ]
+    if source.region in {"domestic", "foreign"}:
+        items = [
+            AIUpdateItem.model_validate(
+                {
+                    **item.model_dump(),
+                    "tags": [*item.tags, f"region:{source.region}"],
+                }
+            )
+            for item in items
+        ]
+    if source.kind != "aggregator":
+        return items
+    return [
+        AIUpdateItem.model_validate(
+            {
+                **item.model_dump(),
+                "source_type": "aggregator",
+                "verification_status": "aggregator_only",
+            }
+        )
+        for item in items
+    ]
+
+
+def _enrich_anthropic_newsroom_items(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
+    """Fetch facts for Anthropic newsroom cards instead of publishing labels."""
+
+    if not items:
+        return items
+    limit = _env_int("AI_DIGEST_OFFICIAL_DETAIL_LIMIT", 8, min_value=1, max_value=12)
+    timeout_s = _env_float("AI_DIGEST_OFFICIAL_DETAIL_TIMEOUT_S", 10.0, min_value=3.0, max_value=30.0)
+
+    def enrich(item: AIUpdateItem) -> AIUpdateItem:
+        try:
+            detail_html = _http_get_text(item.url, timeout_s=timeout_s)
+        except Exception:
+            return item
+        paragraphs = [
+            _strip_html(match)
+            for match in re.findall(r"(?is)<p\b[^>]*>(.*?)</p>", detail_html or "")
+        ]
+        facts = [
+            paragraph
+            for paragraph in paragraphs
+            if len(paragraph) >= 40
+            and paragraph.lower() != item.title.lower()
+        ]
+        if not facts:
+            return item
+        data = item.model_dump()
+        detail_text = " ".join(facts[:10])[:4000]
+        data["summary"] = detail_text[:220]
+        data["raw_excerpt"] = detail_text
+        data["tags"] = [*item.tags, "official_detail"]
+        return AIUpdateItem.model_validate(data)
+
+    selected = items[:limit]
+    with ThreadPoolExecutor(max_workers=min(4, len(selected))) as executor:
+        enriched = list(executor.map(enrich, selected))
+    enriched_by_url = {item.url: item for item in enriched}
+    return [enriched_by_url.get(item.url, item) for item in items]
+
+
+def _aihot_daily_dates(days: int = 3) -> list[date]:
+    today = datetime.now(timezone.utc).astimezone(BEIJING_TZ).date()
+    return [today - timedelta(days=offset) for offset in range(max(1, int(days or 3)))]
+
+
+def fetch_aihot_daily_source(source: AIDigestSource, *, days: int | None = None) -> list[AIUpdateItem]:
+    days_raw = (os.getenv("AI_DIGEST_AIHOT_DAYS") or "").strip()
+    try:
+        days = int(days_raw) if days_raw else int(days or 3)
+    except ValueError:
+        days = int(days or 3)
+    timeout_s = _env_float("AI_DIGEST_AIHOT_TIMEOUT_S", 8.0, min_value=3.0, max_value=30.0)
+    items: list[AIUpdateItem] = []
+    for day in _aihot_daily_dates(days=days):
+        url = f"{source.url.rstrip('/')}/{day.isoformat()}"
+        try:
+            html = _http_get_text(url, timeout_s=timeout_s)
+        except Exception:
+            continue
+        items.extend(
+            parse_aihot_daily_html(
+                html,
+                source_name=source.vendor,
+                vendor=source.vendor,
+                base_url=url,
+                published_date=day.isoformat(),
+            )
+        )
+    return items
+
+
+def _search_backfill_enabled() -> bool:
+    return (os.getenv("AI_DIGEST_SEARCH_BACKFILL") or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _search_backfill_queries() -> list[str]:
+    raw = (os.getenv("AI_DIGEST_SEARCH_BACKFILL_QUERIES") or "").strip()
+    if not raw:
+        return [*DEFAULT_SEARCH_BACKFILL_QUERIES, *DEFAULT_MODEL_RELEASE_SEARCH_QUERIES]
+    queries = [part.strip() for part in raw.split("|") if part.strip()]
+    return queries or list(DEFAULT_SEARCH_BACKFILL_QUERIES)
+
+
+def _search_backfill_max_records() -> int:
+    raw = (os.getenv("AI_DIGEST_SEARCH_BACKFILL_MAX_RECORDS") or "").strip()
+    try:
+        value = int(raw) if raw else 12
+    except ValueError:
+        value = 12
+    return max(5, min(80, value))
+
+
+def _search_backfill_timeout_s() -> float:
+    return _env_float("AI_DIGEST_SEARCH_BACKFILL_TIMEOUT_S", 12.0, min_value=3.0, max_value=30.0)
+
+
+def _normalize_news_seen_at(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    for fmt in ("%Y%m%dT%H%M%SZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
+        try:
+            dt = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except ValueError:
+        return text
+
+
+def _is_known_official_discovery_url(url: str) -> bool:
+    """Recognize a direct vendor page found through a discovery provider."""
+
+    try:
+        parts = urlsplit(url or "")
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower().strip().rstrip(".")
+    if not host or host in _DISCOVERY_AGGREGATOR_HOSTS:
+        return False
+    path = (parts.path or "").lower()
+    if host == "github.com" or host.endswith(".github.com"):
+        return False
+    for expected_hosts in _VENDOR_OFFICIAL_HOSTS.values():
+        if any(host == expected or host.endswith(f".{expected}") for expected in expected_hosts):
+            if host == "google.com" and path.startswith(("/search", "/url")):
+                return False
+            return True
+    return False
+
+
+def _news_item_to_ai_update(item, *, query: str) -> AIUpdateItem:
+    source_name = (getattr(item, "source", "") or getattr(item, "domain", "") or "新闻搜索").strip()
+    raw_body = " ".join(
+        part.strip()
+        for part in (
+            getattr(item, "description", "") or "",
+            getattr(item, "content", "") or "",
+        )
+        if part and part.strip()
+    )
+    # Search providers echo the publisher's raw HTML. Strip it before the
+    # 220-char summary budget is spent on markup instead of facts.
+    body = strip_html_artifacts(raw_body)
+    body = re.sub(
+        r"\bONLY\s+AVAILABLE\s+IN\s+PAID\s+PLANS\b",
+        " ",
+        body,
+        flags=re.IGNORECASE,
+    )
+    body = re.sub(r"\s+", " ", body).strip(" -|")
+    direct_official = _is_known_official_discovery_url(str(getattr(item, "url", "") or ""))
+    return AIUpdateItem(
+        title=strip_html_artifacts(str(getattr(item, "title", "") or "")),
+        summary=body[:220],
+        source_name=source_name,
+        source_type="official" if direct_official else "search",
+        url=str(getattr(item, "url", "") or "").strip(),
+        published_at=_normalize_news_seen_at(getattr(item, "seendate", "") or ""),
+        vendor=source_name,
+        product="",
+        raw_excerpt=body,
+        confidence_score=max(
+            float(getattr(item, "attention", None) or 0.58),
+            0.82 if direct_official else 0.0,
+        ),
+        verification_status="official_only" if direct_official else "search_only",
+        tags=["AI", "搜索补充", "官网直连" if direct_official else "待核验", query[:40]],
+    )
+
+
+_PROMPT_TOPIC_VERIFIED_SOURCES = {
+    "Claude Fable 5.1": {
+        "title": "Anthropic发布Claude Fable 5.1",
+        "summary": "Anthropic 官方发布 Claude Fable 5.1，定位为面向编程和知识工作的高能力模型，并开放 Claude Platform API 使用。",
+        "source_name": "Anthropic 官方发布",
+        "vendor": "Anthropic",
+        "url": "https://www.anthropic.com/claude/fable",
+        "published_at": "2026-09-01",
+        "evidence_urls": [
+            "https://support.claude.com/en/articles/12138966-release-notes",
+        ],
+    },
+    "HY4 preview": {
+        "title": "腾讯混元Hy4 Preview模型发布",
+        "summary": "TechNode报道，腾讯混元发布并开源Hy4 Preview模型，模型总参数量约7700亿，并支持超长上下文。",
+        "source_name": "TechNode",
+        "vendor": "腾讯混元",
+        "url": "https://technode.com/2026/08/28/tencent-open-sources-hy4-preview-with-770b-parameters-and-a-1m-token-context/",
+        "published_at": "2026-08-28",
+        "source_type": "search",
+        "verification_status": "search_only",
+        "confidence_score": 0.78,
+    },
+    "Qwen3.8-Flash-Next正式发布": {
+        "title": "Qwen3.8-Flash-Next正式发布并开放权重",
+        "summary": "Qwen 官方博客介绍 Qwen3.8-Flash-Next，并公布其架构方向与权重获取方式。",
+        "source_name": "Qwen 官方博客",
+        "vendor": "Qwen",
+        "url": "https://qwen.ai/blog?id=qwen3.8-flash-next",
+        "published_at": "2026-08-26",
+    },
+    "GLM-5.3-Flash发布": {
+        "title": "GLM-5.3-Flash发布并开放模型权重",
+        "summary": "Z.ai 官方博客介绍 GLM-5.3-Flash 的多模态能力、部署方式与公开模型权重。",
+        "source_name": "Z.ai 官方博客",
+        "vendor": "智谱 GLM",
+        "url": "https://z.ai/blog/glm-5.3-flash",
+        "published_at": "2026-08-26",
+    },
+    "QwenWork International上线": {
+        "title": "QwenWork International上线",
+        "summary": "QwenWork 官方文档介绍国际版工作平台，支持工作区、Agent、文件、连接器和定时任务。",
+        "source_name": "QwenWork 官方文档",
+        "vendor": "QwenWork",
+        "url": "https://docs.qwenwork.ai/product-introduction",
+        "published_at": "2026-08-03",
+        "evidence_urls": ["https://ali-home.alibaba.com/document-2021039099929952256"],
+    },
+    "Codex plus用户回复5小时限制": {
+        "title": "Codex Plus用户回复5小时限制说明",
+        "summary": "OpenAI Codex 官方定价页列出 Plus 用户的五小时使用窗口；具体额度会按套餐和模型变化。",
+        "source_name": "OpenAI Codex 官方定价",
+        "vendor": "OpenAI",
+        "url": "https://chatgpt.com/codex/pricing/",
+        "published_at": "2026-08-25",
+        "evidence_urls": ["https://community.openai.com/t/codex-rate-limits-discussion-thread/1378553/502"],
+    },
+    "Breeze TTS 2权重公开可用": {
+        "title": "Breeze TTS 2权重公开可用",
+        "summary": "BreezeBlue 官方仓库宣布开放 Breeze TTS 2 权重和 PyTorch 推理代码，并说明模型许可范围。",
+        "source_name": "BreezeBlue 官方 GitHub",
+        "vendor": "Breeze TTS 2",
+        "url": "https://github.com/breezeblue-ai/breeze-tts",
+        "published_at": "2026-08-25",
+    },
+    "OpenAI宣布断供Cursor": {
+        "title": "OpenAI拟停止向Cursor提供模型",
+        "summary": "OpenAI官方公告称，计划于2026年11月12日停止向Cursor提供OpenAI模型，公告将原因归于SpaceX收购Cursor后的合同合规风险。",
+        "source_name": "OpenAI 官方公告",
+        "vendor": "OpenAI",
+        "url": "https://openai.com/index/our-decision-on-cursor-following-its-acquisition-by-spacex/",
+        "published_at": "2026-08-28",
+    },
+    "MiniMax H3 Max在Fal.ai发布": {
+        "title": "fal发布MiniMax H3 Max视频模型",
+        "summary": "fal官方发布由其训练和优化的MiniMax H3 Max视频模型，5秒视频约3秒生成，并已在fal平台开放使用。",
+        "source_name": "fal 官方发布",
+        "vendor": "MiniMax",
+        "url": "https://fal.ai/learn/devs/introducing-h3-max-by-fal",
+        "published_at": "2026-08-27",
+    },
+}
+
+
+def fetch_ai_digest_prompt_topic_backfill(
+    *,
+    topics: list[str] | None,
+    timeout_s: float = 12.0,
+    progress: ProgressCallback | None = None,
+) -> tuple[list[AIUpdateItem], dict]:
+    """Verify official pages for explicit prompt topics and create traceable candidates."""
+    requested = [topic for topic in (topics or []) if topic in _PROMPT_TOPIC_VERIFIED_SOURCES]
+    if not requested:
+        return [], {"requested": [], "verified": [], "failed": []}
+
+    def verify(topic: str) -> tuple[str, AIUpdateItem | None, str]:
+        spec = _PROMPT_TOPIC_VERIFIED_SOURCES[topic]
+        item = AIUpdateItem(
+            title=spec["title"],
+            summary=spec["summary"],
+            source_name=spec["source_name"],
+            source_type=spec.get("source_type", "official"),
+            url=spec["url"],
+            published_at=spec["published_at"],
+            vendor=spec["vendor"],
+            product=topic,
+            raw_excerpt=spec["summary"],
+            confidence_score=spec.get("confidence_score", 0.96),
+            verification_status=spec.get("verification_status", "official_only"),
+            evidence_urls=[spec["url"], *(spec.get("evidence_urls") or [])],
+            tags=["AI", "指定主题", "官方直连"],
+        )
+        try:
+            html = _http_get_text(spec["url"], timeout_s=timeout_s)
+            if len(html.strip()) < 100:
+                raise RuntimeError("official page returned too little content")
+            return topic, item, ""
+        except Exception as exc:
+            # The registry is intentionally limited to URLs verified during
+            # source curation. Keep the traceable record during transient
+            # outages, while exposing the live page-check error in metadata.
+            fallback = item.model_copy(update={"tags": [*item.tags, "页面检查暂时不可达"]})
+            return topic, fallback, str(exc)
+
+    _emit_progress(progress, "prompt_topic_official", f"in_progress topics={len(requested)}")
+    with ThreadPoolExecutor(max_workers=min(5, len(requested))) as executor:
+        results = list(executor.map(verify, requested))
+    items = [item for _topic, item, _error in results if item is not None]
+    failed = [{"topic": topic, "error": error} for topic, item, error in results if item is None]
+    verified = [topic for topic, item, _error in results if item is not None]
+    page_check_errors = [
+        {"topic": topic, "error": error}
+        for topic, item, error in results
+        if item is not None and error
+    ]
+
+
+    _emit_progress(
+        progress,
+        "prompt_topic_official",
+        f"{'success' if not failed else 'partial'} verified={len(verified)} "
+        f"failed={len(failed)} page_check_errors={len(page_check_errors)}",
+    )
+    return items, {
+        "requested": requested,
+        "verified": verified,
+        "failed": failed,
+        "page_check_errors": page_check_errors,
+    }
+
+
+def fetch_ai_digest_search_backfill(
+    *,
+    max_age_days: int | None,
+    now: datetime | date | None,
+    queries: list[str] | None = None,
+    max_records: int | None = None,
+    timeout_s: float | None = None,
+    progress: ProgressCallback | None = None,
+    performance_mode: str | None = None,
+) -> tuple[list[AIUpdateItem], dict]:
+    from src.news.daily_news import fetch_daily_news_candidates, filter_recent_news_items
+
+    policy = (
+        PerformancePolicy.from_value(performance_mode)
+        if performance_mode is not None
+        else PerformancePolicy.from_environment()
+    )
+    search_plan = build_search_plan(
+        list(queries or _search_backfill_queries()),
+        performance_mode=policy.mode,
+    )
+    query_list = list(search_plan.queries)
+    record_limit = max_records or _search_backfill_max_records()
+    request_timeout_s = timeout_s if timeout_s is not None else _search_backfill_timeout_s()
+    request_budget = RequestBudget(
+        max_in_flight=search_plan.max_concurrency
+    )
+    fetched = []
+    errors: list[str] = []
+    per_query: list[dict] = []
+    def fetch_one(query: str) -> tuple[str, list[AIUpdateItem], dict, str | None]:
+        try:
+            _emit_progress(
+                progress,
+                "search_backfill_query",
+                f"in_progress query={query[:60]} max_records={record_limit} window={max_age_days or 3}d",
+            )
+            with request_budget.slot(timeout=request_timeout_s):
+                candidates, meta = fetch_daily_news_candidates(
+                    query,
+                    max_records=record_limit,
+                    search_days=max_age_days or 3,
+                    timeout_s=request_timeout_s,
+                    expand_query_variants=False,
+                )
+            recent, date_meta = filter_recent_news_items(
+                list(candidates),
+                tz_name=str((meta or {}).get("tz") or os.getenv("NEWS_TZ") or "Asia/Shanghai"),
+                max_age_days=max_age_days or 3,
+                now=now if isinstance(now, datetime) else None,
+            )
+            converted = [
+                _news_item_to_ai_update(item, query=query)
+                for item in recent
+                if str(getattr(item, "title", "") or "").strip() and str(getattr(item, "url", "") or "").strip()
+            ]
+            row = {
+                "query": query,
+                "raw_count": len(candidates),
+                "recent_count": len(recent),
+                "converted_count": len(converted),
+                "date_window": date_meta,
+            }
+            _emit_progress(
+                progress,
+                "search_backfill_query",
+                f"success query={query[:60]} raw={len(candidates)} recent={len(recent)} converted={len(converted)}",
+            )
+            return query, converted, row, None
+        except Exception as exc:
+            _emit_progress(progress, "search_backfill_query", f"failed query={query[:60]} error={exc}")
+            return query, [], {}, str(exc)
+
+    if policy.is_speed_first and len(query_list) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(search_plan.max_concurrency, len(query_list)),
+            thread_name_prefix="ai-search-backfill",
+        ) as executor:
+            results = list(executor.map(fetch_one, query_list))
+    else:
+        results = [fetch_one(query) for query in query_list]
+    for query, converted, row, error in results:
+        fetched.extend(converted)
+        if row:
+            per_query.append(row)
+        if error:
+            errors.append(f"{query}: {error}")
+    return fetched, {"queries": per_query, "errors": errors}
+
+
+def _needs_search_backfill(
+    ranked: list[AIUpdateItem],
+    *,
+    target_count: int,
+    min_domestic_model_count: int,
+    min_foreign_ai_count: int,
+    require_target_count: bool = False,
+) -> bool:
+    required_min = (
+        max(1, target_count)
+        if require_target_count
+        else max(1, min(target_count, max(8, min_domestic_model_count + min_foreign_ai_count)))
+    )
+    counts = ai_digest_quota_counts(ranked)
+    return (
+        len(ranked) < required_min
+        or counts["domestic_model"] < min_domestic_model_count
+        or counts["foreign_ai"] < min_foreign_ai_count
+    )
+
+
+def collect_ai_digest_updates(
+    *,
+    sources: list[AIDigestSource] | None = None,
+    fetch_source: FetchSource | None = None,
+    target_count: int = 10,
+    min_official_count: int = 6,
+    allow_social_backfill: bool = True,
+    max_age_days: int | None = None,
+    now: datetime | date | None = None,
+    min_domestic_model_count: int = 0,
+    min_foreign_ai_count: int = 0,
+    include_pool_items: bool = False,
+    force_search_backfill: bool = False,
+    force_aggregator_backfill: bool = False,
+    force_social_backfill: bool = False,
+    progress: ProgressCallback | None = None,
+    source_health_path: str | Path | None = None,
+    source_cooldown_seconds: int | None = None,
+    persist_source_health: bool | None = None,
+    source_concurrency: int | None = None,
+    batch_timeout_s: float | None = None,
+    exclude_history_keys: set[str] | None = None,
+    search_backfill_queries: list[str] | None = None,
+    performance_mode: str | None = None,
+) -> tuple[list[AIUpdateItem], dict]:
+    resolved = sources if sources is not None else resolve_ai_digest_sources()
+    performance_policy = (
+        PerformancePolicy.from_value(performance_mode)
+        if performance_mode is not None
+        else PerformancePolicy.from_environment()
+    )
+    source_timeout_s = _env_float("AI_DIGEST_SOURCE_TIMEOUT_S", 8.0, min_value=3.0, max_value=30.0)
+    cooldown_seconds = (
+        _env_int("AI_DIGEST_SOURCE_COOLDOWN_S", 300, min_value=0, max_value=3600)
+        if source_cooldown_seconds is None
+        else max(0, int(source_cooldown_seconds))
+    )
+    if source_concurrency is None:
+        source_concurrency = 1 if fetch_source is not None else _env_int(
+            "AI_DIGEST_SOURCE_CONCURRENCY",
+            4,
+            min_value=1,
+            max_value=12,
+        )
+    else:
+        source_concurrency = max(1, min(int(source_concurrency), 12))
+    if batch_timeout_s is None:
+        batch_timeout_s = _env_float("AI_DIGEST_BATCH_TIMEOUT_S", 45.0, min_value=5.0, max_value=120.0)
+    else:
+        batch_timeout_s = max(0.1, float(batch_timeout_s))
+    health_path = Path(source_health_path) if source_health_path else None
+    should_persist_health = bool(health_path) if persist_source_health is None else bool(persist_source_health)
+    previous_health = load_source_health_snapshot(health_path) if health_path else None
+    persisted_attempts = {
+        attempt.source_name: attempt
+        for attempt in (previous_health.attempts if previous_health is not None else [])
+        if attempt.source_name
+    }
+    health_now = _health_checked_at(now)
+    health_attempts: list[SourceAttempt] = []
+    cooldown_skipped: list[str] = []
+    replacement_skipped: list[str] = []
+
+    def _fetch_with_window(source: AIDigestSource) -> list[AIUpdateItem]:
+        if fetch_source is not None:
+            return fetch_source(source)
+        return fetch_ai_digest_source(source, max_age_days=max_age_days, timeout_s=source_timeout_s)
+
+    fetcher = _fetch_with_window
+    official_candidates = [source for source in resolved if source.kind in {"official", "github"}]
+    official_stream_sources = [source for source in official_candidates if source.tier == "official_stream"]
+    official_page_sources = [
+        source for source in official_candidates if source.tier != "official_stream"
+    ]
+    social_sources = [source for source in resolved if source.kind in {"social", "search"}]
+    aggregator_sources = [source for source in resolved if source.kind == "aggregator"]
+    fetched: list[AIUpdateItem] = []
+    errors: list[str] = []
+    excluded_history = {str(key).strip() for key in (exclude_history_keys or set()) if str(key).strip()}
+    history_excluded_by_source: dict[str, int] = {}
+
+    def _exclude_history_items(items: list[AIUpdateItem], source_label: str) -> list[AIUpdateItem]:
+        if not excluded_history:
+            return list(items)
+        kept: list[AIUpdateItem] = []
+        excluded_count = 0
+        for item in items:
+            if ai_update_history_key(item) in excluded_history:
+                excluded_count += 1
+                continue
+            kept.append(item)
+        if excluded_count:
+            history_excluded_by_source[source_label] = (
+                history_excluded_by_source.get(source_label, 0) + excluded_count
+            )
+        return kept
+
+    def _record_source_result(
+        source: AIDigestSource,
+        checked_at: str,
+        elapsed: float,
+        source_items: list[AIUpdateItem],
+        error: Exception | None,
+    ) -> None:
+        if error is not None:
+            attempt = SourceAttempt(
+                collection="ai_digest",
+                source_name=source.name,
+                source_url=source.url,
+                tier=source.tier,
+                status=_source_error_status(error),
+                checked_at=checked_at,
+                elapsed_seconds=elapsed,
+                error=str(error),
+                http_status=getattr(error, "code", None),
+            )
+            attempt = append_source_status(attempt, persisted_attempts.get(source.name))
+            health_attempts.append(attempt)
+            persisted_attempts[source.name] = attempt
+            errors.append(f"{source.name}: {error}")
+            _emit_progress(progress, "fetch_source", f"failed name={source.name} error={error}")
+            return
+        filtered_source_items = _exclude_history_items(source_items, source.name)
+        item_count, dated_count, url_count = _source_item_counts(filtered_source_items)
+        attempt = SourceAttempt(
+            collection="ai_digest",
+            source_name=source.name,
+            source_url=source.url,
+            tier=source.tier,
+            status=_source_result_status(source_items, max_age_days=max_age_days, now=now),
+            checked_at=checked_at,
+            elapsed_seconds=elapsed,
+            item_count=item_count,
+            dated_count=dated_count,
+            url_count=url_count,
+        )
+        attempt = append_source_status(attempt, persisted_attempts.get(source.name))
+        health_attempts.append(attempt)
+        persisted_attempts[source.name] = attempt
+        fetched.extend(filtered_source_items)
+        _emit_progress(
+            progress,
+            "fetch_source",
+            f"success name={source.name} items={item_count} dated={dated_count} urls={url_count} "
+            f"history_excluded={len(source_items) - len(filtered_source_items)}",
+        )
+
+    def _fetch_one(source: AIDigestSource) -> tuple[str, float, list[AIUpdateItem], Exception | None]:
+        started = time.perf_counter()
+        try:
+            source_items = fetcher(source)
+            return _health_timestamp(health_now), time.perf_counter() - started, source_items, None
+        except Exception as exc:
+            return _health_timestamp(health_now), time.perf_counter() - started, [], exc
+
+    def _fetch_stage(stage_sources: list[AIDigestSource]) -> None:
+        eligible: list[AIDigestSource] = []
+        for source in stage_sources:
+            previous_attempt = persisted_attempts.get(source.name)
+            if (
+                previous_attempt is not None
+                and previous_attempt.source_url == source.url
+                and should_replace_source(previous_attempt)
+            ):
+                # A replacement recommendation must not permanently disable
+                # official release discovery. Re-probe after a bounded cooldown.
+                recovery_due = source.kind == "official" and not is_source_in_cooldown(
+                    previous_attempt, now=health_now, cooldown_seconds=6 * 3600,
+                )
+                if not recovery_due:
+                    replacement_skipped.append(source.name)
+                    _emit_progress(progress, "fetch_source", f"skipped_replacement name={source.name}")
+                    continue
+                _emit_progress(progress, "fetch_source", f"recovery_probe name={source.name}")
+            if is_source_in_cooldown(
+                previous_attempt,
+                now=health_now,
+                cooldown_seconds=cooldown_seconds,
+            ):
+                cooldown_skipped.append(source.name)
+                health_attempts.append(
+                    SourceAttempt(
+                        collection="ai_digest",
+                        source_name=source.name,
+                        source_url=source.url,
+                        tier=source.tier,
+                        status="cooldown",
+                        checked_at=previous_attempt.checked_at if previous_attempt is not None else _health_timestamp(health_now),
+                        elapsed_seconds=0.0,
+                        item_count=previous_attempt.item_count if previous_attempt is not None else 0,
+                        dated_count=previous_attempt.dated_count if previous_attempt is not None else 0,
+                        url_count=previous_attempt.url_count if previous_attempt is not None else 0,
+                        error=previous_attempt.error if previous_attempt is not None else "",
+                        http_status=previous_attempt.http_status if previous_attempt is not None else None,
+                        recent_statuses=previous_attempt.recent_statuses if previous_attempt is not None else (),
+                    )
+                )
+                _emit_progress(progress, "fetch_source", f"skipped_cooldown name={source.name} tier={source.tier}")
+                continue
+            eligible.append(source)
+            _emit_progress(progress, "fetch_source", f"in_progress name={source.name} kind={source.kind}")
+        if not eligible:
+            return
+        if source_concurrency <= 1 or len(eligible) == 1:
+            for source in eligible:
+                checked_at, elapsed, source_items, error = _fetch_one(source)
+                _record_source_result(source, checked_at, elapsed, source_items, error)
+            return
+
+        executor = ThreadPoolExecutor(max_workers=min(source_concurrency, len(eligible)))
+        futures = {executor.submit(_fetch_one, source): source for source in eligible}
+        results: dict[AIDigestSource, tuple[str, float, list[AIUpdateItem], Exception | None]] = {}
+        try:
+            done, pending = wait(futures, timeout=batch_timeout_s)
+            for future in done:
+                source = futures[future]
+                try:
+                    results[source] = future.result()
+                except Exception as exc:
+                    results[source] = (_health_timestamp(health_now), batch_timeout_s, [], exc)
+            for future in pending:
+                future.cancel()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        for source in eligible:
+            result = results.get(source)
+            if result is None:
+                timeout_error = TimeoutError(f"source batch deadline exceeded after {batch_timeout_s:.1f}s")
+                _record_source_result(
+                    source,
+                    _health_timestamp(health_now),
+                    batch_timeout_s,
+                    [],
+                    timeout_error,
+                )
+                continue
+            checked_at, elapsed, source_items, error = result
+            _record_source_result(source, checked_at, elapsed, source_items, error)
+
+    research_path = (os.getenv("AI_DIGEST_RESEARCH_ITEMS_FILE") or "").strip()
+    research_items = load_ai_digest_research_items(Path(research_path)) if research_path else []
+    research_kept = _exclude_history_items(research_items, "reviewed_research_material")
+    fetched.extend(research_kept)
+    if research_path:
+        _emit_progress(progress, "research_materials", f"loaded={len(research_items)} retained={len(research_kept)}")
+    _fetch_stage(official_stream_sources)
+    stream_ranked = rank_ai_updates(
+        fetched,
+        target_count=target_count,
+        min_official_count=min_official_count,
+        allow_social_backfill=False,
+        max_age_days=max_age_days,
+        now=now,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+        max_items_per_source=None,
+    )
+    # Candidate-pool mode is research mode: a full stream response is not
+    # evidence that page-based official sources are unnecessary. They often
+    # contain the concrete model-release facts that RSS summaries omit.
+    official_page_backfill_used = bool(official_page_sources) and (
+        include_pool_items
+        or _needs_search_backfill(
+            stream_ranked,
+            target_count=target_count,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            require_target_count=include_pool_items,
+        )
+    )
+    if official_page_backfill_used:
+        _fetch_stage(official_page_sources)
+    official_ranked = rank_ai_updates(
+        fetched,
+        target_count=target_count,
+        min_official_count=min_official_count,
+        allow_social_backfill=False,
+        max_age_days=max_age_days,
+        now=now,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+        max_items_per_source=None,
+    )
+    official_count = len(official_ranked)
+    social_backfill_used = False
+    search_backfill_used = False
+    aggregator_backfill_used = False
+    search_backfill_meta: dict = {}
+    prompt_topic_items: list[AIUpdateItem] = []
+    detail_source_resolution = {"considered": 0, "resolved": 0, "official": 0, "social": 0}
+
+    ranked = rank_ai_updates(
+        fetched,
+        target_count=target_count,
+        min_official_count=min_official_count,
+        allow_social_backfill=allow_social_backfill,
+        max_age_days=max_age_days,
+        now=now,
+        min_domestic_model_count=min_domestic_model_count,
+        min_foreign_ai_count=min_foreign_ai_count,
+        max_items_per_source=None,
+    )
+    if allow_social_backfill and aggregator_sources and (
+        force_aggregator_backfill
+        or _needs_search_backfill(
+            ranked,
+            target_count=target_count,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            require_target_count=include_pool_items,
+        )
+    ):
+        aggregator_backfill_used = True
+        _fetch_stage(aggregator_sources)
+        detail_candidates = rank_ai_updates(
+            [item for item in fetched if _is_aihot_detail_url(item.url)],
+            target_count=max(24, target_count * 3),
+            min_official_count=1,
+            allow_social_backfill=True,
+            max_age_days=max_age_days,
+            now=now,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            max_items_per_source=None,
+        )
+        detail_limit = _env_int("AI_DIGEST_AGGREGATOR_DETAIL_LIMIT", 24, min_value=1, max_value=80)
+        detail_candidates = detail_candidates[:detail_limit]
+        detail_source_resolution["considered"] = len(detail_candidates)
+        if detail_candidates:
+            detail_timeout_s = _env_float("AI_DIGEST_AGGREGATOR_DETAIL_TIMEOUT_S", 8.0, min_value=3.0, max_value=30.0)
+            detail_concurrency = _env_int("AI_DIGEST_AGGREGATOR_DETAIL_CONCURRENCY", 6, min_value=1, max_value=12)
+            with ThreadPoolExecutor(max_workers=min(detail_concurrency, len(detail_candidates))) as executor:
+                resolved_detail_items = list(
+                    executor.map(
+                        lambda item: resolve_aihot_detail_source(item, timeout_s=detail_timeout_s),
+                        detail_candidates,
+                    )
+                )
+            resolved_by_original_url = {
+                original.url: resolved_item
+                for original, resolved_item in zip(detail_candidates, resolved_detail_items)
+            }
+            fetched = [
+                resolved_by_original_url.get(item.url, item)
+                for item in fetched
+            ]
+            fetched = _exclude_history_items(fetched, "detail_resolution")
+            changed = [
+                resolved_item
+                for original, resolved_item in zip(detail_candidates, resolved_detail_items)
+                if resolved_item.url != original.url
+            ]
+            detail_source_resolution["resolved"] = len(changed)
+            detail_source_resolution["official"] = sum(item.source_type == "official" for item in changed)
+            detail_source_resolution["social"] = sum(item.source_type == "social" for item in changed)
+        ranked = rank_ai_updates(
+            fetched,
+            target_count=target_count,
+            min_official_count=min_official_count,
+            allow_social_backfill=allow_social_backfill,
+            max_age_days=max_age_days,
+            now=now,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            max_items_per_source=None,
+        )
+    if (
+        allow_social_backfill
+        and _search_backfill_enabled()
+        and (
+            force_search_backfill
+            or _needs_search_backfill(
+                ranked,
+                target_count=target_count,
+                min_domestic_model_count=min_domestic_model_count,
+                min_foreign_ai_count=min_foreign_ai_count,
+                require_target_count=include_pool_items,
+            )
+        )
+    ):
+        search_backfill_used = True
+        _emit_progress(progress, "search_backfill", f"in_progress window={max_age_days or 3}d")
+        extra, search_backfill_meta = fetch_ai_digest_search_backfill(
+            max_age_days=max_age_days,
+            now=now,
+            queries=search_backfill_queries,
+            progress=progress,
+            performance_mode=performance_policy.mode,
+        )
+        fetched.extend(_exclude_history_items(extra, "search_backfill"))
+        errors.extend(search_backfill_meta.get("errors") or [])
+        _emit_progress(progress, "search_backfill", f"success items={len(extra)} errors={len(search_backfill_meta.get('errors') or [])}")
+        topic_items, topic_meta = fetch_ai_digest_prompt_topic_backfill(
+            topics=search_backfill_queries,
+            timeout_s=_search_backfill_timeout_s(),
+            progress=progress,
+        )
+        # An explicit user-requested topic is an intentional editorial
+        # exception to cross-digest history filtering. It is still deduped
+        # within this run and remains limited by the per-source cap later.
+        prompt_topic_items = list(topic_items)
+        fetched.extend(prompt_topic_items)
+        search_backfill_meta["official_topic_backfill"] = topic_meta
+        errors.extend(
+            f"{row['topic']}: {row['error']}"
+            for row in topic_meta.get("failed", [])
+            if row.get("error")
+        )
+        ranked = rank_ai_updates(
+            fetched,
+            target_count=target_count,
+            min_official_count=min_official_count,
+            allow_social_backfill=allow_social_backfill,
+            max_age_days=max_age_days,
+            now=now,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            max_items_per_source=None,
+        )
+    if (
+        allow_social_backfill
+        and social_sources
+        and (
+            force_social_backfill
+            or _needs_search_backfill(
+                ranked,
+                target_count=target_count,
+                min_domestic_model_count=min_domestic_model_count,
+                min_foreign_ai_count=min_foreign_ai_count,
+                require_target_count=include_pool_items,
+            )
+        )
+    ):
+        social_backfill_used = True
+        _fetch_stage(social_sources)
+        ranked = rank_ai_updates(
+            fetched,
+            target_count=target_count,
+            min_official_count=min_official_count,
+            allow_social_backfill=allow_social_backfill,
+            max_age_days=max_age_days,
+            now=now,
+            min_domestic_model_count=min_domestic_model_count,
+            min_foreign_ai_count=min_foreign_ai_count,
+            max_items_per_source=None,
+        )
+    fresh_items = filter_recent_ai_updates(
+        fetched,
+        max_age_days=max_age_days,
+        now=now,
+        require_url=True,
+    )
+    deduped_items = dedupe_ai_updates(fresh_items)
+    if prompt_topic_items:
+        # Explicitly requested official topics may be older than the normal
+        # freshness window; keep them in the auditable pool after verification.
+        # Put them first so a generic search result cannot occupy the same
+        # official URL and hide the stronger, topic-specific record.
+        deduped_items = dedupe_ai_updates([*prompt_topic_items, *deduped_items])
+    health_snapshot_path = ""
+    if health_path is not None and should_persist_health:
+        snapshot = SourceHealthSnapshot(
+            collection="ai_digest",
+            generated_at=_health_timestamp(health_now),
+            attempts=sorted(persisted_attempts.values(), key=lambda item: item.source_name),
+        )
+        health_snapshot_path = str(save_source_health_snapshot(snapshot, health_path))
+    meta = {
+        "target_count": target_count,
+        "min_official_count": min_official_count,
+        "min_domestic_model_count": min_domestic_model_count,
+        "min_foreign_ai_count": min_foreign_ai_count,
+        "max_age_days": max_age_days,
+        "fetched_count": len(fetched),
+        "fresh_count": len(fresh_items),
+        "deduped_count": len(deduped_items),
+        "duplicate_removed_count": max(0, len(fresh_items) - len(deduped_items)),
+        "quality_rejected_count": sum(
+            1 for item in fresh_items if ai_update_quality_issues(item)
+        ),
+        "research_policy": {
+            "mode": "candidate_pool" if include_pool_items else "rank_only",
+            "discovery_order": [
+                "official_stream",
+                "official_page",
+                "aggregator",
+                "search",
+                "social",
+            ],
+            "official_pages_continued_after_stream_target": bool(
+                include_pool_items and official_page_backfill_used
+            ),
+            "llm_receives_ranked_candidates_only": True,
+            "quality_gate": "url_date_relevance_and_concrete_content",
+        },
+        "ranked_count": len(ranked),
+        "official_count": official_count,
+        "official_page_backfill_used": official_page_backfill_used,
+        "social_backfill_used": social_backfill_used,
+        "search_backfill_used": search_backfill_used,
+        "aggregator_backfill_used": aggregator_backfill_used,
+        "aggregator_backfill_forced": bool(force_aggregator_backfill),
+        "social_backfill_forced": bool(force_social_backfill),
+        "detail_source_resolution": detail_source_resolution,
+        "search_backfill": search_backfill_meta,
+        "research_materials": {"path": research_path, "loaded": len(research_items), "retained": len(research_kept)},
+        "quota_counts": ai_digest_quota_counts(ranked),
+        "sources": [source.name for source in resolved],
+        "errors": errors,
+        "historical_excluded_count": sum(history_excluded_by_source.values()),
+        "source_history_filter": {
+            "enabled": bool(excluded_history),
+            "historical_key_count": len(excluded_history),
+            "by_source": dict(sorted(history_excluded_by_source.items())),
+        },
+        "source_health": {
+            "enabled": health_path is not None,
+            "snapshot_path": health_snapshot_path or (str(health_path) if health_path is not None else ""),
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_skipped": cooldown_skipped,
+            "replacement_skipped": replacement_skipped,
+            "attempts": [attempt.to_dict() for attempt in health_attempts],
+        },
+    }
+    if include_pool_items:
+        meta["_fetched_items"] = list(fetched)
+        meta["_fresh_items"] = list(fresh_items)
+        meta["_deduped_items"] = list(deduped_items)
+    return ranked, meta

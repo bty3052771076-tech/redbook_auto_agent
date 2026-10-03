@@ -1,0 +1,136 @@
+{
+  "cutoff": "2026-10-01T18:52:04.970355+08:00",
+  "events": [
+    {
+      "score": 0.6911926759436596,
+      "title": "飞往以色列的FlyDubai航班惊魂事件需知",
+      "country": "Israel",
+      "recency": 0.9888313616319444,
+      "summary": "",
+      "evidence": [
+        {
+          "url": "https://news.google.com/rss/articles/CBMirwFBVV95cUxOOTlDVnRPM016ZnBHZEIyRk9FVHpVSDlFYmNHRWxnUndFNzNmMnMtdUFCSlBSQmdNRWluYjlYUTVScVMyWHZPUUdRYjkxajREZkFIRVhfUVlmOVVlMURUNmRZbjhIdzRNVnNhTkVOeWYyWTVkSjhtZU00cFdkeHdVel8zZWxfR0ljM2tYeHREUmt0b0cteFJ4RkhmUVBJdkJCZ0JKLWEzRWNJYXIwckxn?oc=5",
+          "title": "What to know about the terrifying FlyDubai flight bound for Israel - AP News",
+          "source": "AP News",
+          "summary": "What to know about the terrifying FlyDubai flight bound for Israel &nbsp;&nbsp; AP News",
+          "authority": 1,
+          "published_at": "2026-10-01T10:36:00+00:00"
+        }
+      ],
+      "latitude": 31.0461,
+      "event_key": "What to know about the terrifying FlyDubai flight bound for Israel - AP News",
+      "longitude": 34.8516,
+      "location_name": "Israel（国家级）",
+      "location_method": "explicit_country_name",
+      "publisher_count": 1,
+      "location_precision": "country"
+    },
+    {
+      "score": 0.6906047129806967,
+      "title": "玻利维亚逮捕被美国指控与贩毒集团有关联的检察长",
+      "country": "United States",
+      "recency": 0.9858915468171296,
+      "summary": "美国国务院表示罗杰·马里亚卡收受贿赂以协助贩毒并帮助暴力犯罪分子逃避司法制裁。",
+      "evidence": [
+        {
+          "url": "https://www.cbsnews.com/news/bolivia-attorney-general-roger-mariaca-arrested-drug-cartel-ties/",
+          "title": "Bolivia arrests attorney general accused by U.S. of drug cartel ties",
+          "source": "CBS News",
+          "summary": "The U.S. State Department said that Roger Mariaca received \"bribes to facilitate drug trafficking and help violent criminals evade justice.\"",
+          "authority": 1,
+          "published_at": "2026-10-01T10:31:46+00:00"
+        }
+      ],
+      "latitude": 37.0902,
+      "event_key": "Bolivia arrests attorney general accused by U.S. of drug cartel ties",
+      "longitude": -95.7129,
+      "location_name": "United States（国家级）",
+      "location_method": "explicit_country_name",
+      "publisher_count": 1,
+      "location_precision": "country"
+    },
+    {
+      "score": 0.6881533240918078,
+      "title": "美国撤军后伊拉克库尔德武装寻求新纪元",
+      "country": "Iraq",
+      "recency": 0.9736346023726852,
+      "summary": "库尔德佩什梅格部队寻求统一，以超越党派分歧，在伊拉克库尔德地区建立一支国家力量。",
+      "evidence": [
+        {
+          "url": "https://www.aljazeera.com/news/2026/10/1/iraqs-kurdish-forces-look-to-a-new-era-after-us-withdrawal?traffic_source=rss",
+          "title": "Iraq’s Kurdish forces look to a new era after US withdrawal",
+          "source": "Al Jazeera",
+          "summary": "Peshmerga unification seeks stability, overcoming party disputes to build a national force in Iraq's Kurdish landscape.",
+          "authority": 1,
+          "published_at": "2026-10-01T10:14:07+00:00"
+        }
+      ],
+      "latitude": 33.2232,
+      "event_key": "Iraq’s Kurdish forces look to a new era after US withdrawal",
+      "longitude": 43.6793,
+      "location_name": "Iraq（国家级）",
+      "location_method": "explicit_country_name",
+      "publisher_count": 1,
+      "location_precision": "country"
+    },
+    {
+      "score": 0.6861926759436596,
+      "title": "巴西选举：上等腰肉牛排价格揭示的政治信号",
+      "country": "Brazil",
+      "recency": 0.9638313616319445,
+      "summary": "卢拉四年前承诺巴西人能够再次负担得起上等腰肉牛排。如今他寻求连任时，这种巴西人最爱的牛肉部位价格正讲述着不同的故事。",
+      "evidence": [
+        {
+          "url": "https://www.npr.org/2026/10/01/nx-s1-5986079/picanha-election-brazil-economy",
+          "title": "Picanha, prices and politics: What Brazil's favorite steak says about the election",
+          "source": "NPR News",
+          "summary": "Lula promised Brazilians four years ago they'd be able to afford picanha again. Now, as he seeks another term, the price of the country's favorite cut of beef is telling a different story. (Image credit: Eraldo Peres)",
+          "authority": 1,
+          "published_at": "2026-10-01T10:00:00+00:00"
+        }
+      ],
+      "latitude": -14.235,
+      "event_key": "Picanha, prices and politics: What Brazil's favorite steak says about the election",
+      "longitude": -51.9253,
+      "location_name": "Brazil（国家级）",
+      "location_method": "explicit_country_name",
+      "publisher_count": 1,
+      "location_precision": "country"
+    },
+    {
+      "score": 0.684225083351067,
+      "title": "内塔尼亚胡赞扬化解以色列航班危机的乘客",
+      "country": "Israel",
+      "recency": 0.9539933986689815,
+      "summary": "内塔尼亚胡表示已会见这名以色列乘客，并称其表现出了非凡的勇气。",
+      "evidence": [
+        {
+          "url": "http://www.africanews.com/2026/10/01/netanyahu-praises-passengers-who-helped-avert-disaster-on-israel-bound-flight/",
+          "title": "Netanyahu praises passengers who helped avert disaster on Israel-bound flight",
+          "source": "Africanews",
+          "summary": "Netanyahu said he had met the Israeli passenger, whom he described as acting with extraordinary courage.",
+          "authority": 1,
+          "published_at": "2026-10-01T09:45:50+00:00"
+        }
+      ],
+      "latitude": 31.0461,
+      "event_key": "Netanyahu praises passengers who helped avert disaster on Israel-bound flight",
+      "longitude": 34.8516,
+      "location_name": "Israel（国家级）",
+      "location_method": "explicit_country_name",
+      "publisher_count": 1,
+      "location_precision": "country"
+    }
+  ],
+  "warning": "已排除3条翻译内容无法核实的事件。覆盖有限：地图仅代表当前可获取信源中的事件关注度。",
+  "map_mode": "coordinate-grid",
+  "target_date": "2026-10-01",
+  "source_state": "partial",
+  "country_count": 4,
+  "raw_item_count": 278,
+  "upload_allowed": true,
+  "coverage_status": "limited",
+  "publisher_count": 5,
+  "located_event_count": 5,
+  "independent_event_count": 214
+}

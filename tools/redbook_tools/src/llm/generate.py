@@ -1,0 +1,893 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from typing import Any, Dict, List
+
+from langchain.chat_models import init_chat_model
+from langchain_core.prompts import ChatPromptTemplate
+
+from src.config import LLMConfig
+from src.news.length_policy import news_length_instruction
+from src.text_integrity import repair_utf8_as_gbk_mojibake
+
+
+DEFAULT_LLM_MAX_TOKENS = 60000
+DEFAULT_DRAFT_EFFECTIVE_MAX_TOKENS = 12000
+DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS = 240
+DEFAULT_LLM_RATE_LIMIT_RETRY_SECONDS = 65
+DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES = 3
+
+
+def _temperature_kwargs(model: str, temperature: float) -> dict[str, float]:
+    """Return sampling kwargs supported by the target model.
+
+    Aliyun's Kimi K3 endpoint rejects the OpenAI-compatible ``temperature``
+    parameter entirely.  Omitting it lets the provider use its supported
+    default while preserving the existing setting for other models.
+    """
+    normalized = re.sub(r"[^a-z0-9]+", "-", (model or "").strip().lower()).strip("-")
+    if normalized == "kimi-k3":
+        return {}
+    return {"temperature": temperature}
+
+
+def _truncate(text: str, max_len: int) -> str:
+    return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+
+def _extract_json_block(text: str) -> str | None:
+    text = text.strip()
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence_match:
+        return fence_match.group(1)
+    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace_match:
+        return brace_match.group(0)
+    return None
+
+
+def _iter_balanced_json_objects(text: str) -> list[str]:
+    """Return every top-level ``{...}`` span, ignoring braces inside strings.
+
+    Some providers (MiniMax-M3 was observed) print their reasoning before the
+    final JSON answer.  A greedy first-open-to-last-close match then swallows
+    that prose into the parsed fields, so callers need the individual objects.
+    """
+    objects: list[str] = []
+    depth = 0
+    start: int | None = None
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text or ""):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_string:
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start : index + 1])
+                start = None
+    return objects
+
+
+def _escape_raw_controls_in_strings(text: str) -> str:
+    """Escape literal newlines/tabs inside JSON strings so they parse.
+
+    Models frequently emit a multi-line body with a real newline inside the
+    JSON string (``"body":"内容：<newline>正文"``).  Strict JSON rejects that,
+    and the regex recovery that follows mangles every field.  Escaping only the
+    control characters that appear inside string literals keeps the structure
+    intact while making the payload valid.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    replacements = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    for char in text or "":
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if in_string and char == "\\":
+            out.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            out.append(char)
+            continue
+        if in_string and char in replacements:
+            out.append(replacements[char])
+            continue
+        out.append(char)
+    return "".join(out)
+
+
+def _loads_json_object(candidate: str) -> Dict[str, Any] | None:
+    """Parse one JSON object, repairing raw control characters if needed."""
+    for attempt in (candidate, _escape_raw_controls_in_strings(candidate)):
+        try:
+            data = json.loads(attempt)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _looks_like_jsonish_payload(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    return (
+        t.startswith("{")
+        or t.startswith("[")
+        or "```json" in t
+        or '"title"' in t
+        or '"body"' in t
+        or '"topics"' in t
+        or '"image_event"' in t
+    )
+
+
+def _strip_code_fence(text: str) -> str:
+    if "```" not in text:
+        return text
+    text = re.sub(r"```(?:json)?", "", text)
+    return text.replace("```", "").strip()
+
+
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return _strip_code_fence(value)
+    if isinstance(value, list):
+        parts = [_coerce_text(v) for v in value if _coerce_text(v)]
+        return "\n".join(p for p in parts if p)
+    if isinstance(value, dict):
+        daily_news_keys = ("原文标题", "内容", "评价", "日期", "来源")
+        if any(key in value for key in daily_news_keys):
+            ordered = {key: value.get(key, "") for key in daily_news_keys}
+            return json.dumps(ordered, ensure_ascii=False, indent=2)
+        for key in ("text", "body", "content", "summary"):
+            if key in value:
+                return _coerce_text(value[key])
+        for v in value.values():
+            text = _coerce_text(v)
+            if text:
+                return text
+    return _strip_code_fence(str(value))
+
+
+def _normalize_topics(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        topics: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                topics.append(item)
+            elif isinstance(item, dict):
+                for key in ("name", "topic", "tag"):
+                    if key in item and isinstance(item[key], str):
+                        topics.append(item[key])
+                        break
+                else:
+                    topics.append(_coerce_text(item))
+            else:
+                topics.append(_coerce_text(item))
+        return [t for t in topics if t]
+    return []
+
+
+def _sanitize_body(body: str) -> str:
+    body = (body or "").strip()
+    if not body:
+        return body
+
+    markers = (
+        "Prompt:",
+        "Prompt：",
+        "Initial title:",
+        "Initial title：",
+        "Assets",
+        "要求",
+        "写作要求",
+        "新闻标题",
+        "用户偏好",
+        "用户关注点",
+        "offline fallback",
+        "news_fetch_failed",
+        "http://",
+        "https://",
+    )
+    if not any(m in body for m in markers):
+        return body
+
+    lines = [ln.strip() for ln in body.splitlines()]
+    kept: list[str] = []
+    for ln in lines:
+        if not ln:
+            if kept and kept[-1] != "":
+                kept.append("")
+            continue
+        if ln.startswith(("Prompt:", "Prompt：", "Initial title:", "Initial title：")):
+            continue
+        if ln.startswith(("Assets", "Assets:")):
+            continue
+        if ln.startswith(("写作要求", "写作要求：", "要求", "要求：")):
+            continue
+        if re.match(r"^[-*]\s*(标题|来源|时间|链接)[:：]", ln):
+            continue
+        if "news_fetch_failed" in ln or "offline fallback" in ln:
+            continue
+        if re.search(r"https?://", ln):
+            continue
+        kept.append(ln)
+
+    text = "\n".join(kept).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def _decode_jsonish_string(raw: str) -> str:
+    text = (raw or "").strip().rstrip(",").strip()
+    text = re.sub(r"\n\s*[}\]]\s*$", "", text).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1]
+    text = (
+        text.replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\\'", "'")
+    )
+    return _strip_code_fence(text).strip()
+
+
+def _extract_jsonish_field(text: str, key: str, next_keys: List[str]) -> str | None:
+    m = re.search(rf'(?is)"{re.escape(key)}"\s*:\s*', text)
+    if not m:
+        return None
+    start = m.end()
+    end = len(text)
+    for nk in next_keys:
+        m2 = re.search(
+            rf'(?im)^\s*,?\s*"{re.escape(nk)}"\s*:\s*',
+            text[start:],
+        )
+        if m2:
+            end = min(end, start + m2.start())
+    value = text[start:end].strip().rstrip(",").strip()
+    return value or None
+
+
+def _parse_jsonish_topics(raw: str) -> List[str]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    for candidate in (text, text.replace("'", '"')):
+        try:
+            obj = json.loads(candidate)
+            topics = _normalize_topics(obj)
+            if topics:
+                return topics
+        except Exception:
+            pass
+    # Fallback for malformed arrays: pick quoted strings first.
+    quoted = re.findall(r'"([^"\n]{1,40})"', text)
+    if quoted:
+        return [t.strip() for t in quoted if t.strip()]
+    return [seg.strip() for seg in re.split(r"[,，、/|]", text) if seg.strip()]
+
+
+def _recover_jsonish_object(text: str) -> Dict[str, Any] | None:
+    src = _strip_code_fence((text or "")).strip()
+    if not _looks_like_jsonish_payload(src):
+        return None
+
+    out: Dict[str, Any] = {}
+    title_raw = _extract_jsonish_field(src, "title", ["body", "topics", "image_event"])
+    body_raw = _extract_jsonish_field(src, "body", ["topics", "image_event"])
+    topics_raw = _extract_jsonish_field(src, "topics", ["image_event"])
+    event_raw = _extract_jsonish_field(src, "image_event", [])
+
+    if title_raw:
+        title = _decode_jsonish_string(title_raw)
+        if title:
+            out["title"] = title
+    if body_raw:
+        body = _decode_jsonish_string(body_raw)
+        if body:
+            out["body"] = body
+    if topics_raw:
+        topics = _parse_jsonish_topics(topics_raw)
+        if topics:
+            out["topics"] = topics
+    if event_raw:
+        image_event = _decode_jsonish_string(event_raw)
+        if image_event:
+            out["image_event"] = image_event
+
+    if out:
+        return out
+    return None
+
+
+def _strip_reasoning_text(text: str) -> str:
+    # Tags inside an actual JSON string are source text, not a reasoning block.
+    try:
+        if isinstance(json.loads(_strip_code_fence(text)), (dict, list)):
+            return text.strip()
+    except (json.JSONDecodeError, TypeError):
+        pass
+    final = re.sub(r"(?is)<(think|thinking|reasoning)\b[^>]*>.*?</\1\s*>", "", text or "")
+    if re.search(r"(?is)</?(?:think|thinking|reasoning)\b", final):
+        raise ValueError("unpublishable LLM output: incomplete reasoning boundary")
+    return final.strip()
+
+
+def _parse_json_text(text: Any) -> Dict[str, Any] | None:
+    if not isinstance(text, str):
+        text = _coerce_text(text)
+    try:
+        text = _strip_reasoning_text(text)
+    except ValueError:
+        return None
+    if not text:
+        return None
+    # Prefer an individual balanced object.  Providers that narrate before the
+    # JSON would otherwise have their prose merged into the first and last
+    # brace, corrupting every field.  The last complete object is the answer;
+    # intermediate ones are quoted text inside the reasoning.
+    balanced = _iter_balanced_json_objects(text)
+    for candidate in reversed(balanced):
+        data = _loads_json_object(candidate)
+        if data is not None:
+            return data
+        recovered = _recover_jsonish_object(candidate)
+        if recovered:
+            return recovered
+    json_text = _extract_json_block(text)
+    if json_text:
+        try:
+            data = json.loads(json_text)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            recovered = _recover_jsonish_object(json_text)
+            if recovered:
+                return recovered
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        recovered = _recover_jsonish_object(text)
+        if recovered:
+            return recovered
+        return None
+    return None
+
+
+def _should_try_next_llm(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    keywords = (
+        "quota",
+        "out of quota",
+        "insufficient",
+        "balance",
+        "limit",
+        "throttl",
+        "rate",
+        "exceeded",
+        "forbidden",
+        "permission",
+        "no permission",
+        "access denied",
+        "overdue",
+        "arrears",
+        "model not found",
+        "unsupported",
+        "not support",
+        "invalid model",
+        "no available",
+        "429",
+        "余额",
+        "配额",
+        "限流",
+        "不足",
+        "超限",
+    )
+    return any(k in msg for k in keywords)
+
+
+def _is_provider_capacity_exhausted(exc: Exception) -> bool:
+    """Return true for account/token-plan exhaustion, not transient throttling."""
+    msg = str(exc or "").lower()
+    return any(
+        marker in msg
+        for marker in (
+            "token plan",
+            "用量上限",
+            "套餐用量",
+            "quota exhausted",
+            "free quota exhausted",
+            "insufficient balance",
+            "余额不足",
+        )
+    )
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return any(marker in msg for marker in ("429", "rate_limit", "rate limit", "throttl", "限流"))
+
+
+def _rate_limit_retry_seconds() -> int:
+    raw = os.getenv("LLM_RATE_LIMIT_RETRY_SECONDS", str(DEFAULT_LLM_RATE_LIMIT_RETRY_SECONDS))
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_LLM_RATE_LIMIT_RETRY_SECONDS
+
+
+def _rate_limit_max_retries() -> int:
+    raw = os.getenv("LLM_RATE_LIMIT_MAX_RETRIES", str(DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES))
+    try:
+        return max(0, min(10, int(raw)))
+    except (TypeError, ValueError):
+        return DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES
+
+
+def _transient_retry_seconds() -> int:
+    raw = os.getenv("LLM_TRANSIENT_RETRY_SECONDS", "8")
+    try:
+        return max(0, min(120, int(raw)))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _transient_retry_max() -> int:
+    raw = os.getenv("LLM_TRANSIENT_RETRY_MAX", "1")
+    try:
+        return max(0, min(3, int(raw)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _is_transient_request_error(exc: Exception) -> bool:
+    """Identify retryable upstream failures without retrying permanent errors."""
+    message = str(exc or "").lower()
+    permanent_markers = (
+        "400",
+        "bad request",
+        "invalid",
+        "not found",
+        "unsupported",
+        "context length",
+        "max_tokens",
+        "permission",
+        "forbidden",
+        "quota",
+        "balance",
+        "content filter",
+        "unpublishable llm output",
+    )
+    if any(marker in message for marker in permanent_markers):
+        return False
+    return True
+
+
+def _ensure_cfg_list(cfg: LLMConfig | list[LLMConfig]) -> list[LLMConfig]:
+    if isinstance(cfg, list):
+        return cfg
+    return [cfg]
+
+
+def _effective_draft_max_tokens(*, prompt_text: str, max_body: int) -> int:
+    """Keep the global token ceiling without oversizing ordinary draft calls.
+
+    A long news prompt plus ``max_tokens=60000`` can exceed a provider's
+    context-budget validation before generation starts.  Drafts are bounded
+    to ``max_body`` characters, so a smaller request budget is sufficient and
+    leaves room for the input prompt and JSON envelope.
+    """
+    raw = os.getenv("LLM_MAX_TOKENS", str(DEFAULT_LLM_MAX_TOKENS))
+    try:
+        configured = max(256, int(raw))
+    except (TypeError, ValueError):
+        configured = DEFAULT_LLM_MAX_TOKENS
+
+    body_budget = max(1024, int(max_body or 0) * 4 + 1024)
+    safe_budget = min(DEFAULT_DRAFT_EFFECTIVE_MAX_TOKENS, body_budget)
+
+    # Estimate input tokens conservatively for CJK-heavy prompts.  Keep a
+    # minimum output budget, but reserve the remainder of a common 32k context
+    # window for the prompt when a caller supplies unusually large material.
+    estimated_input_tokens = max(1, len(prompt_text or "") // 2)
+    context_budget = max(4096, 32768 - estimated_input_tokens)
+    return max(256, min(configured, safe_budget, context_budget))
+
+
+def _summary_provider_kwargs(cfg: LLMConfig, *, disable_thinking: bool = True) -> dict[str, Any]:
+    if cfg.provider.strip().lower() != "minimax":
+        return {}
+    model = cfg.model.strip().lower()
+    if model not in {"minimax-m3", "minimax-m3.1-flash-preview"}:
+        return {}
+    body: dict[str, Any] = {"reasoning_split": True}
+    if model == "minimax-m3" and disable_thinking:
+        body["thinking"] = {"type": "disabled"}
+    return {"extra_body": body}
+
+
+def _response_diagnostics(response: Any, requested_max_tokens: int) -> dict[str, Any]:
+    metadata = getattr(response, "response_metadata", {}) or {}
+    usage = getattr(response, "usage_metadata", {}) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if not isinstance(usage, dict):
+        usage = {}
+    raw_usage = metadata.get("token_usage") or {}
+    if not isinstance(raw_usage, dict):
+        raw_usage = {}
+    result: dict[str, Any] = {
+        "requested_max_tokens": requested_max_tokens,
+        "finish_reason": re.sub(r"[^a-zA-Z0-9_-]", "", str(metadata.get("finish_reason") or ""))[:40],
+    }
+    for key, alternate in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"), ("total_tokens", "total_tokens")):
+        value = usage.get(key, raw_usage.get(alternate))
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            result[key] = value
+    details = usage.get("output_token_details") or raw_usage.get("completion_tokens_details") or {}
+    if isinstance(details, dict):
+        value = details.get("reasoning", details.get("reasoning_tokens"))
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            result["reasoning_tokens"] = value
+    return result
+
+
+def _final_response_text(response: Any, diagnostics: dict[str, Any]) -> str:
+    finish = diagnostics.get("finish_reason")
+    if finish in {"length", "content_filter"}:
+        raise ValueError(f"unpublishable LLM output: finish_reason={finish}")
+    content = response.content if hasattr(response, "content") else str(response)
+    if isinstance(content, list):
+        # Content blocks can contain SDK reasoning summaries, not just text.
+        content = "\n".join(
+            block if isinstance(block, str) else _coerce_text(block.get("text", ""))
+            for block in content
+            if isinstance(block, str) or (isinstance(block, dict) and block.get("type") in {"text", "output_text"})
+        )
+    text = _coerce_text(content)
+    final = _strip_reasoning_text(text)
+    if not final:
+        raise ValueError("unpublishable LLM output: no final answer")
+    return final
+
+
+def generate_draft(
+    cfg: LLMConfig | list[LLMConfig],
+    *,
+    title_hint: str,
+    prompt_hint: str,
+    asset_paths: List[str],
+    max_title: int = 20,
+    max_body: int = 1000,
+    preserve_body: bool = False,
+    concise_news: bool = False,
+) -> Dict[str, Any]:
+    """
+    Generate a structured draft (title/body/topics) using the configured LLM.
+    Fallback to offline template if the API call fails.
+    preserve_body lets news callers resummarize before applying their length gate.
+    concise_news applies field-level limits before generation without clipping output.
+    """
+    cfg_list = _ensure_cfg_list(cfg)
+
+    scene_required = any(name in f"{title_hint} {prompt_hint}" for name in ("每日新闻", "每日我去"))
+    image_event_contract = (
+        "JSON key image_event is required in this same response: describe a single visible scene, "
+        "First copy the first complete factual sentence from body content verbatim, without field labels. "
+        "Then describe a single source-supported editorial illustration in a second complete Chinese sentence. "
+        "The second sentence MUST start with the concrete source subject and action clause, "
+        "then 的概念示意， and only then describe neutral visible composition. "
+        "Do not start the second sentence with composition, background or a generic concept label. "
+        "For example: 英国央行行长警告人工智能热潮的概念示意，以非写实侧影表达立场，背景为纯色色面。 "
+        "Keep the source subject and action or state clear. Do not copy only a headline or retell the whole story. "
+        "Choose one central, source-supported moment, not a collage of causes, reactions and outcomes. "
+        "For statements, plans, allegations or proposals, preserve their status and use an explicitly conceptual illustration, never an implemented outcome. "
+        "Use one or two principal subjects; retain supported spatial relations and intact/damaged status. "
+        "Do not invent uniforms, weapons, buildings, flags, cash, crowds, injuries or disaster scenes. "
+        "When an appearance or a setting is unknown, use a generic editorial depiction, not a claimed documentary detail. "
+        "Describe visible people, objects and actions, not abstract metaphors such as market shock. "
+        "Specify plain, blank surfaces without any text, digits, logos or watermarks. "
+        "Before responding, check every factual assertion in image_event against the supplied material. "
+        if scene_required else
+        "Optional JSON key: image_event (a short event-only description for image generation). "
+    )
+    output_contract = (
+        "Return a JSON object with title/body/topics/image_event; image_event is required."
+        if scene_required else "Return a JSON object with title/body/topics (and optionally image_event)."
+    )
+    writing_length_instruction = news_length_instruction() if concise_news else "Body <= 1000 chars. "
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                (
+                    "You are a Xiaohongshu image-post assistant. Write in Chinese. "
+                    "Generate a short title and body. Title <= 20 chars. "
+                    f"{writing_length_instruction if not concise_news else ''}"
+                    "Make the factual content complete within the supplied evidence; do not pad sparse facts with speculation or generic commentary. "
+                    "If the initial title is long, rewrite it into <= 20 chars (do NOT just truncate with '...'). "
+                    "Body may include hashtags (e.g. #topic) but do not spam. "
+                    "Only output the final publishable article body. Do NOT include any prompt text, requirements, metadata, or links. "
+                    "If the prompt includes news details (e.g. title/source/time/url or mentions 每日新闻), "
+                    "do NOT fabricate facts; only use the provided news information. "
+                    "When information is limited, stay conservative and avoid adding specifics. "
+                    "Preserve quantitative bounds such as over, about and at least, and preserve planned versus completed states. "
+                    "Never turn publication or crawl metadata into an event date in the factual body; retain only dates explicitly stated in the source prose. "
+                    "Thursday means 周四, not a calendar date derived from metadata. "
+                    "Keep publication metadata only in a separate 日期 field; never add that date to the 内容 paragraph. "
+                    "Return strict JSON only: no Markdown, no code fences, no extra text. "
+                    "JSON keys: title, body, topics (array of strings). "
+                    f"{image_event_contract}"
+                    "The body is normally plain text; if the user prompt explicitly requires body to be a JSON object text, follow that stricter body format. "
+                    f"{writing_length_instruction if concise_news else ''}"
+                ),
+            ),
+            (
+                "user",
+                (
+                    "Prompt: {prompt_hint}\n"
+                    "Initial title: {title_hint}\n"
+                    "Assets (for reference only, do not output paths): {assets}\n"
+                    f"{output_contract}"
+                ),
+            ),
+        ]
+    )
+
+    messages = prompt.format_messages(
+        prompt_hint=prompt_hint,
+        title_hint=(title_hint or "").strip(),
+        assets=", ".join(asset_paths) if asset_paths else "none",
+    )
+
+    last_exc: Exception | None = None
+    generated_text: str | None = None
+    response_diagnostics: dict[str, Any] = {}
+    for idx, llm_cfg in enumerate(cfg_list):
+        request_attempt = 0
+        transient_attempt = 0
+        max_rate_limit_retries = _rate_limit_max_retries()
+        while True:
+            try:
+                model_kwargs = {
+                    "model_provider": "openai",
+                    "base_url": llm_cfg.base_url,
+                    "api_key": llm_cfg.api_key,
+                    "max_tokens": _effective_draft_max_tokens(
+                        prompt_text="\n".join(
+                            str(getattr(message, "content", "")) for message in messages
+                        ),
+                        max_body=max_body,
+                    ),
+                    "timeout": DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+                }
+                model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.4))
+                model_kwargs.update(_summary_provider_kwargs(llm_cfg))
+                model = init_chat_model(
+                    llm_cfg.model,
+                    **model_kwargs,
+                )
+                print(
+                    f"[llm] provider={llm_cfg.provider} model={llm_cfg.model} base_url={llm_cfg.base_url}"
+                )
+                resp = model.invoke(messages)
+                response_diagnostics = _response_diagnostics(resp, model_kwargs["max_tokens"])
+                print(f"[llm-response] provider={llm_cfg.provider} model={llm_cfg.model} diagnostics={json.dumps(response_diagnostics)}")
+                generated_text = _final_response_text(resp, response_diagnostics)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if (
+                    _is_rate_limited(exc)
+                    and not _is_provider_capacity_exhausted(exc)
+                    and request_attempt < max_rate_limit_retries
+                ):
+                    request_attempt += 1
+                    wait_s = _rate_limit_retry_seconds()
+                    print(
+                        f"[llm] rate_limited | provider={llm_cfg.provider} model={llm_cfg.model} "
+                        f"retry={request_attempt}/{max_rate_limit_retries} wait={wait_s}s"
+                    )
+                    time.sleep(wait_s)
+                    continue
+                if (
+                    _is_transient_request_error(exc)
+                    and transient_attempt < _transient_retry_max()
+                ):
+                    transient_attempt += 1
+                    wait_s = _transient_retry_seconds()
+                    print(
+                        f"[llm] transient_error | provider={llm_cfg.provider} model={llm_cfg.model} "
+                        f"retry={transient_attempt}/{_transient_retry_max()} wait={wait_s}s"
+                    )
+                    time.sleep(wait_s)
+                    continue
+                print(
+                    f"[llm] request_failed | provider={llm_cfg.provider} model={llm_cfg.model} "
+                    f"error={_truncate(str(exc), 240)}"
+                )
+                break
+        if generated_text is not None:
+            break
+        if idx + 1 < len(cfg_list) and _should_try_next_llm(last_exc or RuntimeError()):
+            continue
+        generated_text = json.dumps(
+            {
+                "title": _truncate((title_hint or "标题").strip(), max_title),
+                "body": "",
+                "topics": [],
+                "image_event": "",
+                "_fallback_error": str(last_exc),
+            },
+            ensure_ascii=False,
+        )
+        break
+
+    text = generated_text or ""
+
+    data = _parse_json_text(text)
+    if data is None:
+        data = {"title": title_hint, "body": text, "topics": [], "image_event": ""}
+    # Snapshot the model's optional column extras before they are normalised
+    # away, so the caller can persist them when a column prompt asks for them.
+    parsed_extras = {
+        key: data.get(key)
+        for key in ("status", "reason", "verified_contrast", "visual_plan")
+        if key in data
+    }
+
+    raw_title = _coerce_text(data.get("title", title_hint)).strip()
+    raw_body = _coerce_text(data.get("body", "")).strip()
+    if _looks_like_jsonish_payload(raw_body):
+        parsed_body = _parse_json_text(raw_body)
+        if parsed_body and isinstance(parsed_body, dict):
+            nested_body = _coerce_text(parsed_body.get("body") or parsed_body.get("text")).strip()
+            if nested_body:
+                raw_body = nested_body
+            nested_title = _coerce_text(parsed_body.get("title")).strip()
+            if nested_title and (not raw_title or raw_title == title_hint):
+                raw_title = nested_title
+            nested_topics = _normalize_topics(parsed_body.get("topics"))
+            if nested_topics and not _normalize_topics(data.get("topics")):
+                data["topics"] = nested_topics
+            nested_event = _coerce_text(parsed_body.get("image_event")).strip()
+            if nested_event and not _coerce_text(data.get("image_event")).strip():
+                data["image_event"] = nested_event
+
+    raw_body = _sanitize_body(raw_body)
+
+    if not raw_title:
+        raw_title = title_hint
+    if not raw_body:
+        # Never turn private instructions into publishable content. An empty
+        # model body is a failed generation and must be rejected by callers.
+        data["_fallback_error"] = str(data.get("_fallback_error") or "LLM returned an empty body")
+
+    data["title"] = _truncate(repair_utf8_as_gbk_mojibake(raw_title), max_title)
+    repaired_body = repair_utf8_as_gbk_mojibake(raw_body)
+    data["body"] = repaired_body if preserve_body or concise_news else _truncate(repaired_body, max_body)
+    data["topics"] = [
+        repair_utf8_as_gbk_mojibake(topic)
+        for topic in _normalize_topics(data.get("topics"))
+    ]
+    data["image_event"] = repair_utf8_as_gbk_mojibake(
+        _coerce_text(data.get("image_event", ""))
+    )
+    # Column prompts may request a few structured extras (for example the
+    # illustration plan or an explicit status). Carry them through unchanged so
+    # the caller can persist and validate them; unknown keys stay dropped.
+    for extra_key in ("status", "reason", "verified_contrast", "visual_plan"):
+        if extra_key in data:
+            continue
+        value = parsed_extras.get(extra_key) if isinstance(parsed_extras, dict) else None
+        if value not in (None, "", [], {}):
+            data[extra_key] = value
+    if response_diagnostics:
+        data["_response_diagnostics"] = response_diagnostics
+    return data
+
+
+def generate_json(
+    cfg: LLMConfig | list[LLMConfig],
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 6000,
+) -> Dict[str, Any]:
+    """Return one strict JSON response without applying draft-writing defaults."""
+    cfg_list = _ensure_cfg_list(cfg)
+    # Pass prompts as template values so literal JSON braces in a schema are
+    # treated as content instead of LangChain template variables.
+    messages = ChatPromptTemplate.from_messages(
+        [
+            ("system", "{system_prompt}"),
+            ("user", "{user_prompt}"),
+        ]
+    ).format_messages(system_prompt=system_prompt, user_prompt=user_prompt)
+    last_exc: Exception | None = None
+
+    for idx, llm_cfg in enumerate(cfg_list):
+        request_attempt = 0
+        max_rate_limit_retries = _rate_limit_max_retries()
+        while True:
+            try:
+                model_kwargs = {
+                    "model_provider": "openai",
+                    "base_url": llm_cfg.base_url,
+                    "api_key": llm_cfg.api_key,
+                    "max_tokens": max(256, int(max_tokens)),
+                    "timeout": DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+                }
+                model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.1))
+                model_kwargs.update(_summary_provider_kwargs(llm_cfg, disable_thinking=False))
+                model = init_chat_model(
+                    llm_cfg.model,
+                    **model_kwargs,
+                )
+                print(
+                    f"[llm-json] provider={llm_cfg.provider} model={llm_cfg.model} "
+                    f"base_url={llm_cfg.base_url}"
+                )
+                response = model.invoke(messages)
+                diagnostics = _response_diagnostics(response, model_kwargs["max_tokens"])
+                print(f"[llm-json-response] provider={llm_cfg.provider} model={llm_cfg.model} diagnostics={json.dumps(diagnostics)}")
+                text = _final_response_text(response, diagnostics)
+                data = _parse_json_text(text)
+                if not isinstance(data, dict):
+                    raise RuntimeError("model did not return a parseable JSON object")
+                return data
+            except Exception as exc:
+                last_exc = exc
+                if (
+                    _is_rate_limited(exc)
+                    and not _is_provider_capacity_exhausted(exc)
+                    and request_attempt < max_rate_limit_retries
+                ):
+                    request_attempt += 1
+                    wait_s = _rate_limit_retry_seconds()
+                    print(
+                        f"[llm-json] rate_limited | provider={llm_cfg.provider} model={llm_cfg.model} "
+                        f"retry={request_attempt}/{max_rate_limit_retries} wait={wait_s}s"
+                    )
+                    time.sleep(wait_s)
+                    continue
+                break
+        if idx + 1 < len(cfg_list) and _should_try_next_llm(last_exc or RuntimeError()):
+            continue
+        break
+
+    raise RuntimeError(f"LLM JSON generation failed: {last_exc}")
