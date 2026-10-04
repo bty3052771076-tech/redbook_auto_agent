@@ -64,3 +64,11 @@ settings.local.*
 *.sqlite*
 Thumbs.db
 .DS_Store
+
+# Local third-party deployments; keep tools/redbook_tools versioned
+/tools/worldmonitor/
+/tools/RSSHub/
+/tools/AIHOT/
+/tools/opencodex/
+/tools/postgresql/
+/tools/*.local.json

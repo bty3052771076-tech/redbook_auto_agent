@@ -15,5 +15,8 @@ def configure_runtime() -> Path:
     os.environ["KNOWLEDGE_DB_CREDENTIALS"] = str(credentials)
     os.environ.setdefault("KNOWLEDGE_EMBEDDING_CACHE", str(root / "data/models/fastembed"))
     os.environ["ALLOW_PAID_LLM_FALLBACK"] = "0"
-    os.environ.setdefault("GLOBAL_MAP_BASEMAP_PATH", r"E:\AI\codex\worldmonitor\public\data\countries.geojson")
+    tools = Path(__file__).resolve().parents[1] / "tools"
+    os.environ.setdefault("WORLDMONITOR_DIR", str(tools / "worldmonitor"))
+    os.environ.setdefault("RSSHUB_DIR", str(tools / "RSSHub"))
+    os.environ.setdefault("GLOBAL_MAP_BASEMAP_PATH", str(tools / "worldmonitor/public/data/countries.geojson"))
     return root

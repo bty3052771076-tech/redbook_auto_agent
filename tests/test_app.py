@@ -16,7 +16,7 @@ from backend.runs import local_draft_ids
 
 
 BASE = "http://127.0.0.1:8786"
-TOOLS = Path(r"E:\AI\codex\redbook_tools")
+TOOLS = Path(__file__).resolve().parents[1] / "tools/redbook_tools"
 OLD = Path(r"E:\AI\codex\redbook_workflow")
 
 

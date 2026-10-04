@@ -2,6 +2,10 @@
 
 本程序位于 `E:\AI\codex\redbook_agent`，通过 `redbook_tools` 调用新闻采集、写稿、生图和草稿上传工具；PostgreSQL、草稿、图片、日志和专用浏览器 profile 保存在 `E:\AI\codex\redbook_runtime`。启动和运行不读取旧 `redbook_workflow` 目录。旧项目及其 `Start-Web-GUI.cmd`、`apps.cli` 仍保留，可继续人工使用。
 
+所有领域工具代码实际从本项目 `tools/redbook_tools` 导入，不再依赖旁边的 `E:\AI\codex\redbook_tools`。第三方工具副本位于 `tools/worldmonitor`、`tools/RSSHub`、`tools/AIHOT`、`tools/opencodex` 和 `tools/postgresql/18.6/pgsql`，保留原始目录。数据、登录态与 API Key 继续使用原运行区，不复制或覆盖活动数据库。
+
+本机工具复制入口是 `scripts/provision_local_tools.ps1`。已有虚拟环境的工具包引用可使用 `.\.venv\Scripts\python.exe scripts/rebind_tool_package.py` 修正，不下载新依赖。工具清单位于被忽略的 `tools/manifest.local.json`。Node.js、Python、Chrome 与现有 OpenCodex 账号配置仍属于本机环境；不会迁移账号池，也不会切换付费 API。
+
 ## 快速开始
 
 1. 双击 `Start-Agent.cmd`。脚本仅在 E 盘启动独立 PostgreSQL（端口 5433），然后启动本地 API 与已构建的前端。
@@ -22,7 +26,7 @@
 
 ## 本地 AIHOT 信源
 
-“每日AI讯息”可额外读取部署在 `E:\AI\codex\AIHOT` 的开源 AIHOT。运行前执行 `& 'E:\AI\codex\AIHOT\scripts\local-stack.ps1' start -Worker`，结束后执行相同脚本的 `stop`；站点地址为 <http://127.0.0.1:8768>。独立运行区的 `.env.gui` 已配置本地 API 地址。AIHOT 使用另一套 E 盘 PostgreSQL（5434），不会读取旧项目的浏览器 profile 或草稿。若该服务未启动，智能体会报告该聚合信源的连接失败，并继续尝试其余信源。AIHOT 仅提供可核验原始网址和发布时间的候选线索，最终仍由智能体执行时效、查重与内容质量检查。
+“每日AI讯息”可额外读取本项目 `tools/AIHOT` 的开源 AIHOT。运行前执行 `scripts/manage_aihot.ps1 -Action start -Worker`，结束后执行相同脚本的 `-Action stop`；站点地址为 <http://127.0.0.1:8768>。独立运行区的 `.env.gui` 已配置本地 API 地址。AIHOT 使用另一套 E 盘 PostgreSQL（5434），数据继续在 `E:\AI\codex\AIHOT-data`；两个程序不要同时启动两份服务。若该服务未启动，智能体会报告该聚合信源的连接失败，并继续尝试其余信源。AIHOT 仅提供可核验原始网址和发布时间的候选线索，最终仍由智能体执行时效、查重与内容质量检查。
 
 ## 安装与更新
 
@@ -63,7 +67,7 @@ py -3.10 -m venv .venv
 ```powershell
 Set-Location E:\AI\codex\redbook_agent
 .\.venv\Scripts\python.exe -m pytest -q tests
-Set-Location E:\AI\codex\redbook_tools
+Set-Location E:\AI\codex\redbook_agent\tools\redbook_tools
 E:\AI\codex\redbook_agent\.venv\Scripts\python.exe -m pytest -q tests
 ```
 
@@ -79,4 +83,4 @@ E:\AI\codex\redbook_agent\.venv\Scripts\python.exe -m pytest -q tests
 4. 运行区 `.env.gui` 中填写本人的供应商密钥和模型配置；不要提交该文件。ChatGPT 订阅生图需要另行准备本地 OpenCodex 和已授权的账号连接；仅克隆本仓库不会获得该连接。参考图/人设图、地图 GeoJSON、可选 AIHOT/RSSHub 等外部服务也需要自行配置。
 5. 启动 `Start-Agent.cmd`，通过连接页面在专用 profile 中完成平台登录，然后先验证本地生成和草稿上传。首次部署的完整生成与平台链路需要部署者实机验证；本仓库的自动化测试不能替代账号权限和平台审核结果。
 
-现有本机 `.venv` 之前引用旁边的 `redbook_tools`，此次发布不会中断它。下一次重新安装根目录依赖会改用仓库自带工具包。更新时先等待当前任务结束，不要同时运行两份后台竞争同一 profile。
+现有本机 `.venv` 已改用仓库内 `tools/redbook_tools`。`Start-Agent.cmd` 使用 `scripts/manage_postgresql.ps1` 从本项目的 PostgreSQL 副本管理原运行区数据库；新部署也需要准备该二进制目录。更新时先等待当前任务结束，不要同时运行两份后台竞争同一 profile。
