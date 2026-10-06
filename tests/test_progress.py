@@ -135,3 +135,27 @@ def test_status_questions_are_read_only(text):
 @pytest.mark.parametrize("text", ["生成10条每日新闻", "重新生成每日AI讯息并上传", "生成1条每日新闻，完成后告诉我进度", "停止当前任务", "删除草稿"])
 def test_new_task_or_control_command_is_not_a_status_question(text):
     assert not is_status_question(text)
+
+
+@pytest.mark.parametrize('result,message', [
+    ('no_verified_offers', '截至北京时间2026-10-05，今日暂未发现可核验且可领取的AI福利。'),
+    ('verification_incomplete', '福利核验未完成，不能据此判断今天没有福利。'),
+])
+def test_wool_result_remains_visible_after_other_job_events(result, message):
+    from backend.progress import activity_reply
+
+    run = {'status': 'completed', 'events': [
+        event(1, 'wool_result', 'in_progress', f'daily_wool result={result} message={message}'),
+        *[event(i, 'review', 'in_progress', 'daily_news') for i in range(2, 25)],
+        event(25, 'finish', 'success', 'uploaded=1'),
+    ]}
+    activity = build_activity(run, {}, now=120)
+    assert message in activity['summary']
+    assert message in activity_reply(activity)
+
+
+def test_wool_notice_survives_log_rollover_and_resume():
+    cp = {'jobs': [{'kind': 'daily_wool', 'count': 1}],
+          'job_states': {'0': {'wool_notice': '今日暂未发现可核验且可领取的AI福利。'}}}
+    activity = build_activity({'status': 'completed', 'events': []}, cp, now=120)
+    assert '暂未发现可核验' in activity['summary']

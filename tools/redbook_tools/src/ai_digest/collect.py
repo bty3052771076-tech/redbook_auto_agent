@@ -328,8 +328,14 @@ def _aihot_detail_external_url(html_text: str) -> str:
 
 
 def _matches_vendor_official_host(item: AIUpdateItem, url: str) -> bool:
-    host = (urlsplit(url or "").hostname or "").lower()
+    parts = urlsplit(url or "")
+    host = (parts.hostname or "").lower()
     vendor = (item.vendor or "").strip().lower()
+    if host == "github.com":
+        owners = {"anthropic": "anthropics", "openai": "openai"}
+        segments = parts.path.strip("/").split("/")
+        if vendor in owners:
+            return len(segments) >= 2 and segments[0].lower() == owners[vendor]
     expected_hosts = _VENDOR_OFFICIAL_HOSTS.get(vendor, ())
     return any(host == expected or host.endswith(f".{expected}") for expected in expected_hosts)
 
@@ -1232,6 +1238,7 @@ def collect_ai_digest_updates(
     )
     if allow_social_backfill and aggregator_sources and (
         force_aggregator_backfill
+        or include_pool_items
         or _needs_search_backfill(
             ranked,
             target_count=target_count,
@@ -1352,6 +1359,7 @@ def collect_ai_digest_updates(
         and social_sources
         and (
             force_social_backfill
+            or include_pool_items
             or _needs_search_backfill(
                 ranked,
                 target_count=target_count,

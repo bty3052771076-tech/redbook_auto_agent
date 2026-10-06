@@ -26,6 +26,7 @@ from src.storage.files import _write_json_atomic, latest_execution, load_post, s
 from src.storage.models import now_iso
 from src.global_map.models import GlobalMapRequest
 from src.global_map.service import preview_global_map_from_service
+from src.news.topics import DEFAULT_DAILY_NEWS_PROMPT
 
 ROOT = Path(os.getenv("REDBOOK_RUNTIME_ROOT") or Path(__file__).resolve().parents[1]).resolve()
 PROVIDERS = {"aliyun": "阿里云", "volcengine": "火山引擎", "siliconflow": "硅基流动", "minimax": "MiniMax", "opencodex": "OpenCodex / ChatGPT订阅"}
@@ -191,6 +192,7 @@ class Workbench:
     def _agent_count(text: str) -> int:
         patterns = (
             r"(?<!\d)(\d{1,3})\s*(?:条|篇)?\s*(?:(?:今日|今天)(?:的)?\s*)?每日新闻",
+            r"(?<!\d)(\d{1,3})\s*(?:条|篇)\s*(?:关于|有关)[^；;。\n]+?每日新闻",
             r"每日新闻\s*(?:生成|做|写)?\s*(\d{1,3})\s*(?:条|篇)?",
         )
         for pattern in patterns:
@@ -271,7 +273,7 @@ class Workbench:
                 "kind": "daily_news",
                 "title": "每日新闻",
                 "count": self._agent_count(cleaned),
-                "prompt": "国际冲突 争议事件 全球热点 财经产业 科技产业 芯片 AI 社会民生 体育文化 中国国内",
+                "prompt": DEFAULT_DAILY_NEWS_PROMPT,
                 "evaluation_viewpoint": "无视角评价",
                 "lookback_days": "auto",
             })
@@ -322,7 +324,7 @@ class Workbench:
             cleaned,
         ))
         generate_only = not wants_platform_draft and bool(
-            re.search(r"(?:只|仅)(?:生成|做|写)|(?:不要|不需要|禁止)(?:上传|保存)", cleaned)
+            re.search(r"(?:只|仅)(?:生成|做|写)|(?:不要|不需要|禁止|不)(?:上传|保存)", cleaned)
         )
         delivery = "generate_only" if generate_only else "save_draft"
         bindings = self.providers()["bindings"]
@@ -336,7 +338,9 @@ class Workbench:
         ))
         if score_choices:
             score_required = score_choices[-1].group().startswith(("开启", "启用"))
-        return {
+        from src.agent.task_intent import enrich_local_plan
+
+        return enrich_local_plan({
             "executable": bool(jobs),
             "jobs": jobs,
             "platform": platform,
@@ -352,16 +356,25 @@ class Workbench:
                 + ("只生成本地稿，不上传平台。" if delivery == "generate_only" else "完成后保存到草稿箱。")
                 + ("图片评分硬门槛开启。" if score_required else "图片评分仅供参考，不因低分重画或补位。")
             ) if jobs else "请明确要生成的栏目，例如“生成1篇每日AI讯息”或“生成3条每日新闻并保存到小红书草稿”。",
-        }
+        }, cleaned)
 
     def append_agent_message(self, conversation_id: str, text: str) -> dict:
         conversation = self._read_agent_conversation(valid_conversation_id(conversation_id))
-        plan_data = self._parse_agent_message(text)
+        if not str(text or "").strip() or len(str(text)) > 10000:
+            raise ValueError("请输入不超过10000字的任务要求")
+        try:
+            plan_data = self._parse_agent_message(text)
+        except ValueError as exc:
+            plan_data = {
+                "executable": False, "jobs": [], "recognition_source": "rules",
+                "delivery": "generate_only", "platform": "xhs",
+                "assistant_summary": str(exc), "parse_error": str(exc),
+            }
         now = time.time()
         message_id = uuid.uuid4().hex
         conversation["messages"].append({"id": message_id, "role": "user", "content": str(text).strip(), "created_at": now})
         plan_id = uuid.uuid4().hex
-        plan = {"id": plan_id, "version": len(conversation["plans"]) + 1, "created_at": now, "status": "ready" if plan_data["executable"] else "needs_input", **plan_data}
+        plan = {"id": plan_id, "version": len(conversation["plans"]) + 1, "created_at": now, "source_message_id": message_id, "status": "ready" if plan_data["executable"] else "needs_input", **plan_data}
         conversation["plans"].append(plan)
         conversation["messages"].append({
             "id": uuid.uuid4().hex,
@@ -531,6 +544,11 @@ class Workbench:
         plan_path = plans_dir / f"{plan_id}.json"
         _write_json_atomic(plan_path, {
             "jobs": plan["jobs"],
+            "recognition_source": plan.get("recognition_source", "rules"),
+            "source_message_id": plan.get("source_message_id", ""),
+            "requirements": plan.get("requirements", []),
+            "performance_mode": plan["performance_mode"],
+            "platform": plan["platform"],
             "delivery": plan["delivery"],
             "image_score_required": plan.get("image_score_required", True),
             "conversation_context": self._agent_memory_for_execution(conversation_id),
@@ -1004,8 +1022,13 @@ class Workbench:
         return {"rows": rows, "snapshots": snapshots, "provider_labels": labels}
 
     def sources(self) -> dict:
-        snapshots = gui.load_latest_source_health_snapshots(source_dir=self.root / "data/source_health")
-        return self.redact({"rows": [asdict(r) for r in gui.build_source_health_dashboard_rows(snapshots)]})
+        from src.sources.diagnostics import diagnostic_dashboard
+        report = diagnostic_dashboard(root=self.root, env=self.environment())
+        with self.lock:
+            checks = [j for j in self.jobs.values() if j.get("kind") == "check-sources"]
+            latest = max(checks, key=lambda j: j.get("created_at", 0), default=None)
+            report["check"] = {k: latest.get(k) for k in ("id", "status", "stage", "message", "started_at", "ended_at")} if latest else None
+        return self.redact(report)
 
     def analysis(self) -> dict:
         path = self.root / "data/analytics/published_metrics_analysis.md"
@@ -1148,7 +1171,7 @@ class Workbench:
                 raise ValueError("模式或目标平台无效")
             prompt = gui.combine_prompt_entries(request.get("prompts", []))
             if not prompt:
-                prompt = "国际冲突 争议事件 全球热点 财经产业 科技产业 芯片 AI 社会民生 体育文化 中国国内"
+                prompt = DEFAULT_DAILY_NEWS_PROMPT
             lookback = str(request.get("lookback_days", "auto") or "auto")
             try:
                 raw_budget = request.get("budget_minutes", 0)
@@ -1409,8 +1432,8 @@ class Workbench:
             args += [kind, "--top-n", str(bounded_int(request.get("top_n", 6), 1, 20)), "--save"]
         elif kind == "check-sources":
             args = gui.build_cli_args(kind, params={"collection": request.get("collection", "all"),
-                "keywords": str(request.get("keywords", "科技")),
-                "max_age_days": bounded_int(request.get("max_age_days", 3), 1, 14)})
+                "keywords": str(request.get("keywords", DEFAULT_DAILY_NEWS_PROMPT)),
+                "max_age_days": bounded_int(request.get("max_age_days", 2), 1, 14)})
         elif kind in {"delete-preview", "delete-drafts"}:
             scope = deletion_scope(request)
             if kind == "delete-drafts":

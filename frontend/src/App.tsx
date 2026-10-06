@@ -1,18 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, CheckCircle2, ChevronRight, CircleAlert, ClipboardList, Database, FileText, Image, LoaderCircle, Menu, MessageSquare, Play, RefreshCw, Send, Settings2, ShieldCheck, X } from "lucide-react";
+import { Activity, Check, CheckCircle2, ChevronRight, CircleAlert, ClipboardList, Database, FileText, Image, LoaderCircle, Menu, MessageSquare, Play, RefreshCw, Send, Settings2, ShieldCheck, X } from "lucide-react";
 import {
   api, startSession, type Connections, type Conversation, type Draft, type DraftSummary,
   type Model, type Plan, type Run,
 } from "./api";
 import { RunProgress, TechnicalLog, activeStatuses } from "./RunProgress";
 import { WoolGallery } from "./WoolGallery";
+import { PlanJobs, TaskCalibration } from "./TaskCalibration";
+import { SourceDiagnostics } from "./SourceDiagnostics";
+import "./source-diagnostics.css";
 
-type Page = "chat" | "drafts" | "runs" | "connections" | "wool";
+type Page = "chat" | "drafts" | "runs" | "connections" | "wool" | "sources";
 const pages: { id: Page; label: string; icon: typeof MessageSquare }[] = [
   { id: "chat", label: "对话任务", icon: MessageSquare },
   { id: "drafts", label: "草稿审查", icon: FileText },
   { id: "runs", label: "运行记录", icon: ClipboardList },
   { id: "connections", label: "连接与模型", icon: Settings2 },
+  { id: "sources", label: "信源健康", icon: Activity },
   { id: "wool", label: "AI鸡蛋图库", icon: Image },
 ];
 const requiredChecks = [
@@ -47,6 +51,7 @@ function App() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [prompt, setPrompt] = useState("");
   const [plan, setPlan] = useState<Plan | null>(null);
+  const [calibrationPending, setCalibrationPending] = useState(false);
   const [runs, setRuns] = useState<Run[]>([]);
   const [activeRun, setActiveRun] = useState<Run | null>(null);
   const [runConnectionError, setRunConnectionError] = useState("");
@@ -168,7 +173,7 @@ function App() {
   }
 
   async function confirmPlan() {
-    if (!conversation || !plan || !plan.executable) return;
+    if (!conversation || !plan || !plan.executable || calibrationPending) return;
     setBusy(true); setError("");
     try {
       const result = await api<Run>(`/api/plans/${plan.id}/confirm`, "POST", {
@@ -253,10 +258,28 @@ function App() {
             <div className="messages">{conversation?.messages.length ? conversation.messages.map((message) => <div key={message.id} className={`message ${message.role}`}><small>{message.role === "user" ? "你" : "智能体"} · {niceDate(message.created_at)}</small><p>{message.content}</p></div>) : <div className="empty-chat"><MessageSquare size={22} /><strong>开始一项采编任务</strong><span>输入自然语言要求，智能体先展示可确认的执行计划。</span></div>}
               {activeRun && conversation?.runs.includes(activeRun.id) && <div className="message assistant live-message"><small>智能体 · 运行播报</small><RunProgress run={activeRun} connectionError={runConnectionError} onRefresh={refreshRun} /><TechnicalLog run={activeRun} /></div>}
             </div>
-            <div className="composer"><label htmlFor="prompt">任务要求</label><textarea id="prompt" rows={3} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="例如：生成 3 条每日新闻和 1 篇每日 AI 讯息，核验事实与配图后保存到草稿箱" onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); sendMessage(); } }} /><div className="composer-actions">{activeRun ? <button className="text-button" disabled={busy} onClick={askProgress}><RefreshCw size={14} />询问进度</button> : <span>新任务生成前确认计划</span>}<button className="primary-button" disabled={busy || !prompt.trim()} onClick={() => sendMessage()}><Send size={16} />发送</button></div></div>
+            <div className="composer"><label htmlFor="prompt">任务要求</label><textarea id="prompt" rows={3} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="例如：生成5条每日新闻，关键词：伊朗、关税、芯片；保存到小红书草稿箱" onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); sendMessage(); } }} /><div className="composer-actions">{activeRun ? <button className="text-button" disabled={busy} onClick={askProgress}><RefreshCw size={14} />询问进度</button> : <span>新任务生成前确认计划</span>}<button className="primary-button" disabled={busy || !prompt.trim()} onClick={() => sendMessage()}><Send size={16} />发送</button></div></div>
           </section>
-          <aside className="plan-pane"><div className="pane-heading"><h2>本次计划</h2><span className="status-amber">{plan ? planRunning ? "执行中" : planSubmitted ? "已执行" : plan.executable ? "待确认" : "需补充" : "等待输入"}</span></div>{plan ? <><ol className="plan-list">{plan.jobs.map((job, index) => <li key={`${job.kind}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{job.title}</strong><small>{job.count} 条 · 生成与审查</small></div></li>)}</ol><div className="plan-boundary"><h3>执行边界</h3><p>交付：{plan.delivery === "generate_only" ? "仅生成本地稿" : "保存至草稿箱"}</p><p>平台：{plan.platform === "xhs" ? "小红书" : plan.platform}</p><p>公开发布：本次不执行</p></div><button className="primary-button full" disabled={busy || !plan.executable || planSubmitted} onClick={confirmPlan}><Play size={16} />{planRunning ? "正在执行" : planSubmitted ? "计划已执行" : "确认并执行"}</button></> : <p className="muted">输入任务后，这里会显示栏目、数量和交付方式。</p>}{activeRun && <div className="run-inline"><strong>最近一次运行</strong><RunProgress run={activeRun} compact connectionError={runConnectionError} /><button className="text-button" onClick={() => setPage("runs")}>查看运行记录 <ChevronRight size={14} /></button></div>}</aside>
+          <aside className="plan-pane">
+            <div className="pane-heading"><h2>本次计划</h2><span className="status-amber">{plan ? planRunning ? "执行中" : planSubmitted ? "已执行" : plan.executable ? "待确认" : "需补充" : "等待输入"}</span></div>
+            {plan ? <>
+              {conversation && <TaskCalibration key={`${conversation.id}:${plan.id}`} conversation={conversation} plan={plan}
+                disabled={busy || planSubmitted || Boolean(activeRun && activeStatuses.has(activeRun.status))}
+                onPendingChange={setCalibrationPending} onAdopt={() => openConversation(conversation.id)} />}
+              <h3 className="current-plan-heading">当前计划</h3>
+              <PlanJobs jobs={plan.jobs} />
+              {!!plan.unresolved_requirements?.length && <ul className="calibration-issues">{plan.unresolved_requirements.map((item, index) => <li key={index}>{item}</li>)}</ul>}
+              <div className="plan-boundary"><h3>执行边界</h3><p>交付：{plan.delivery === "generate_only" ? "仅生成本地稿" : "保存至草稿箱"}</p><p>平台：{plan.platform === "xhs" ? "小红书" : plan.platform}</p><p>运行模式：{plan.performance_mode === "speed" ? "速度优先" : "速度与稳定平衡"}</p><p>公开发布：本次不执行</p></div>
+              <button className="primary-button full" disabled={busy || calibrationPending || !plan.executable || planSubmitted} onClick={confirmPlan}><Play size={16} />{planRunning ? "正在执行" : planSubmitted ? "计划已执行" : "确认并执行"}</button>
+            </> : <p className="muted">输入任务后，这里会显示栏目、数量和交付方式。</p>}
+            {activeRun && <div className="run-inline"><strong>最近一次运行</strong><RunProgress run={activeRun} compact connectionError={runConnectionError} /><button className="text-button" onClick={() => setPage("runs")}>查看运行记录 <ChevronRight size={14} /></button></div>}
+          </aside>
         </div>}
+        {ready && page === "sources" && <main className="standard-page"><div className="page-heading"><h1>信源健康</h1></div>
+          <SourceDiagnostics read={() => api("/api/sources")} check={request => {
+            const { kind: _kind, title: _title, ...body } = request;
+            return api("/api/sources/check", "POST", body, crypto.randomUUID());
+          }}/></main>}
         {ready && page === "wool" && <main className="standard-page"><WoolGallery request={(path, method, body) => api("/api" + path, method, body)}/></main>}
         {ready && page === "drafts" && <div className="draft-layout">
           <section className="draft-list">

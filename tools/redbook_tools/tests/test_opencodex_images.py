@@ -52,6 +52,21 @@ def test_subscription_provider_cannot_contain_api_key():
         relay.validate_subscription_config(value)
 
 
+def test_unrelated_chat_provider_cannot_disable_subscription_images():
+    value = config()
+    value['providers']['text-service'] = {
+        'adapter': 'openai-chat', 'baseUrl': 'https://text.example/v1', 'apiKey': 'dummy'}
+    relay.validate_subscription_config(value)
+
+
+@pytest.mark.parametrize('name', ['openai-apikey', 'google-antigravity'])
+def test_automatic_image_fallback_provider_is_forbidden_even_with_chat_adapter(name):
+    value = config()
+    value['providers'][name] = {'adapter': 'openai-chat', 'apiKey': 'dummy'}
+    with pytest.raises(relay.OpenCodexImageError):
+        relay.validate_subscription_config(value)
+
+
 @pytest.mark.parametrize("url", ["https://api.openai.com/v1", "http://localhost:10100",
                                   "http://127.0.0.1:10100/v1", "http://127.0.0.1:10100?q=x"])
 def test_only_exact_loopback_origin_is_accepted(monkeypatch, url):
@@ -122,6 +137,42 @@ def test_timeout_cannot_be_resubmitted_with_a_new_post_id(mocked_relay, tmp_path
                 post_id=post_id, prompt="same scene", dest_dir=tmp_path / post_id
             )
     assert len(calls) == 1
+
+
+def test_explicit_bad_request_is_rejected_and_preserves_safe_diagnostic(mocked_relay, tmp_path):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(400, json={"error": {
+            "code": "invalid_request_error", "param": "images",
+            "message": "Invalid image input token=sk-private-test"}})
+
+    mocked_relay(handler)
+    for post_id in ("first", "replacement"):
+        with pytest.raises(relay.OpenCodexImageError, match="HTTP_400") as caught:
+            relay.generate_subscription_image(
+                post_id=post_id, prompt="same scene", dest_dir=tmp_path / post_id)
+        assert "Invalid image input" in str(caught.value)
+        assert "sk-private-test" not in str(caught.value)
+    assert len(calls) == 1
+    record = json.loads(next((tmp_path / "submission-state").glob("*.json")).read_text())
+    assert record["status"] == "rejected"
+    assert record["upstream_error"]["code"] == "invalid_request_error"
+    assert "Invalid image input" in record["upstream_error"]["message"]
+    assert "sk-private-test" not in json.dumps(record)
+
+
+def test_legacy_bad_request_is_not_reported_as_an_uncertain_submission(mocked_relay, tmp_path):
+    mocked_relay(lambda request: pytest.fail("known rejection must not be resubmitted"))
+    dest = tmp_path / "assets"
+    dest.mkdir()
+    payload = {"model": relay.MODEL, "prompt": "scene", "inputs": [], "quality": "medium", "size": "1024x1536"}
+    key = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    (dest / f"opencodex-{key}.json").write_text(json.dumps({
+        "status": "uncertain", "error": "OPENCODEX_HTTP_400"}))
+    with pytest.raises(relay.OpenCodexImageError, match="HTTP_400"):
+        relay.generate_subscription_image(post_id="test", prompt="scene", dest_dir=dest)
 
 
 def test_two_references_use_json_edit_route(mocked_relay, tmp_path):

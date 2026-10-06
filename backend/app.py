@@ -12,6 +12,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -30,6 +31,7 @@ from src.storage.files import load_post  # noqa: E402
 
 from .evidence import source_evidence
 from .runs import local_draft_ids
+from .task_recognition import RecognitionService, call_model
 from .progress import activity_reply, build_activity, checkpoint_job_records, is_status_question, read_checkpoint, run_overview
 
 
@@ -39,6 +41,13 @@ class ConversationCreate(BaseModel):
 
 class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=12000)
+
+
+class SourceCheckCreate(BaseModel):
+    model_config = {"extra": "forbid"}
+    collection: Literal["all", "daily_news", "ai_digest"] = "all"
+    keywords: str = Field(default="国际冲突 科技产业 社会民生 财经产业", max_length=400)
+    max_age_days: int = Field(default=2, ge=1, le=14, strict=True)
 
 
 class PlanConfirm(BaseModel):
@@ -54,6 +63,18 @@ class ModelRoles(BaseModel):
     image: str = ""
 
 
+class TaskRecognitionCreate(BaseModel):
+    model_config = {"extra": "forbid"}
+    source_message_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    base_plan_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    base_plan_version: int = Field(ge=1, strict=True)
+
+
+class TaskRecognitionAdopt(BaseModel):
+    model_config = {"extra": "forbid"}
+    base_plan_version: int = Field(ge=1, strict=True)
+
+
 class DraftReview(BaseModel):
     updated_at: str
     checks: dict[str, bool]
@@ -63,6 +84,8 @@ class DraftReview(BaseModel):
 app = FastAPI(title="采编智能体", docs_url=None, redoc_url=None, openapi_url=None)
 app.state.token = secrets.token_urlsafe(32)
 app.state.service = None
+app.state.recognitions = None
+recognition_call = call_model
 
 
 def service() -> Workbench:
@@ -72,6 +95,16 @@ def service() -> Workbench:
             raise RuntimeError("独立 PostgreSQL 不可用，请检查 E 盘运行区的数据库")
         app.state.service = Workbench(root=RUNTIME)
     return app.state.service
+
+
+def recognition_service() -> RecognitionService:
+    current = service()
+    with current.lock:
+        existing = app.state.recognitions
+        if existing is None or existing.current is not current:
+            existing = RecognitionService(current, lambda config, payload: recognition_call(config, payload))
+            app.state.recognitions = existing
+        return existing
 
 
 def ensure_review_schema() -> None:
@@ -149,6 +182,16 @@ def conversations():
     return {"rows": service().list_agent_conversations()}
 
 
+@app.get("/api/sources", dependencies=[Depends(authenticated)])
+def sources():
+    return service().sources()
+
+
+@app.post("/api/sources/check", dependencies=[Depends(authenticated)])
+def check_sources(body: SourceCheckCreate, idempotency_key: str = Header(default="")):
+    return service().submit({"kind": "check-sources", "title": "信源检测", **body.model_dump()}, idempotency_key)
+
+
 @app.post("/api/conversations", dependencies=[Depends(authenticated)])
 def create_conversation(body: ConversationCreate):
     return service().create_agent_conversation(body.title)
@@ -175,7 +218,10 @@ def add_message(conversation_id: str, body: MessageCreate):
             saved["messages"].extend([message, assistant])
             current._write_agent_conversation(saved)
         return current.redact({"message": message, "assistant": assistant, "plan": None, "run": detail})
-    parsed = current._parse_agent_message(body.content)
+    try:
+        parsed = current._parse_agent_message(body.content)
+    except ValueError:
+        return current.append_agent_message(conversation_id, body.content)
     if parsed.get("plan_kind") == "draft_management" and (parsed.get("management") or {}).get("mode") == "publish":
         raise ValueError("独立界面暂不执行公开发布；请先生成、审查并上传草稿，发布请在平台人工确认")
     return current.append_agent_message(valid_conversation_id(conversation_id), body.content)
@@ -188,10 +234,34 @@ def confirm_plan(plan_id: str, body: PlanConfirm, idempotency_key: str = Header(
     plan = next((item for item in conversation.get("plans", []) if item.get("id") == valid_id(plan_id)), None)
     if plan and plan.get("plan_kind") == "draft_management" and (plan.get("management") or {}).get("mode") == "publish":
         raise ValueError("独立界面暂不执行公开发布；请在平台人工确认")
-    return current.execute_agent_plan(
-        valid_conversation_id(body.conversation_id), valid_id(plan_id), body.version,
-        idempotency_key or uuid4().hex, skill_mode=body.skill_mode, skill_names=body.skill_names,
-    )
+    with current.lock:
+        recognition_service().assert_can_execute(body.conversation_id, plan_id)
+        return current.execute_agent_plan(
+            valid_conversation_id(body.conversation_id), valid_id(plan_id), body.version,
+            idempotency_key or uuid4().hex, skill_mode=body.skill_mode, skill_names=body.skill_names,
+        )
+
+
+@app.post("/api/conversations/{conversation_id}/task-recognitions", dependencies=[Depends(authenticated)])
+def create_task_recognition(conversation_id: str, body: TaskRecognitionCreate, idempotency_key: str = Header(default="")):
+    if len(idempotency_key) > 120:
+        raise ValueError("校准请求键过长")
+    return recognition_service().start(valid_conversation_id(conversation_id), body.model_dump(), idempotency_key or uuid4().hex)
+
+
+@app.get("/api/conversations/{conversation_id}/task-recognitions/{recognition_id}", dependencies=[Depends(authenticated)])
+def task_recognition(conversation_id: str, recognition_id: str):
+    return recognition_service().get(valid_conversation_id(conversation_id), valid_id(recognition_id))
+
+
+@app.post("/api/conversations/{conversation_id}/task-recognitions/{recognition_id}/adopt", dependencies=[Depends(authenticated)])
+def adopt_task_recognition(conversation_id: str, recognition_id: str, body: TaskRecognitionAdopt):
+    return recognition_service().adopt(valid_conversation_id(conversation_id), valid_id(recognition_id), body.base_plan_version)
+
+
+@app.post("/api/conversations/{conversation_id}/task-recognitions/{recognition_id}/discard", dependencies=[Depends(authenticated)])
+def discard_task_recognition(conversation_id: str, recognition_id: str):
+    return recognition_service().discard(valid_conversation_id(conversation_id), valid_id(recognition_id))
 
 
 @app.get("/api/runs", dependencies=[Depends(authenticated)])

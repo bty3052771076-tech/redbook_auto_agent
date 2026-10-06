@@ -21,11 +21,47 @@ from PIL import Image, ImageStat
 MODEL = "gpt-image-2"
 VERIFIED_CODE_HASHES = {"d263dd024eb8e6bd6eea93ab02fc81f6ff2e890722df0e844833044c4b764586"}
 MAX_RESPONSE = 100 * 1024 * 1024
+REJECTED_HTTP_CODES = {400, 403, 413, 415, 422}
+
+
+def _raise_for_previous_submission(saved: dict) -> None:
+    error = str(saved.get("error") or "")
+    # Older versions incorrectly labelled explicit validation rejections uncertain.
+    if saved.get("status") == "rejected" or error in {
+        f"OPENCODEX_HTTP_{code}" for code in REJECTED_HTTP_CODES
+    }:
+        raise OpenCodexImageError(error or "OPENCODEX_PREVIOUS_REQUEST_REJECTED",
+                                 detail=str((saved.get("upstream_error") or {}).get("message") or ""))
+    if saved.get("status") in {"submitted", "uncertain"}:
+        raise OpenCodexImageError("OPENCODEX_PREVIOUS_REQUEST_UNCERTAIN")
+
+
+def _response_error(response: httpx.Response) -> dict[str, str]:
+    from src.images.minimax_images import safe_image_error
+
+    chunks, length = [], 0
+    try:
+        for chunk in response.iter_bytes():
+            length += len(chunk)
+            if length > 16384:
+                return {"message": "Error response exceeds diagnostic size limit"}
+            chunks.append(chunk)
+        payload = json.loads(b"".join(chunks))
+        error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        if not isinstance(error, dict):
+            return {}
+        return {key: safe_image_error(str(error[key])) for key in ("code", "type", "param", "message")
+                if error.get(key) is not None}
+    except (httpx.HTTPError, ValueError):
+        return {}
 
 
 class OpenCodexImageError(RuntimeError):
-    def __init__(self, code: str, *, fallback_safe: bool = False):
-        super().__init__(code)
+    def __init__(self, code: str, *, fallback_safe: bool = False, detail: str = ""):
+        if detail:
+            from src.images.minimax_images import safe_image_error
+            detail = safe_image_error(detail)
+        super().__init__(f"{code}: {detail}" if detail else code)
         self.code = code
         self.fallback_safe = fallback_safe
 
@@ -42,8 +78,13 @@ def validate_subscription_config(config: dict) -> None:
     if config.get("images"):
         raise OpenCodexImageError("OPENCODEX_CUSTOM_IMAGE_ROUTE_FORBIDDEN", fallback_safe=True)
     providers = config["providers"]
-    if set(providers) - {"openai", "command-code"}:
-        raise OpenCodexImageError("OPENCODEX_UNVERIFIED_PROVIDER_FORBIDDEN", fallback_safe=True)
+    for name in set(providers) - {"openai", "command-code"}:
+        # In the pinned relay, ordinary chat adapters are not image candidates.
+        # Reserved fallback routes and custom image settings remain forbidden.
+        provider = providers[name]
+        if (name in {"openai-apikey", "google-antigravity"}
+                or not isinstance(provider, dict) or provider.get("adapter") != "openai-chat"):
+            raise OpenCodexImageError("OPENCODEX_UNVERIFIED_PROVIDER_FORBIDDEN", fallback_safe=True)
     p = providers.get("openai")
     if not isinstance(p, dict) or (
         p.get("adapter") != "openai-responses"
@@ -262,14 +303,10 @@ def generate_subscription_image(*, post_id: str, prompt: str, dest_dir: Path,
                                                          "post_id": post_id})
                 raise OpenCodexImageError("OPENCODEX_CACHE_ARTIFACT_INVALID")
             # A process death after submission must not cause a second charged POST.
-            if saved.get("status") in {"submitted", "uncertain"}:
-                raise OpenCodexImageError("OPENCODEX_PREVIOUS_REQUEST_UNCERTAIN")
-            if saved.get("status") == "rejected":
-                raise OpenCodexImageError(saved.get("error", "OPENCODEX_PREVIOUS_REQUEST_REJECTED"))
+            _raise_for_previous_submission(saved)
         if shared_record.exists():
             shared = json.loads(shared_record.read_text(encoding="utf-8"))
-            if shared.get("status") in {"submitted", "uncertain"}:
-                raise OpenCodexImageError("OPENCODEX_PREVIOUS_REQUEST_UNCERTAIN")
+            _raise_for_previous_submission(shared)
         started = time.monotonic()
         meta: dict = {"provider": "opencodex", "mode": "ai_generated", "model": MODEL,
                       "endpoint": endpoint, "request_key": key, "input_hashes": hashes,
@@ -292,8 +329,12 @@ def generate_subscription_image(*, post_id: str, prompt: str, dest_dir: Path,
                         with client.stream("POST", base + "/v1/images/" + endpoint, json=body) as response:
                             if not 200 <= response.status_code < 300:
                                 safe = response.status_code in {401, 404, 429}
+                                meta["http_status"] = response.status_code
+                                meta["response_rejected"] = response.status_code in REJECTED_HTTP_CODES
+                                meta["upstream_error"] = _response_error(response)
                                 raise OpenCodexImageError(f"OPENCODEX_HTTP_{response.status_code}",
-                                                         fallback_safe=safe)
+                                                         fallback_safe=safe,
+                                                         detail=meta["upstream_error"].get("message", ""))
                             chunks, length = [], 0
                             for chunk in response.iter_bytes():
                                 length += len(chunk)
@@ -317,7 +358,8 @@ def generate_subscription_image(*, post_id: str, prompt: str, dest_dir: Path,
             width, height = validate_image(content, hashes)
             meta.update(width=width, height=height)
         except OpenCodexImageError as exc:
-            meta.update(error=exc.code, status="not_submitted" if exc.fallback_safe else
+            meta.update(error=exc.code, status="rejected" if meta.get("response_rejected") else
+                        "not_submitted" if exc.fallback_safe else
                         ("uncertain" if meta["status"] == "submitted" else "rejected"))
             _write_request_state(record, shared_record, meta)
             enabled = (os.getenv("OPENCODEX_IMAGE_FALLBACK") or "none").lower() == "minimax"

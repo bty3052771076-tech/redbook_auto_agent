@@ -19,6 +19,7 @@ STAGES = {
     "sync_context": "同步账号与知识库", "plan": "规划任务", "generate": "生成内容与配图",
     "review": "审查内容与配图", "upload": "保存平台草稿", "upload_batch": "保存平台草稿",
     "recover": "处理异常", "finish": "汇总结果",
+    "wool_result": "AI福利核验结果",
 }
 KINDS = {
     "daily_news": "每日新闻", "daily_ai_digest": "每日AI讯息", "daily_global_map": "全球事件关注图",
@@ -120,6 +121,8 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
     stage = "等待运行记录"
     timeline = []
     failures = []
+    wool_notice = next((str(record.get("wool_notice"))
+                        for record in checkpoint_job_records(checkpoint) if record.get("wool_notice")), "")
     for e in events:
         node, detail, state = str(e.get("node") or ""), str(e.get("detail") or ""), str(e.get("status") or "")
         kind = next((k for k in KINDS if re.search(rf"\b{re.escape(k)}\b", detail)), "")
@@ -141,7 +144,10 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
                 ids[cursor]["local"].add(post[1])
         if state in {"failed", "warning"} and agent:
             failures.append(_issue(detail))
-        if node == "finish":
+        if node == "wool_result" and "message=" in detail:
+            wool_notice = detail.split("message=", 1)[1].strip()
+            sentence = wool_notice
+        elif node == "finish":
             sentence = "运行结束，正在汇总交付结果。"
         elif node == "plan" and "summary=" in detail:
             sentence = "任务安排：" + detail.split("summary=", 1)[1].strip()
@@ -230,6 +236,8 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
             issues = [_issue(str(run.get("message") or checkpoint.get("last_failure") or "未记录具体错误原因"))]
     if counts["retained"]:
         summary += f" 已保留通过审查的稿件 {counts['retained']} 条，待继续上传。"
+    if wool_notice:
+        summary += " " + wool_notice
     issues = list({issue["message"]: issue for issue in issues}.values())
     return {"status": status, "status_label": LABELS.get(status, "状态未记录"), "active": active,
             "headline": headline, "summary": summary, "stage": stage, "current_job": current_job,

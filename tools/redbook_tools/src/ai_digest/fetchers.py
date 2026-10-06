@@ -787,49 +787,49 @@ def parse_codex_reset_html(
     page data. Treat the result as an aggregator lead, while retaining the
     direct X URL as evidence for later review.
     """
-    raw = html_text or ""
-    reset_match = re.search(r'\\"resetAt\\":\\"(?P<value>20[0-9]{2}-[0-9]{2}-[0-9]{2}T[^\\"]+)\\"', raw)
-    note_match = re.search(r'\\"note\\":\\"(?P<value>(?:\\\\.|[^\\"])*)\\"', raw)
-    source_match = re.search(
-        r'\\"resetAt\\":\\"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[^\\"]+\\".{0,700}?\\"source\\":\\"(?P<value>https?://[^\\"]+)\\"',
-        raw,
-    )
-    if not reset_match or not note_match:
-        return []
-    reset_at = reset_match.group("value")
-    try:
-        note = json.loads(f'"{note_match.group("value")}"')
-    except (TypeError, ValueError, json.JSONDecodeError):
-        note = note_match.group("value")
-    if "reset" not in f"{note} {raw[:25000]}".lower():
-        return []
-    evidence_url = source_match.group("value") if source_match else ""
-    try:
-        evidence_url = json.loads(f'"{evidence_url}"') if "\\" in evidence_url else evidence_url
-    except (TypeError, ValueError, json.JSONDecodeError):
-        pass
-    reset_kind = "可留存额度重置" if "banked reset" in str(note).lower() else "额度重置"
-    summary = (
-        f"第三方追踪页记录：Codex 出现{reset_kind}信号；"
-        "适用范围和到账情况须以官方通知或账户页面为准。"
-    )
-    return [
-        AIUpdateItem(
+    payload = _next_flight_payload_text(html_text or "")
+    marker = re.search(r'"recentHistory"\s*:\s*', payload)
+    if not marker:
+        raise ValueError("Codex reset history data missing; cannot verify benefits")
+    records, _ = json.JSONDecoder().raw_decode(payload, marker.end())
+    if not isinstance(records, list):
+        raise ValueError("Codex reset history is not a list")
+    items = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        details = record.get("details") or {}
+        if not isinstance(details, dict):
+            continue
+        reset_at = str(record.get("resetAt") or "")
+        note = str(details.get("note") or record.get("summary") or "")
+        evidence_url = str(record.get("source") or "")
+        if not _parse_datetime(reset_at) or not note or not evidence_url.startswith("https://"):
+            continue
+        banked = record.get("recordKind") == "banked_distribution" or "banked" in str(details.get("resetMethod") or "").lower()
+        reset_kind = "可留存额度重置" if banked else "已执行的自动额度重置"
+        summary = (
+            f"第三方追踪页记录：Codex {reset_kind}；"
+            "这是历史事件记录，适用范围、是否仍可领取和到账情况须以官方通知或账户页面为准。"
+        )
+        items.append(AIUpdateItem(
             title=f"Codex {reset_kind}：第三方追踪信号",
             summary=summary,
             source_name=source_name,
             source_type="aggregator",
-            url=base_url,
+            url=evidence_url,
             published_at=reset_at,
             vendor=vendor,
-            product="Codex banked reset",
+            product="Codex banked reset" if banked else "Codex automatic reset",
             raw_excerpt=f"{summary} 追踪页原始说明：{note} 追踪页引用的公开帖：{evidence_url}".strip(),
             confidence_score=0.78,
             verification_status="aggregator_confirmed",
             evidence_urls=[url for url in (evidence_url, base_url) if url],
-            tags=["AI", "benefit", "Codex", "banked_reset"],
-        )
-    ]
+            tags=["AI", "benefit", "Codex", "banked_reset" if banked else "historical_automatic_reset"],
+        ))
+    if records and not items:
+        raise ValueError("Codex reset history records lack dates or evidence")
+    return items
 
 
 class _LinkCollector(HTMLParser):

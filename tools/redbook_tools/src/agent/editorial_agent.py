@@ -576,9 +576,47 @@ def _build_graph(
             state["posts"] = posts
             state["post_ids"] = _post_ids(posts)
             state["last_failure"] = ""
+            state.setdefault("job_states", {}).setdefault(key, {}).pop("generation_failure", None)
+            if job.kind == "daily_wool":
+                for post in posts:
+                    platform = post.get("platform", {}) if isinstance(post, dict) else getattr(post, "platform", {})
+                    notice = ((platform or {}).get("daily_wool") or {}).get("user_notice")
+                    if notice:
+                        state["job_states"][key]["wool_notice"] = _redact_text(str(notice))
             _emit(state, progress, "generate", "success", f"{job.kind} posts={len(posts)} attempt={attempts[key]}")
         except Exception as exc:
             state["last_failure"] = _redact_text(f"generation_error: {exc}")
+            record = state.setdefault("job_states", {}).setdefault(key, {})
+            previous = record.get("generation_failure") or {}
+            repeated = int(previous.get("count", 0)) + 1 if previous.get("reason") == state["last_failure"] else 1
+            record["generation_failure"] = {"reason": state["last_failure"], "count": repeated}
+            requires_resolution = any(code in state["last_failure"] for code in (
+                "OPENCODEX_PREVIOUS_REQUEST_UNCERTAIN", "OPENCODEX_RESULT_UNCERTAIN",
+                "OPENCODEX_PREVIOUS_REQUEST_REJECTED", "OPENCODEX_HTTP_400",
+                "OPENCODEX_HTTP_403", "OPENCODEX_HTTP_413", "OPENCODEX_HTTP_415",
+                "OPENCODEX_HTTP_422", "WOOL_PERSONA_NOT_CONFIGURED", "WOOL_IMAGE_RESOURCE_MISSING",
+                "OPENCODEX_UPDATE_REQUIRES_COMPATIBILITY_REVIEW", "OPENCODEX_UNVERIFIED_PROVIDER_FORBIDDEN",
+                "OPENCODEX_CUSTOM_IMAGE_ROUTE_FORBIDDEN", "OPENCODEX_SUBSCRIPTION_ROUTE_REQUIRED",
+                "OPENCODEX_API_CREDENTIAL_ROUTE_FORBIDDEN", "OPENCODEX_LOOPBACK_URL_REQUIRED",
+                "OPENCODEX_CACHE_ARTIFACT_INVALID", "OPENCODEX_REFERENCE_TOO_LARGE",
+                "OPENCODEX_REFERENCE_FORMAT_INVALID", "OPENCODEX_TWO_REFERENCES_REQUIRED",
+            ))
+            material_exhausted = job.kind == "daily_ai_digest" and repeated >= 3 and any(
+                marker in state["last_failure"] for marker in (
+                    "daily ai digest material insufficient", "daily ai digest official material insufficient",
+                    "AI讯息材料不足"))
+            verification_incomplete = "WOOL_VERIFICATION_INCOMPLETE" in state["last_failure"]
+            if verification_incomplete:
+                record["wool_notice"] = state["last_failure"].split("WOOL_VERIFICATION_INCOMPLETE:", 1)[-1].strip()
+            if requires_resolution or material_exhausted or verification_incomplete:
+                state["retryable"] = False
+                state["job_blocked"] = True
+                action = ("SOURCE_REFRESH_REQUIRED: 连续三次相同资讯材料错误，需补充或修正可核验材料后续跑；"
+                          if material_exhausted else
+                          "SOURCE_VERIFICATION_REQUIRED: 请检查福利信源状态，恢复后续跑；"
+                          if verification_incomplete else
+                          "IMAGE_REQUEST_RESOLUTION_REQUIRED: 请检查生图错误记录并修复请求或核实提交结果后续跑；")
+                state["last_failure"] = action + state["last_failure"]
             state.setdefault("errors", []).append(state["last_failure"])
             provider_failure(state, [state["last_failure"]])
             _emit(state, progress, "generate", "failed", state["last_failure"])

@@ -1,4 +1,4 @@
-export type PlanJob = { kind: string; title: string; count: number; prompt?: string };
+export type PlanJob = { kind: string; title: string; count: number; prompt?: string; keywords?: string[]; topic_brief?: string };
 export type Plan = {
   id: string;
   version: number;
@@ -11,9 +11,22 @@ export type Plan = {
   delivery: string;
   platform: string;
   assistant_summary: string;
+  source_message_id?: string;
+  recognition_source?: "rules" | "llm";
+  performance_mode?: string;
+  image_score_required?: boolean;
+  unresolved_requirements?: string[];
+  model_roles?: Record<string, string>;
 };
 export type Message = { id: string; role: string; content: string; created_at: number };
-export type Conversation = { id: string; title: string; messages: Message[]; plans: Plan[]; runs: string[]; status: string };
+export type TaskRecognition = {
+  id: string; source_message_id: string; base_plan_id: string; base_plan_version: number;
+  status: "running" | "ready" | "needs_input" | "failed" | "interrupted" | "adopted" | "discarded";
+  model: string; provider: string; started_at: number; ended_at?: number; elapsed_seconds?: number;
+  error: string; candidate?: Plan | null;
+  changes: { label: string; before: unknown; after: unknown }[];
+};
+export type Conversation = { id: string; title: string; messages: Message[]; plans: Plan[]; runs: string[]; status: string; task_recognitions?: TaskRecognition[] };
 export type Activity = {
   status: string; status_label: string; active: boolean; headline: string; summary: string;
   stage: string; current_job: string; started_at: number | null; ended_at: number | null;
@@ -54,11 +67,11 @@ export type Connections = {
   profile_login: string;
 };
 
-export async function api<T>(path: string, method = "GET", body?: unknown): Promise<T> {
+export async function api<T>(path: string, method = "GET", body?: unknown, idempotencyKey?: string): Promise<T> {
   const response = await fetch(path, {
     method,
     credentials: "same-origin",
-    headers: { "Content-Type": "application/json", "X-Workbench": "1" },
+    headers: { "Content-Type": "application/json", "X-Workbench": "1", ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await response.json().catch(() => ({}));

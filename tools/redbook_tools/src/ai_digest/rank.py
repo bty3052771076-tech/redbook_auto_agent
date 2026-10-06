@@ -1362,19 +1362,27 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
     )
     for item in items:
         key = item.dedupe_key
+        release_url = urlsplit(item.normalized_url)
+        github_release = (
+            (release_url.hostname or "").lower() == "github.com"
+            and "/releases/tag/" in release_url.path
+        )
         if (
             item.source_type in {"official", "github"}
             and item.normalized_url
             and shared_official_urls[item.normalized_url] > 1
             and item.title_key
+            and not github_release
         ):
             # A release-notes page can contain several independently dated
             # entries. Preserve distinct titles from that same official page;
-            # semantic-topic deduplication below still merges the same update.
+            # a GitHub tag URL, however, represents exactly one release.
             key = f"{key}|title:{item.title_key}"
         stable_event = _stable_cross_source_event_key(item)
         stable_lookup_key = f"event:{stable_event}" if stable_event else ""
         title_key = item.title_key
+        if github_release and title_key:
+            title_key = f"{release_url.path.split('/releases/tag/', 1)[0]}:{title_key}"
         semantic_key = _semantic_topic_key(item)
         # Generic categories such as ``topic:benchmark`` are not event
         # identities. Do not merge them at all; URL/title keys still remove
@@ -1392,6 +1400,9 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
             "topic:updates",
         }
         semantic_lookup_key = "" if semantic_key in generic_topic_keys else semantic_key
+        if github_release:
+            # A coarse topic such as v2 cannot identify a specific release.
+            semantic_lookup_key = ""
         existing_key = title_keys.get(title_key)
         if not existing_key and semantic_lookup_key:
             existing_key = topic_keys.get(semantic_lookup_key)

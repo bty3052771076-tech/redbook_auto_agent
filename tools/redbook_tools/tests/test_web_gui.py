@@ -196,8 +196,11 @@ def test_daily_global_map_plan_freezes_scope_and_uses_standalone_cli(service):
 
 def test_agent_conversation_rejects_invalid_count(service):
     conversation = service.create_agent_conversation()
-    with pytest.raises(ValueError, match="1至20"):
-        service.append_agent_message(conversation["id"], "生成21条每日新闻")
+    result = service.append_agent_message(conversation["id"], "生成21条每日新闻")
+    assert result["plan"]["executable"] is False
+    assert result["plan"]["jobs"] == []
+    assert "1至20" in result["assistant"]["content"]
+    assert result["plan"]["source_message_id"] == result["message"]["id"]
 
 
 def test_agent_conversation_requires_a_supported_task(service):
@@ -641,7 +644,10 @@ def test_provider_quota_uses_existing_cli(service, provider):
 
 
 def test_sources_analysis_and_local_approval(service):
-    assert service.sources() == {"rows": []}
+    report = service.sources()
+    assert report["rows"]
+    assert report["check"] is None
+    assert all(row["status"] in {"not_checked", "not_configured", "disabled", "not_selected"} for row in report["rows"])
     assert service.analysis()["text"] == ""
     args, _ = service.plan({"kind": "check-sources", "collection": "ai_digest", "max_age_days": 3}, "a" * 32)
     assert "ai_digest" in args

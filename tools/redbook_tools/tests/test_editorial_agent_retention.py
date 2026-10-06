@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+import pytest
+
 from src.agent import editorial_agent as agent
 
 
@@ -211,3 +213,61 @@ def test_transient_429_rotates_and_retries_instead_of_pausing_provider(tmp_path,
     assert result.status == 'completed'
     assert calls == ['daily_news', 'daily_ai_digest', 'daily_news']
     assert not any(event['node'] == 'provider_pause' for event in result.events)
+
+
+@pytest.mark.parametrize('error', [
+    'OPENCODEX_HTTP_400', 'OPENCODEX_PREVIOUS_REQUEST_UNCERTAIN',
+    'OPENCODEX_UPDATE_REQUIRES_COMPATIBILITY_REVIEW', 'OPENCODEX_UNVERIFIED_PROVIDER_FORBIDDEN',
+    'WOOL_VERIFICATION_INCOMPLETE',
+])
+def test_permanent_image_failure_retains_other_deliveries_without_retry(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(agent.time, 'sleep', lambda _: None)
+    calls = []
+
+    def generate(job, context):
+        calls.append(job.kind)
+        if job.kind == 'daily_wool' and calls.count(job.kind) <= 2:
+            raise RuntimeError(error)
+        return [Post(job.kind)]
+
+    result = agent.run_editorial_agent(
+        [agent.AgentJob('daily_wool', 'Wool'), agent.AgentJob('daily_news', 'News')],
+        tools=agent.EditorialAgentTools(lambda j: {}, generate, lambda *a: [], lambda *a: (True, 'saved')),
+        config=config(tmp_path))
+    assert calls == ['daily_wool', 'daily_news']
+    assert result.status == 'partial'
+    assert result.completed_jobs == 1
+
+
+@pytest.mark.parametrize('reason', [
+    'daily ai digest official material insufficient: no recent verified items',
+    'AI讯息材料不足：第2条标题或摘要未完成中文改写',
+])
+def test_identical_digest_shortage_stops_after_three_attempts(tmp_path, monkeypatch, reason):
+    monkeypatch.setattr(agent.time, 'sleep', lambda _: None)
+    calls = []
+
+    def generate(job, context):
+        calls.append(job.kind)
+        if len(calls) <= 5:
+            raise RuntimeError(reason)
+        return [Post('ai')]
+
+    result = agent.run_editorial_agent(
+        [agent.AgentJob('daily_ai_digest', 'AI')],
+        tools=agent.EditorialAgentTools(lambda j: {}, generate, lambda *a: [], lambda *a: (True, 'saved')),
+        config=config(tmp_path))
+    assert len(calls) == 3
+    assert result.status == 'blocked'
+    assert any('SOURCE_REFRESH_REQUIRED' in error for error in result.errors)
+
+
+def test_wool_notice_is_kept_in_checkpoint_after_delivery(tmp_path):
+    post = Post('wool')
+    post.platform = {'daily_wool': {'user_notice': '今日暂未发现可核验且可领取的AI福利。'}}
+    result = agent.run_editorial_agent(
+        [agent.AgentJob('daily_wool', 'AI福利')],
+        tools=agent.EditorialAgentTools(lambda j: {}, lambda j, c: [post], lambda *a: [], lambda *a: (True, 'saved')),
+        config=config(tmp_path))
+    checkpoint = agent.load_agent_checkpoint(result.checkpoint_path)
+    assert checkpoint['job_states']['0']['wool_notice'] == '今日暂未发现可核验且可领取的AI福利。'

@@ -22,6 +22,31 @@ from .reference_library import WoolReferenceLibrary, wool_asset_root
 WoolProgress = Callable[[str, str], None]
 
 
+def _availability_notice(offers: list[WoolOffer], meta: dict, issue_date: date) -> tuple[str, str]:
+    prefix = f"截至北京时间{issue_date.isoformat()}，"
+    if offers:
+        return "offers_found", prefix + f"发现{len(offers)}条近期可核验的AI福利线索；领取资格和有效期以官方活动或账户页面为准。"
+    source_meta = meta.get("source_meta") or {}
+    health = source_meta.get("source_health") or {}
+    attempts = health.get("attempts") or []
+    healthy = {"success", "empty", "stale"}
+    incomplete = (
+        not attempts
+        or any(attempt.get("status") not in healthy for attempt in attempts)
+        or source_meta.get("errors")
+        or (source_meta.get("search_backfill") or {}).get("errors")
+        or health.get("cooldown_skipped")
+    )
+    if incomplete:
+        return "verification_incomplete", prefix + (
+            "福利核验未完成：部分信源获取失败、被限流或缺少有效日期，当前未找到可确认的领取信息。"
+            "不能据此判断今天没有福利；请检查信源状态，恢复后重查。"
+        )
+    return "no_verified_offers", prefix + (
+        "今日暂未发现可核验且可领取的AI福利。此结果仅覆盖本次已检查信源，不代表所有厂商都没有活动。"
+    )
+
+
 def _asset_info(path: Path) -> AssetInfo:
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     return AssetInfo(
@@ -153,10 +178,16 @@ def create_daily_wool_posts(
         issue_date = now
     else:
         issue_date = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date()
+    availability, notice = _availability_notice(offers, collect_meta, issue_date)
+    if progress:
+        progress("wool_result", f"daily_wool result={availability} message={notice}")
+    if availability == "verification_incomplete":
+        raise RuntimeError(f"WOOL_VERIFICATION_INCOMPLETE: {notice}")
     fallback_title, fallback_body = _deterministic_copy(
         offers, max_age_days=max_age_days, issue_date=issue_date
     )
-    title, body, generation_mode = _llm_copy(offers, (fallback_title, fallback_body))
+    title, body, generation_mode = (_llm_copy(offers, (fallback_title, fallback_body)) if offers
+                                    else (fallback_title, fallback_body, "deterministic_no_offers"))
     post = Post(
         type="image",
         status=PostStatus.draft,
@@ -167,6 +198,8 @@ def create_daily_wool_posts(
             "daily_wool": {
                 "mode": "daily_wool",
                 "has_wool": bool(offers),
+                "availability_status": availability,
+                "user_notice": notice,
                 "offer_count": len(offers),
                 "max_age_days": max_age_days,
                 "issue_date": issue_date.isoformat(),

@@ -193,7 +193,8 @@ def test_approved_library_automatically_enables_reference_edit(monkeypatch, tmp_
     monkeypatch.delenv("WOOL_ASSET_ROOT", raising=False)
     monkeypatch.delenv("WOOL_IMAGE_MODE", raising=False)
     monkeypatch.setenv("IMAGE_PROVIDER", "minimax")
-    monkeypatch.setattr(workflow, "collect_daily_wool_offers", lambda **kwargs: ([], {}))
+    monkeypatch.setattr(workflow, "collect_daily_wool_offers", lambda **kwargs: ([], {
+        "source_meta": {"source_health": {"attempts": [{"source_name": "openai", "status": "empty"}]}}}))
     monkeypatch.setattr(image_edit, "create_wool_image", lambda **kwargs: (source, {"asset_mode": "reference_persona_edit", "provider": "opencodex", "elapsed_s": 1}))
     posts = workflow.create_daily_wool_posts(now=date(2026, 10, 3))
     assert posts[0].platform["images"][0]["provider"] == "opencodex"
