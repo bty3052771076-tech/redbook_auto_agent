@@ -68,11 +68,18 @@ class TaskRecognitionCreate(BaseModel):
     source_message_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     base_plan_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     base_plan_version: int = Field(ge=1, strict=True)
+    controller_model_ref: str = Field(default="", max_length=260)
 
 
 class TaskRecognitionAdopt(BaseModel):
     model_config = {"extra": "forbid"}
     base_plan_version: int = Field(ge=1, strict=True)
+
+
+class PlanModels(BaseModel):
+    model_config = {"extra": "forbid"}
+    version: int = Field(ge=1, strict=True)
+    model_roles: ModelRoles
 
 
 class DraftReview(BaseModel):
@@ -159,6 +166,9 @@ def authenticated(request: Request):
 @app.exception_handler(RuntimeError)
 @app.exception_handler(FileNotFoundError)
 async def user_error(_request: Request, exc: Exception):
+    from src.model_platforms import PlatformError
+    if isinstance(exc, PlatformError):
+        return JSONResponse(exc.public(), status_code=exc.status)
     current = app.state.service
     return JSONResponse({"error": current.redact(str(exc)) if current else str(exc)}, status_code=400)
 
@@ -225,6 +235,37 @@ def add_message(conversation_id: str, body: MessageCreate):
     if parsed.get("plan_kind") == "draft_management" and (parsed.get("management") or {}).get("mode") == "publish":
         raise ValueError("独立界面暂不执行公开发布；请先生成、审查并上传草稿，发布请在平台人工确认")
     return current.append_agent_message(valid_conversation_id(conversation_id), body.content)
+
+
+@app.put("/api/conversations/{conversation_id}/plans/{plan_id}/models", dependencies=[Depends(authenticated)])
+def plan_models(conversation_id: str, plan_id: str, body: PlanModels):
+    from src.model_platforms import PlatformError
+    current = service()
+    with current.lock:
+        saved = current._read_agent_conversation(valid_conversation_id(conversation_id))
+        plan = next((p for p in saved.get("plans", []) if p.get("id") == valid_id(plan_id)), None)
+        if not plan:
+            raise PlatformError("PLAN_NOT_FOUND", "计划不存在", status=404)
+        if plan.get("version") != body.version:
+            raise PlatformError("REVISION_CONFLICT", "计划已经变化，请刷新后保存", status=409)
+        if plan.get("job_id") or plan.get("resume_job_id"):
+            raise PlatformError("PLAN_FROZEN", "已执行计划不能修改模型，请新建计划", status=409)
+        recognition_service().assert_can_execute(conversation_id, plan_id)
+        roles = body.model_roles.model_dump()
+        catalog = {m["id"]: m for m in current.models()["rows"]}
+        for role, ref in roles.items():
+            if not ref:
+                continue
+            if ref.startswith("m_"):
+                current.model_platforms().resolve(role, ref)
+            else:
+                row = catalog.get(ref)
+                if not row or not row.get("selectable") or row["kind"] != ("image" if role == "image" else "llm"):
+                    raise PlatformError("MODEL_DISABLED", "此角色模型不可执行，请检查连接与模型")
+        plan["model_roles"] = roles
+        plan["version"] += 1
+        current._write_agent_conversation(saved)
+        return current.redact({"plan": plan})
 
 
 @app.post("/api/plans/{plan_id}/confirm", dependencies=[Depends(authenticated)])
@@ -428,6 +469,21 @@ def save_roles(body: ModelRoles):
 
 
 from .wool_library import create_wool_library_router
+
+
+@app.api_route("/api/model-platforms/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], dependencies=[Depends(authenticated)])
+async def model_platforms(path: str, request: Request):
+    from src.model_platforms.service import platform_request
+    data = {}
+    if request.method != "GET":
+        raw = await request.body()
+        if not raw or len(raw) > 2 * 1024 * 1024:
+            raise ValueError("请求为空或超过2MiB")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("请求必须是对象")
+    return await asyncio.to_thread(platform_request, service(), request.method, "/api/model-platforms/" + path,
+                                   data, request.headers.get("Idempotency-Key", ""))
 
 app.include_router(create_wool_library_router(service), dependencies=[Depends(authenticated)])
 

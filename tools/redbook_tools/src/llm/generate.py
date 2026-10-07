@@ -697,19 +697,22 @@ def generate_draft(
                 }
                 model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.4))
                 model_kwargs.update(_summary_provider_kwargs(llm_cfg))
-                model = init_chat_model(
-                    llm_cfg.model,
-                    **model_kwargs,
-                )
+                model = None if llm_cfg.platform_snapshot else init_chat_model(llm_cfg.model, **model_kwargs)
                 print(
                     f"[llm] provider={llm_cfg.provider} model={llm_cfg.model} base_url={llm_cfg.base_url}"
                 )
-                resp = model.invoke(messages)
+                if llm_cfg.platform_snapshot:
+                    from src.model_platforms.integration import invoke
+                    resp = invoke(llm_cfg, messages, max_tokens=model_kwargs["max_tokens"])
+                else:
+                    resp = model.invoke(messages)
                 response_diagnostics = _response_diagnostics(resp, model_kwargs["max_tokens"])
                 print(f"[llm-response] provider={llm_cfg.provider} model={llm_cfg.model} diagnostics={json.dumps(response_diagnostics)}")
                 generated_text = _final_response_text(resp, response_diagnostics)
                 break
             except Exception as exc:
+                if llm_cfg.platform_snapshot:
+                    raise
                 last_exc = exc
                 if (
                     _is_rate_limited(exc)
@@ -854,15 +857,16 @@ def generate_json(
                 }
                 model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.1))
                 model_kwargs.update(_summary_provider_kwargs(llm_cfg, disable_thinking=False))
-                model = init_chat_model(
-                    llm_cfg.model,
-                    **model_kwargs,
-                )
+                model = None if llm_cfg.platform_snapshot else init_chat_model(llm_cfg.model, **model_kwargs)
                 print(
                     f"[llm-json] provider={llm_cfg.provider} model={llm_cfg.model} "
                     f"base_url={llm_cfg.base_url}"
                 )
-                response = model.invoke(messages)
+                if llm_cfg.platform_snapshot:
+                    from src.model_platforms.integration import invoke
+                    response = invoke(llm_cfg, messages, max_tokens=model_kwargs["max_tokens"])
+                else:
+                    response = model.invoke(messages)
                 diagnostics = _response_diagnostics(response, model_kwargs["max_tokens"])
                 print(f"[llm-json-response] provider={llm_cfg.provider} model={llm_cfg.model} diagnostics={json.dumps(diagnostics)}")
                 text = _final_response_text(response, diagnostics)
@@ -871,6 +875,8 @@ def generate_json(
                     raise RuntimeError("model did not return a parseable JSON object")
                 return data
             except Exception as exc:
+                if llm_cfg.platform_snapshot:
+                    raise
                 last_exc = exc
                 if (
                     _is_rate_limited(exc)

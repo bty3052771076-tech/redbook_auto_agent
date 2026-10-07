@@ -1,4 +1,4 @@
-export type PlanJob = { kind: string; title: string; count: number; prompt?: string; keywords?: string[]; topic_brief?: string };
+export type PlanJob = { kind: string; title: string; count: number; prompt?: string; keywords?: string[]; keyword_mode?: "default" | "filter" | "preference"; topic_brief?: string };
 export type Plan = {
   id: string;
   version: number;
@@ -36,7 +36,7 @@ export type Activity = {
   timeline: { id: string; at: number; text: string; status: string; stage: string }[];
   issues: { message: string; action: string }[];
 };
-export type Run = { id: string; agent_run_id?: string; resume_of?: string; title?: string; status: string; status_label?: string; display_message?: string; message?: string; stage?: string; created_at?: number; started_at?: number; ended_at?: number; events?: { id: number; at: number; message: string }[]; post_rows?: { id: string; title?: string; images?: number; status?: string; readback?: string }[]; activity?: Activity; local_post_ids?: string[]; retained_post_ids?: string[] };
+export type Run = { id: string; model_snapshots?: Record<string, { upstream_model_id: string; connection_name: string; adapter: string }>; agent_run_id?: string; resume_of?: string; title?: string; status: string; status_label?: string; display_message?: string; message?: string; stage?: string; created_at?: number; started_at?: number; ended_at?: number; events?: { id: number; at: number; message: string }[]; post_rows?: { id: string; title?: string; images?: number; status?: string; readback?: string }[]; activity?: Activity; local_post_ids?: string[]; retained_post_ids?: string[] };
 export type DraftSummary = {
   post_id: string;
   title: string;
@@ -58,7 +58,7 @@ export type Draft = {
   steps: { name: string; status: string }[];
   evidence: { title: string; source: string; published_at: string; url: string }[];
 };
-export type Model = { id: string; model: string; provider: string; kind: string; selectable: boolean; disabled_reason?: string };
+export type Model = { id: string; model: string; provider: string; provider_name?: string; kind: string; selectable: boolean; disabled_reason?: string; role_reasons?: Record<string, string> };
 export type Connections = {
   database: { status: string; documents?: number; indexed_documents?: number; error?: string };
   providers: { bindings: Record<string, string>; connections: { id: string; label: string; configured: boolean }[] };

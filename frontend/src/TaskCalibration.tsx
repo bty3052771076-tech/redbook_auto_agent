@@ -6,7 +6,7 @@ export function PlanJobs({ jobs }: { jobs: PlanJob[] }) {
   return <ol className="plan-list">{jobs.map((job, index) => <li key={`${job.kind}-${index}`}>
     <span>{String(index + 1).padStart(2, "0")}</span>
     <div><strong>{job.title}</strong><small>{job.count} 条 · 生成与审查</small>
-      {!!job.keywords?.length && <p className="plan-keywords"><span>关键词</span>{job.keywords.join("、")}</p>}
+      {!!job.keywords?.length && <p className="plan-keywords"><span>{job.keyword_mode === "preference" ? "选题偏向" : "关键词"}</span>{job.keywords.join("、")}</p>}
       {job.topic_brief && <p className="plan-topic">{job.topic_brief}</p>}
     </div>
   </li>)}</ol>;

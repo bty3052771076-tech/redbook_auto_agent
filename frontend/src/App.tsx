@@ -8,6 +8,8 @@ import { RunProgress, TechnicalLog, activeStatuses } from "./RunProgress";
 import { WoolGallery } from "./WoolGallery";
 import { PlanJobs, TaskCalibration } from "./TaskCalibration";
 import { SourceDiagnostics } from "./SourceDiagnostics";
+import { ModelPlatforms } from "./ModelPlatforms";
+import { PlanModels } from "./PlanModels";
 import "./source-diagnostics.css";
 
 type Page = "chat" | "drafts" | "runs" | "connections" | "wool" | "sources";
@@ -245,7 +247,7 @@ function App() {
         <header className="topbar">
           <button className="icon-button mobile-menu" aria-label="打开导航" title="打开导航" onClick={() => setMobileNav(true)}><Menu size={19} /></button>
           <span>本地工作空间 / 内容生产</span>
-          <div className="topbar-right"><span>MiniMax 订阅</span><span>项目专用浏览器</span></div>
+          <div className="topbar-right"><span>{activeRun?.model_snapshots?.agent?.upstream_model_id || modelRows.find(model => model.id === (plan?.model_roles?.agent || roles.agent))?.model || "继承主控配置"}</span><span>项目专用浏览器</span></div>
         </header>
         {!ready && <div className="startup"><LoaderCircle size={18} className="spin" />正在连接本地服务</div>}
         {error && <div className="banner error" role="alert"><CircleAlert size={17} /><span>{error}</span><button className="icon-button" title="关闭提示" aria-label="关闭提示" onClick={() => setError("")}><X size={16} /></button></div>}
@@ -263,6 +265,10 @@ function App() {
           <aside className="plan-pane">
             <div className="pane-heading"><h2>本次计划</h2><span className="status-amber">{plan ? planRunning ? "执行中" : planSubmitted ? "已执行" : plan.executable ? "待确认" : "需补充" : "等待输入"}</span></div>
             {plan ? <>
+              {conversation && <PlanModels conversationId={conversation.id} plan={plan} models={modelRows}
+                disabled={busy || planSubmitted || calibrationPending} onChanged={updated => {
+                  setPlan(updated); setConversation(current => current ? { ...current, plans: current.plans.map(p => p.id === updated.id ? updated : p) } : current);
+                }} />}
               {conversation && <TaskCalibration key={`${conversation.id}:${plan.id}`} conversation={conversation} plan={plan}
                 disabled={busy || planSubmitted || Boolean(activeRun && activeStatuses.has(activeRun.status))}
                 onPendingChange={setCalibrationPending} onAdopt={() => openConversation(conversation.id)} />}
@@ -297,7 +303,7 @@ function App() {
           </> : <div className="empty-detail"><ClipboardList size={30} /><h2>选择一条草稿</h2><p>查看正文、图片和平台回读状态。</p></div>}</section>
         </div>}
         {ready && page === "runs" && <main className="standard-page"><div className="page-heading"><div><h1>运行记录</h1><p>查看每项任务的状态、耗时和错误原因。</p></div><button className="quiet-button" onClick={() => load().catch(fail)}><RefreshCw size={16} />刷新</button></div><div className="run-table"><div className="run-table-head"><span>任务</span><span>状态</span><span>开始时间</span><span>详细信息</span></div>{runs.map((item) => <button className="run-table-row" key={item.id} onClick={async () => { try { setActiveRun(await api<Run>(`/api/runs/${item.id}`)); setRunConnectionError(""); } catch (cause) { fail(cause); } }}><strong>{item.title || item.id}</strong><span className={["completed", "success"].includes(item.status) ? "status-good" : "status-amber"}>{item.status_label || "状态待读取"}</span><span>{niceDate(item.created_at)}</span><span>{item.display_message || "查看进度详情"}</span></button>)}{!runs.length && <p className="muted empty-list">尚无运行记录。</p>}</div>{activeRun && <div className="run-detail"><h2>任务详情</h2><RunProgress run={activeRun} connectionError={runConnectionError} onRefresh={refreshRun} />{activeRun.local_post_ids?.length ? <div className="run-draft-links"><strong>本地生成草稿，仍需人工审查</strong>{activeRun.local_post_ids.map((id) => <button className="quiet-button" key={id} onClick={() => showRunDraft(id)}>查看草稿 {id.slice(0, 8)}<ChevronRight size={14} /></button>)}</div> : null}<TechnicalLog run={activeRun} /></div>}</main>}
-        {ready && page === "connections" && <main className="standard-page connections-page"><div className="page-heading"><div><h1>连接与模型</h1><p>主控、写稿和生图分别选择；更改仅影响之后的新任务。</p></div></div><section className="db-line"><Database size={20} /><div><strong>PostgreSQL 与知识库</strong><p>{connections?.database.status === "ready" ? `连接正常 · 文档 ${connections.database.documents ?? 0} 条 · 已索引 ${connections.database.indexed_documents ?? 0} 条` : connections?.database.error || "未连接"}</p></div><button className="quiet-button" onClick={() => load().catch(fail)}><RefreshCw size={16} />检查连接</button></section><div className="connections-grid"><section><h2>模型角色</h2><p className="muted">只有当前可用的模型才出现在选择列表中。</p>{Object.entries(roleNames).map(([role, name]) => <label className="role-field" key={role}><span>{name}</span><select value={roles[role] || ""} onChange={(event) => setRoles((current) => ({ ...current, [role]: event.target.value }))}><option value="">自动使用当前配置</option>{modelRows.filter((item) => item.selectable && item.kind === (role === "image" ? "image" : "llm")).map((item) => <option key={item.id} value={item.id}>{item.provider} · {item.model}</option>)}</select></label>)}<button className="primary-button" onClick={saveRoles} disabled={busy}><Check size={16} />保存模型选择</button><div className="subscription-note"><ShieldCheck size={16} />订阅优先；禁止自动切换到按量付费</div></section><section><h2>平台与信源</h2><div className="connection-row"><strong>小红书创作者中心</strong><span>{connections?.profile_configured ? "专用 profile 已配置" : "专用 profile 未配置"}</span><small>登录状态：{connections?.profile_login || "未验证"}</small><button className="quiet-button" onClick={openProfile} disabled={busy}>打开专用浏览器</button></div><div className="connection-row"><strong>新闻 API 与 World Monitor</strong><span>按任务启动；不常驻运行</span></div><div className="connection-row"><strong>模型供应商</strong><span>{connections?.providers.connections.filter((item) => item.configured).map((item) => item.label).join("、") || "尚未配置"}</span></div><p className="muted">登录请使用新程序的项目专用浏览器，不能从默认浏览器继承会话。</p></section></div></main>}
+        {ready && page === "connections" && <main className="standard-page connections-page"><div className="page-heading"><div><h1>连接与模型</h1><p>主控、写稿和生图分别选择；更改仅影响之后的新任务。</p></div></div><section className="db-line"><Database size={20} /><div><strong>PostgreSQL 与知识库</strong><p>{connections?.database.status === "ready" ? `连接正常 · 文档 ${connections.database.documents ?? 0} 条 · 已索引 ${connections.database.indexed_documents ?? 0} 条` : connections?.database.error || "未连接"}</p></div><button className="quiet-button" onClick={() => load().catch(fail)}><RefreshCw size={16} />检查连接</button></section><ModelPlatforms call={api} legacyModels={modelRows} onChanged={load} /><section className="db-line"><div><strong>小红书创作者中心</strong><p>{connections?.profile_configured ? "专用 profile 已配置" : "专用 profile 未配置"}</p></div><button className="quiet-button" onClick={openProfile} disabled={busy}>打开专用浏览器</button></section></main>}
       </div>
     </div>
   );
