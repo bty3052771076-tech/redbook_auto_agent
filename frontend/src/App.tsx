@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Activity, Check, CheckCircle2, ChevronRight, CircleAlert, ClipboardList, Database, FileText, Image, LoaderCircle, Menu, MessageSquare, Play, RefreshCw, Send, Settings2, ShieldCheck, X } from "lucide-react";
+import { Activity, Check, CheckCircle2, ChevronRight, CircleAlert, ClipboardList, Database, FileText, Image, LoaderCircle, Menu, MessageSquare, Play, Puzzle, RefreshCw, Send, Settings2, ShieldCheck, X } from "lucide-react";
 import {
   api, startSession, type Connections, type Conversation, type Draft, type DraftSummary,
   type Model, type Plan, type Run,
@@ -10,14 +10,20 @@ import { PlanJobs, TaskCalibration } from "./TaskCalibration";
 import { SourceDiagnostics } from "./SourceDiagnostics";
 import { ModelPlatforms } from "./ModelPlatforms";
 import { PlanModels } from "./PlanModels";
+import { PlanEditor } from './PlanEditor';
+import { CopyPlan, PlanHistory } from './PlanHistory';
+import { CapabilityCenter } from "./capabilities/CapabilityCenter";
+import { PlanCapabilities, readPlanSelection } from "./capabilities/PlanCapabilities";
+import { guarded } from "./capabilities/shared";
 import "./source-diagnostics.css";
 
-type Page = "chat" | "drafts" | "runs" | "connections" | "wool" | "sources";
+type Page = "chat" | "drafts" | "runs" | "connections" | "wool" | "sources" | "capabilities";
 const pages: { id: Page; label: string; icon: typeof MessageSquare }[] = [
   { id: "chat", label: "对话任务", icon: MessageSquare },
   { id: "drafts", label: "草稿审查", icon: FileText },
   { id: "runs", label: "运行记录", icon: ClipboardList },
   { id: "connections", label: "连接与模型", icon: Settings2 },
+  { id: "capabilities", label: "能力中心", icon: Puzzle },
   { id: "sources", label: "信源健康", icon: Activity },
   { id: "wool", label: "AI鸡蛋图库", icon: Image },
 ];
@@ -43,9 +49,10 @@ function DraftEvidence({ evidence }: { evidence: Draft["evidence"] }) {
 }
 
 function App() {
-  const [page, setPage] = useState<Page>("chat");
+  const [page, setPage] = useState<Page>(location.hash.startsWith("#capabilities") ? "capabilities" : "chat");
   const [mobileNav, setMobileNav] = useState(false);
   const [ready, setReady] = useState(false);
+  const [sessionReady, setSessionReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -54,6 +61,8 @@ function App() {
   const [prompt, setPrompt] = useState("");
   const [plan, setPlan] = useState<Plan | null>(null);
   const [calibrationPending, setCalibrationPending] = useState(false);
+  const [capabilityPending, setCapabilityPending] = useState(false);
+  const [planEditing, setPlanEditing] = useState(false);
   const [runs, setRuns] = useState<Run[]>([]);
   const [activeRun, setActiveRun] = useState<Run | null>(null);
   const [runConnectionError, setRunConnectionError] = useState("");
@@ -63,25 +72,44 @@ function App() {
   const [connections, setConnections] = useState<Connections | null>(null);
   const [roles, setRoles] = useState<Record<string, string>>({ agent: "", writer: "", image: "" });
   const selectionVersion = useRef(0);
+  useEffect(() => {
+    const listener = () => { if (location.hash.startsWith("#capabilities")) setPage("capabilities"); else if (location.hash === "#chat") setPage("chat"); };
+    window.addEventListener("hashchange", listener);
+    return () => window.removeEventListener("hashchange", listener);
+  }, []);
+  function goPage(next: Page) {
+    guarded(() => { setPage(next); setMobileNav(false); location.hash = next === "capabilities" ? "#capabilities/overview" : `#${next}`; });
+  }
+  async function showCapabilityRun(id: string) {
+    try { setActiveRun(await api<Run>(`/api/runs/${id}`)); setRunConnectionError(""); goPage("runs"); }
+    catch (cause) { fail(cause); }
+  }
 
   const fail = (reason: unknown) => { setError(reason instanceof Error ? reason.message : String(reason)); setNotice(""); };
   const load = useCallback(async () => {
-    const [allConversations, allRuns, allDrafts, allConnections] = await Promise.all([
-      api<{ rows: Conversation[] }>("/api/conversations"),
-      api<{ rows: Run[] }>("/api/runs"),
-      api<{ rows: DraftSummary[] }>("/api/drafts"),
-      api<Connections>("/api/connections"),
-    ]);
-    setConversations(allConversations.rows);
-    setRuns(allRuns.rows);
-    setDrafts(allDrafts.rows);
-    setConnections(allConnections);
-    setRoles(allConnections.providers.bindings);
-    setReady(true);
+    try {
+      const [allConversations, allRuns, allDrafts, allConnections] = await Promise.all([
+        api<{ rows: Conversation[] }>("/api/conversations"),
+        api<{ rows: Run[] }>("/api/runs"),
+        api<{ rows: DraftSummary[] }>("/api/drafts"),
+        api<Connections>("/api/connections"),
+      ]);
+      setConversations(allConversations.rows);
+      setRuns(allRuns.rows);
+      setDrafts(allDrafts.rows);
+      setConnections(allConnections);
+      setRoles(allConnections.providers.bindings);
+      setReady(true);
+      setError("");
+    } catch (cause) {
+      setReady(false); setConnections(null);
+      throw cause;
+    }
   }, []);
 
   useEffect(() => {
     startSession().then(async () => {
+      setSessionReady(true);
       await load();
       const saved = localStorage.getItem("agent-conversation");
       if (saved) await openConversation(saved);
@@ -175,11 +203,13 @@ function App() {
   }
 
   async function confirmPlan() {
-    if (!conversation || !plan || !plan.executable || calibrationPending) return;
+    if (!conversation || !plan || !plan.executable || calibrationPending || capabilityPending || planEditing) return;
     setBusy(true); setError("");
     try {
+      const selection = await readPlanSelection(conversation.id, plan.id);
       const result = await api<Run>(`/api/plans/${plan.id}/confirm`, "POST", {
-        conversation_id: conversation.id, version: plan.version,
+        conversation_id: conversation.id, version: plan.version, semantic_hash: plan.semantic_hash,
+        configuration_fingerprint: plan.configuration_fingerprint, ...selection,
       });
       setActiveRun(result); setNotice("任务已提交，当前进度将在对话中持续更新。");
       await load(); await openConversation(conversation.id);
@@ -223,7 +253,7 @@ function App() {
   }
 
   const currentPlan = plan && conversation?.plans.find((item) => item.id === plan.id);
-  const planSubmitted = Boolean(currentPlan?.job_id);
+  const planSubmitted = Boolean(currentPlan?.job_id || currentPlan?.execution_request_id);
   const planRunning = Boolean(planSubmitted && activeRun &&
     [currentPlan?.job_id, currentPlan?.resume_job_id].includes(activeRun.id) && activeStatuses.has(activeRun.status));
   const modelRows: Model[] = connections?.models.rows || [];
@@ -235,7 +265,7 @@ function App() {
         <div className="brand"><span className="brand-mark" />采编智能体</div>
         <nav aria-label="主导航">
           {pages.map(({ id, label, icon: Icon }) => (
-            <button key={id} className={`nav-item ${page === id ? "active" : ""}`} onClick={() => { setPage(id); setMobileNav(false); }}>
+            <button key={id} className={`nav-item ${page === id ? "active" : ""}`} onClick={() => goPage(id)}>
               <Icon size={18} strokeWidth={1.8} /><span>{label}</span>
             </button>
           ))}
@@ -249,7 +279,8 @@ function App() {
           <span>本地工作空间 / 内容生产</span>
           <div className="topbar-right"><span>{activeRun?.model_snapshots?.agent?.upstream_model_id || modelRows.find(model => model.id === (plan?.model_roles?.agent || roles.agent))?.model || "继承主控配置"}</span><span>项目专用浏览器</span></div>
         </header>
-        {!ready && <div className="startup"><LoaderCircle size={18} className="spin" />正在连接本地服务</div>}
+        {!sessionReady && <div className="startup"><LoaderCircle size={18} className="spin" />正在连接本地服务</div>}
+        {sessionReady && !ready && <div className="startup"><CircleAlert size={18} />业务数据暂不可用，可查看能力中心。<button className="quiet-button" onClick={() => load().catch(fail)}><RefreshCw size={16} />重新读取业务数据</button></div>}
         {error && <div className="banner error" role="alert"><CircleAlert size={17} /><span>{error}</span><button className="icon-button" title="关闭提示" aria-label="关闭提示" onClick={() => setError("")}><X size={16} /></button></div>}
         {notice && <div className="banner notice" role="status"><CheckCircle2 size={17} /><span>{notice}</span><button className="icon-button" title="关闭提示" aria-label="关闭提示" onClick={() => setNotice("")}><X size={16} /></button></div>}
         {ready && page === "chat" && <div className="chat-layout">
@@ -265,22 +296,34 @@ function App() {
           <aside className="plan-pane">
             <div className="pane-heading"><h2>本次计划</h2><span className="status-amber">{plan ? planRunning ? "执行中" : planSubmitted ? "已执行" : plan.executable ? "待确认" : "需补充" : "等待输入"}</span></div>
             {plan ? <>
+              {conversation && <PlanEditor conversation={conversation} plan={plan} models={modelRows}
+                disabled={busy || planSubmitted} onSaved={() => openConversation(conversation.id)} onPending={setPlanEditing} />}
+              {conversation && <PlanHistory conversation={conversation} plan={plan}
+                disabled={busy || planSubmitted || planEditing || capabilityPending} onSaved={() => openConversation(conversation.id)} />}
+              {conversation && planSubmitted && <CopyPlan key={plan.id} conversation={conversation} plan={plan}
+                disabled={busy || planEditing || capabilityPending} onSaved={()=>openConversation(conversation.id)} />}
               {conversation && <PlanModels conversationId={conversation.id} plan={plan} models={modelRows}
-                disabled={busy || planSubmitted || calibrationPending} onChanged={updated => {
-                  setPlan(updated); setConversation(current => current ? { ...current, plans: current.plans.map(p => p.id === updated.id ? updated : p) } : current);
+                disabled={busy || planSubmitted || calibrationPending || planEditing} onChanged={updated => {
+                  setPlan(updated); void openConversation(conversation.id);
                 }} />}
-              {conversation && <TaskCalibration key={`${conversation.id}:${plan.id}`} conversation={conversation} plan={plan}
+              {conversation && <TaskCalibration key={`calibration:${conversation.id}:${plan.id}`} conversation={conversation} plan={plan} models={modelRows}
                 disabled={busy || planSubmitted || Boolean(activeRun && activeStatuses.has(activeRun.status))}
-                onPendingChange={setCalibrationPending} onAdopt={() => openConversation(conversation.id)} />}
+                onPendingChange={setCalibrationPending} onEditing={setPlanEditing} onAdopt={() => openConversation(conversation.id)} />}
               <h3 className="current-plan-heading">当前计划</h3>
               <PlanJobs jobs={plan.jobs} />
+              {conversation && <PlanCapabilities key={`capabilities:${conversation.id}:${plan.id}`} conversationId={conversation.id} plan={plan}
+                runId={planSubmitted ? currentPlan?.resume_job_id || currentPlan?.job_id : undefined}
+                disabled={busy || planSubmitted || calibrationPending} onPending={setCapabilityPending} onChanged={updated => {
+                  setPlan(updated); void openConversation(conversation.id);
+                }} />}
               {!!plan.unresolved_requirements?.length && <ul className="calibration-issues">{plan.unresolved_requirements.map((item, index) => <li key={index}>{item}</li>)}</ul>}
               <div className="plan-boundary"><h3>执行边界</h3><p>交付：{plan.delivery === "generate_only" ? "仅生成本地稿" : "保存至草稿箱"}</p><p>平台：{plan.platform === "xhs" ? "小红书" : plan.platform}</p><p>运行模式：{plan.performance_mode === "speed" ? "速度优先" : "速度与稳定平衡"}</p><p>公开发布：本次不执行</p></div>
-              <button className="primary-button full" disabled={busy || calibrationPending || !plan.executable || planSubmitted} onClick={confirmPlan}><Play size={16} />{planRunning ? "正在执行" : planSubmitted ? "计划已执行" : "确认并执行"}</button>
+              <button className="primary-button full" disabled={busy || calibrationPending || capabilityPending || planEditing || !plan.executable || planSubmitted} onClick={confirmPlan}><Play size={16} />{planRunning ? "正在执行" : planSubmitted ? "计划已执行" : "确认并执行"}</button>
             </> : <p className="muted">输入任务后，这里会显示栏目、数量和交付方式。</p>}
             {activeRun && <div className="run-inline"><strong>最近一次运行</strong><RunProgress run={activeRun} compact connectionError={runConnectionError} /><button className="text-button" onClick={() => setPage("runs")}>查看运行记录 <ChevronRight size={14} /></button></div>}
           </aside>
         </div>}
+        {sessionReady && page === "capabilities" && <CapabilityCenter conversations={conversations} runs={runs} onRun={showCapabilityRun} />}
         {ready && page === "sources" && <main className="standard-page"><div className="page-heading"><h1>信源健康</h1></div>
           <SourceDiagnostics read={() => api("/api/sources")} check={request => {
             const { kind: _kind, title: _title, ...body } = request;

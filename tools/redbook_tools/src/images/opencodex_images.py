@@ -1,5 +1,6 @@
 """Fail-closed local ChatGPT image relay with durable, bounded requests."""
 from __future__ import annotations
+from src.agent.capabilities.dispatcher import governed
 
 import base64
 from contextlib import contextmanager
@@ -260,6 +261,7 @@ def validate_image(content: bytes, input_hashes: list[str]) -> tuple[int, int]:
         raise OpenCodexImageError("OPENCODEX_INVALID_IMAGE_RESULT") from None
 
 
+@governed('builtin:image.generate', 'generate')
 def generate_subscription_image(*, post_id: str, prompt: str, dest_dir: Path,
                                 reference_paths: list[Path] | None = None,
                                 allow_minimax_fallback: bool = True) -> SubscriptionImageResult:

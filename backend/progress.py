@@ -20,6 +20,7 @@ STAGES = {
     "review": "审查内容与配图", "upload": "保存平台草稿", "upload_batch": "保存平台草稿",
     "recover": "处理异常", "finish": "汇总结果",
     "wool_result": "AI福利核验结果",
+    "reconcile_drafts": "核对草稿保存结果", "review_summary": "汇总逐篇审查结果",
 }
 KINDS = {
     "daily_news": "每日新闻", "daily_ai_digest": "每日AI讯息", "daily_global_map": "全球事件关注图",
@@ -113,7 +114,7 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
     elapsed = max(0, (now if active or not ended else ended) - started) if started else 0
     jobs = [{"kind": str(j.get("kind") or ""), "title": str(j.get("title") or KINDS.get(j.get("kind"), "采编任务")),
              "requested": int(j.get("count") or 1), "generated": None, "reviewed": None,
-             "saved": 0, "verified": 0, "local": 0, "retained": 0, "status": "pending"}
+             "saved": 0, "verified": 0, "local": 0, "retained": 0, "rejected": 0, "status": "pending"}
             for j in checkpoint.get("jobs", []) if isinstance(j, dict)]
     ids = [{"saved": set(), "local": set()} for _ in jobs]
     events = _events(run, checkpoint)
@@ -182,6 +183,7 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
     verified = {row.get("id") for row in run.get("post_rows", []) if row.get("readback") == "verified"}
     current = int(checkpoint.get("job_index") or 0)
     for index, record in enumerate(checkpoint_job_records(checkpoint)):
+        jobs[index]["rejected"] = int((record.get("review_summary") or {}).get("rejected") or 0)
         for key, field in (("post_ids", "generated"), ("reviewed_post_ids", "reviewed")):
             if key in record:
                 jobs[index][field] = len(set(record[key] or []))
@@ -213,7 +215,7 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
     all_saved.update(row["id"] for row in run.get("post_rows", [])
                      if row.get("status") == "saved_as_draft" or row.get("readback") == "verified")
     counts.update(saved=len(all_saved), verified=len(all_saved & verified), local=sum(j["local"] for j in jobs),
-                  retained=sum(j["retained"] for j in jobs))
+                  retained=sum(j["retained"] for j in jobs), rejected=sum(j["rejected"] for j in jobs))
     requested = sum(j["requested"] for j in jobs) if jobs else None
     last_update = max([started] + [float(e.get("at") or 0) for e in run.get("events", []) if isinstance(e, dict)]
                       + [float(e.get("at") or 0) for e in events]) or None
@@ -232,10 +234,17 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
         if failed:
             summary += " 未完成：" + "、".join(jobs[i]["title"] for i in failed if isinstance(i, int) and i < len(jobs)) + "。"
         issues = failures[-3:] if status in {"partial_success", "partial", "failed", "interrupted", "paused", "waiting_user"} else []
+        # Historical review failures remain in the timeline, not as current blockers.
+        records = checkpoint_job_records(checkpoint)
+        if records and any("last_failure" in record for record in records):
+            issues = [_issue(str(record["last_failure"])) for record in records
+                      if record.get("status") != "completed" and record.get("last_failure")]
         if not issues and status in {"failed", "interrupted", "paused"}:
             issues = [_issue(str(run.get("message") or checkpoint.get("last_failure") or "未记录具体错误原因"))]
     if counts["retained"]:
         summary += f" 已保留通过审查的稿件 {counts['retained']} 条，待继续上传。"
+    if counts["rejected"]:
+        summary += f" 有 {counts['rejected']} 条候选稿未通过审查，未上传；合格稿独立交付。"
     if wool_notice:
         summary += " " + wool_notice
     issues = list({issue["message"]: issue for issue in issues}.values())

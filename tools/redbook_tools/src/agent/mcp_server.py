@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from uuid import uuid4
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:
+    from mcp.server.fastmcp import FastMCP as MCPServer
 from src.news.daily_news import fetch_daily_news_candidates
 from src.knowledge.store import KnowledgeStore
 
-mcp = FastMCP("redbook-workflow-local")
+mcp = MCPServer("redbook-workflow-local")
 
 
 @mcp.tool()
@@ -32,7 +36,8 @@ async def knowledge_search(query: str, purpose: str = "duplicate_reference", lim
         status = store.status()
         if status.get("status") != "ready" or not status.get("index_ready"):
             raise RuntimeError("KNOWLEDGE_INDEX_NOT_READY")
-        results = store.search(query, purpose=purpose, limit=max(1, min(20, int(limit))))
+        results = store.search(query, purpose=purpose, limit=max(1, min(20, int(limit))),
+                               account_namespace=os.getenv('AGENT_CAPABILITY_NAMESPACE','local'))
         return {"status": "ok" if results else "ok_empty", "results": results}
 
     return await asyncio.to_thread(search)

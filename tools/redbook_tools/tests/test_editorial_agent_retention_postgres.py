@@ -94,12 +94,12 @@ def test_postgres_retains_partial_review_across_new_connection_and_ignores_audit
         assert resumed.status == 'completed'
         assert resumed.completed_jobs == 2
         assert generated == [('daily_news', identifier, '0'), ('daily_ai_digest', identifier, '1')]
-        assert sent == ['ai', 'a', 'b', 'c']
+        assert sent == ['a', 'b', 'ai', 'c']
         assert reviews[-1] == ('daily_news', ['a', 'b'], '0')
         again = agent.run_editorial_agent([], tools=tools,
             config=agent.EditorialAgentConfig(checkpoint_dir=tmp_path, checkpoint_backend='postgres', resume_from=first.checkpoint_path))
         assert again.status == 'completed'
-        assert sent == ['ai', 'a', 'b', 'c']
+        assert sent == ['a', 'b', 'ai', 'c']
         with durable_saver() as saver:
             checkpoint = saver.get_tuple({'configurable': {'thread_id': identifier}})
             values = checkpoint.checkpoint['channel_values']

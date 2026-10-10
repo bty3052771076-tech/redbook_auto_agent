@@ -77,6 +77,10 @@ class Scenario:
         elif path == "/api/connections":
             data = {"database": {"status": "ready", "documents": 10}, "providers": {"bindings": {}, "connections": []},
                     "models": {"rows": []}, "profile_configured": True, "profile_login": "未验证"}
+        elif path.endswith('/capabilities') and request.method == 'GET':
+            data = {'version': self.plan.get('version', 1), 'skill_mode': 'off', 'skill_names': [],
+                    'disabled_tools': [], 'tools': [], 'skills': [], 'memory': {}, 'profile': '测试隔离',
+                    'readiness': {'ready': True}, 'calls': []}
         else:
             pytest.fail(f"Unexpected API call: {request.method} {path}")
         route.fulfill(status=200, content_type="application/json", body=json.dumps(deepcopy(data), ensure_ascii=False))

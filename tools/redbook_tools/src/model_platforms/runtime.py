@@ -150,6 +150,8 @@ class RuntimeClient:
         self.store, self.transport = store, transport
 
     def _request(self, connection, path, method='POST', body=None, query=None, *, timeout=60, byte_budget=None):
+        from src.agent.capabilities.dispatcher import request_timeout
+        timeout = request_timeout(timeout)
         base = connection['base_url']
         path = relative_path(path)
         secret = '' if connection['auth_mode'] == 'none' else self.store.secrets.read(connection['credential_ref'])

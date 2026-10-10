@@ -1,5 +1,6 @@
 """Local workbench adapter. No browser or provider calls on import/read routes."""
 from __future__ import annotations
+from copy import deepcopy
 
 import csv
 import hashlib
@@ -411,6 +412,11 @@ class Workbench:
         conversation["messages"].append({"id": message_id, "role": "user", "content": str(text).strip(), "created_at": now})
         plan_id = uuid.uuid4().hex
         plan = {"id": plan_id, "version": len(conversation["plans"]) + 1, "created_at": now, "source_message_id": message_id, "status": "ready" if plan_data["executable"] else "needs_input", **plan_data}
+        if plan.get('plan_kind') != 'draft_management':
+            from src.agent.plan_contract import normalize_plan, digest
+            plan['source_text_hash'] = digest(str(text).strip())
+            plan = normalize_plan(plan)
+            plan['status'] = 'ready' if plan['executable'] else 'needs_input'
         conversation["plans"].append(plan)
         conversation["messages"].append({
             "id": uuid.uuid4().hex,
@@ -427,17 +433,33 @@ class Workbench:
 
     def get_agent_conversation(self, conversation_id: str) -> dict:
         conversation = self._read_agent_conversation(valid_conversation_id(conversation_id))
-        conversation.pop("_revision", None)
+        conversation['conversation_revision'] = conversation.pop("_revision", 0)
         conversation.pop("_last_message_seq", None)
+        from src.agent.plan_contract import normalize_plan
+        conversation['plans'] = [normalize_plan(p) if p.get('plan_kind') != 'draft_management' else p for p in conversation['plans']]
         return self.redact(conversation)
+
+    def _context_memory_service(self, conversation: dict):
+        from src.agent.capabilities.store import CapabilityStore
+        from src.agent.memory_service import MemoryService
+        service = MemoryService(CapabilityStore(self.conversation_store.knowledge_store,
+            namespace=self.conversation_store.namespace))
+        plans = conversation.get('plans') or []
+        columns = {job['kind'] for job in plans[-1].get('jobs', [])} if plans else set()
+        if conversation.get('column'):
+            columns.add(conversation['column'])
+        return service, {'account': conversation.get('account_id', ''), 'columns': columns, 'conversation': conversation['id']}
 
     def agent_context_status(self, conversation_id: str) -> dict:
         conversation_id = valid_conversation_id(conversation_id)
-        self._read_agent_conversation(conversation_id)
+        conversation = self._read_agent_conversation(conversation_id)
         if not hasattr(self.conversation_store, "context_messages"):
             return {"status": "unavailable", "reason": "PostgreSQL conversation store is required"}
         from src.agent.compaction import compacted_context, estimate_tokens
         context = compacted_context(self.conversation_store, conversation_id)
+        if isinstance(self.conversation_store, PostgresConversationStore):
+            memory, scope = self._context_memory_service(conversation)
+            context = memory.filter_context(context, **scope)
         return {
             "status": "ready",
             "conversation_id": conversation_id,
@@ -451,9 +473,7 @@ class Workbench:
     def _agent_memory_for_execution(self, conversation_id: str) -> dict:
         status = self.agent_context_status(conversation_id)
         snapshot = ((status.get("context") or {}).get("snapshot") or {})
-        if not snapshot:
-            return {}
-        summary = str(self.redact(snapshot.get("summary") or "")).strip()[:6000]
+        summary = str(self.redact(snapshot.get("summary") or "")).strip()
         constraints = snapshot.get("constraints") or []
         if not isinstance(constraints, list):
             constraints = []
@@ -461,10 +481,11 @@ class Workbench:
             "snapshot_version": int(snapshot.get("version") or 0),
             "through_seq": int(snapshot.get("through_seq") or 0),
             "summary": summary,
-            "constraints": [str(self.redact(item)).strip()[:500] for item in constraints[:30] if str(item).strip()],
+            "constraints": [str(self.redact(item)).strip() for item in constraints if str(item).strip()],
+            "recent_messages": self.redact((status.get('context') or {}).get('recent_messages',[])),
         }
 
-    def compact_agent_conversation(self, conversation_id: str) -> dict:
+    def compact_agent_conversation(self, conversation_id: str, *, policy: dict | None = None) -> dict:
         conversation_id = valid_conversation_id(conversation_id)
         conversation = self._read_agent_conversation(conversation_id)
         if not hasattr(self.conversation_store, "save_snapshot"):
@@ -475,11 +496,26 @@ class Workbench:
         selected = (plans[-1].get('model_roles') or {}).get('agent', '') if plans else ''
         env = self.freeze_model_roles(self.environment(), {'kind': 'compaction', 'agent_id': selected})
         config = platform_config('agent', env=env) or legacy_controller(env)
+        policy = policy or {}
+        sanitize_context = None
+        task_state = {"conversation_status": conversation.get("status", "idle"),
+                      'model_role': 'agent', 'model_id': getattr(config, 'model', '') or selected or 'legacy_controller',
+                      'context_policy': dict(policy)}
+        if isinstance(self.conversation_store, PostgresConversationStore):
+            memory, scope = self._context_memory_service(conversation)
+            task_state['memory_policy_revisions'] = {row['id']: row['revision'] for row in memory.store.resources('memory')}
+            selected_memory = {row['id']: row for column in scope['columns'] or ['']
+                               for row in memory.select(account=scope['account'], column=column, conversation=conversation_id)}
+            task_state.update(memory_refs=[{'id': row['id'], 'revision': row['revision']} for row in selected_memory.values()],
+                              account_id=scope['account'], columns=sorted(scope['columns']))
+            sanitize_context = lambda context: memory.filter_context(context, **scope)
         result = compact_conversation(
             self.conversation_store,
             conversation_id,
             summarize=lambda payload: minimax_summary(payload, config=config),
-            task_state={"conversation_status": self.conversation_store.get(conversation_id).get("status", "idle")},
+            soft_limit_tokens=policy.get('soft_threshold',12000),
+            keep_recent_messages=policy.get('keep_recent',16),
+            task_state=task_state, sanitize_context=sanitize_context,
         )
         return self.redact(result)
 
@@ -701,6 +737,19 @@ class Workbench:
                       if item.get("job_id") == agent_run_id or item.get("agent_run_id") == agent_run_id), None)
         if not plan or not plan.get("jobs"):
             raise ValueError("找不到该运行对应的任务计划")
+        frozen = plan.get('frozen_execution')
+        if plan.get('plan_schema_version') == 'editorial-plan.v3' and not frozen:
+            raise ValueError('PLAN_FROZEN_INCOMPLETE: 原任务缺少冻结快照，不可使用当前配置替代')
+        if frozen:
+            from src.agent.plan_contract import digest, verify_execution
+            verify_execution(frozen)
+            if digest(frozen) != plan.get('frozen_execution_hash'):
+                raise ValueError('PLAN_FROZEN_MISMATCH: 原任务冻结摘要不一致，未恢复任务')
+            if any(key not in frozen for key in ('host_environment','model_runtime','capability_namespace')):
+                raise ValueError('PLAN_FROZEN_INCOMPLETE: 原任务缺少冻结环境，不可使用当前配置替代')
+            from backend.plan_service import PlanService
+            PlanService(self).ensure_frozen_file(conversation_id, plan)
+            plan = {**plan, **frozen}
         snapshot = self._agent_checkpoint_state(agent_run_id)
         if snapshot.get("status") == "completed":
             raise ValueError("该智能体运行已经完成，无需恢复")
@@ -727,6 +776,9 @@ class Workbench:
             "run_id": agent_run_id,
             "resume_of": run_id,
         }
+        if frozen:
+            request.update({key:deepcopy(frozen[key]) for key in ('host_environment','model_runtime','capability_namespace')})
+            request['host_environment']['AGENT_REQUIRE_FROZEN_CAPABILITIES'] = '1'
         job = self.submit(request, key)
         if previous.get("agent_run_id") != agent_run_id:
             previous["agent_run_id"] = agent_run_id
@@ -1212,7 +1264,13 @@ class Workbench:
         kind = request.get("kind")
         env = self.environment()
         if kind in {"agent", "auto", "material", "ai-digest", "wool", "daily-wool", "global-map"}:
-            env = self.freeze_model_roles(env, request)
+            if kind == 'agent' and request.get('model_runtime') is not None:
+                from src.model_platforms.integration import resume_model_environment
+                env.update(request.get('host_environment') or {})
+                env.update(resume_model_environment({'model_runtime':request['model_runtime']}, env))
+                env['AGENT_CAPABILITY_NAMESPACE'] = request['capability_namespace']
+            else:
+                env = self.freeze_model_roles(env, request)
             request = dict(request)
             for role, field in (("agent", "agent_id"), ("writer", "llm_id")):
                 frozen = json.loads(env.get("RUN_MODEL_SNAPSHOTS") or "{}").get(role)
@@ -1530,7 +1588,13 @@ class Workbench:
                         raise ValueError("同一幂等标识不能用于不同任务")
                     return self.redact(j)
             self.assert_idle()
-            job_id = uuid.uuid4().hex
+            job_id = valid_id(str(request['reserved_job_id'])) if request.get('kind') == 'agent' and request.get('reserved_job_id') else uuid.uuid4().hex
+            existing = read_json(self.directory / 'jobs' / f'{job_id}.json', {})
+            if existing:
+                if existing.get('key') != key or existing.get('digest') != digest:
+                    raise ValueError('同一运行身份不能用于不同任务')
+                self.jobs[job_id] = existing
+                return self.redact(existing)
             planned_request = dict(request)
             if request.get("kind") == "agent":
                 # Tie the CLI checkpoint to the Web job so a later resume does
@@ -1548,8 +1612,8 @@ class Workbench:
                     job["resume_of"] = valid_id(str(request["resume_of"]))
             if request["kind"] in {"delete-preview", "delete-drafts"}:
                 job["deletion_scope"] = deletion_scope(request)
-            self.jobs[job_id] = job
             self.persist(job)
+            self.jobs[job_id] = job
             threading.Thread(target=self._run, args=(job, args, env), daemon=True).start()
             return self.redact(job.copy())
 

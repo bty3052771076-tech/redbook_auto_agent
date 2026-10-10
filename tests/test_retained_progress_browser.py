@@ -25,7 +25,9 @@ def test_resumed_progress_renders_retained_items_without_network(tmp_path, monke
     run["activity"] = build_activity(run, checkpoint)
     rows = {"/api/session": {}, "/api/conversations": {"rows": [conversation]},
             f"/api/conversations/{cid}": conversation, "/api/runs": {"rows": [run]},
-            f"/api/runs/{attempt_id}": run, "/api/drafts": {"rows": []},
+            f"/api/runs/{attempt_id}": run,
+            f"/api/runs/{attempt_id}/capabilities": {"status": "not_recorded", "not_recorded": True},
+            "/api/drafts": {"rows": []},
             "/api/connections": {"database": {"status": "ready"}, "providers": {"bindings": {}, "connections": []},
                                  "models": {"rows": []}, "profile_configured": True}}
     dist = Path(__file__).resolve().parents[1] / "frontend/dist"

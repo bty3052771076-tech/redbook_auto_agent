@@ -192,7 +192,8 @@ def test_structured_approval_is_authoritative_after_content_changes(tmp_path, mo
     )
     checkpoint = agent.load_agent_checkpoint(result.checkpoint_path)
     assert checkpoint['job_states']['0']['reviewed_post_ids'] == ['b']
-    assert result.status == 'blocked'
+    assert result.status == 'partial'
+    assert result.completed_jobs == 0
 
 
 def test_transient_429_rotates_and_retries_instead_of_pausing_provider(tmp_path, monkeypatch):

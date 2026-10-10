@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.agent.capabilities.dispatcher import governed, contextual_callback
 
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
@@ -901,7 +902,7 @@ def fetch_ai_digest_search_backfill(
             max_workers=min(search_plan.max_concurrency, len(query_list)),
             thread_name_prefix="ai-search-backfill",
         ) as executor:
-            results = list(executor.map(fetch_one, query_list))
+            results = list(executor.map(contextual_callback(fetch_one), query_list))
     else:
         results = [fetch_one(query) for query in query_list]
     for query, converted, row, error in results:
@@ -934,6 +935,7 @@ def _needs_search_backfill(
     )
 
 
+@governed('builtin:ai.search', 'preparation')
 def collect_ai_digest_updates(
     *,
     sources: list[AIDigestSource] | None = None,

@@ -10,6 +10,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
 
 from src.config import LLMConfig
+from src.agent.capabilities.dispatcher import governed, request_timeout as _capability_request_timeout
 from src.news.length_policy import news_length_instruction
 from src.text_integrity import repair_utf8_as_gbk_mojibake
 
@@ -585,6 +586,7 @@ def _final_response_text(response: Any, diagnostics: dict[str, Any]) -> str:
     return final
 
 
+@governed('builtin:writer.generate', 'generate', refresh_context=True)
 def generate_draft(
     cfg: LLMConfig | list[LLMConfig],
     *,
@@ -693,7 +695,7 @@ def generate_draft(
                         ),
                         max_body=max_body,
                     ),
-                    "timeout": DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+                    "timeout": _capability_request_timeout(DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS),
                 }
                 model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.4))
                 model_kwargs.update(_summary_provider_kwargs(llm_cfg))
@@ -703,9 +705,11 @@ def generate_draft(
                 )
                 if llm_cfg.platform_snapshot:
                     from src.model_platforms.integration import invoke
-                    resp = invoke(llm_cfg, messages, max_tokens=model_kwargs["max_tokens"])
+                    from src.agent.capabilities.context_usage import invoke_observed
+                    resp = invoke_observed(llm_cfg, messages, lambda: invoke(llm_cfg, messages, max_tokens=model_kwargs["max_tokens"]))
                 else:
-                    resp = model.invoke(messages)
+                    from src.agent.capabilities.context_usage import invoke_observed
+                    resp = invoke_observed(llm_cfg, messages, lambda: model.invoke(messages))
                 response_diagnostics = _response_diagnostics(resp, model_kwargs["max_tokens"])
                 print(f"[llm-response] provider={llm_cfg.provider} model={llm_cfg.model} diagnostics={json.dumps(response_diagnostics)}")
                 generated_text = _final_response_text(resp, response_diagnostics)
@@ -824,6 +828,7 @@ def generate_draft(
     return data
 
 
+@governed('builtin:writer.generate', 'generate', passthrough_resources=('builtin:controller.plan',),refresh_context=True)
 def generate_json(
     cfg: LLMConfig | list[LLMConfig],
     *,
@@ -853,7 +858,7 @@ def generate_json(
                     "base_url": llm_cfg.base_url,
                     "api_key": llm_cfg.api_key,
                     "max_tokens": max(256, int(max_tokens)),
-                    "timeout": DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
+                    "timeout": _capability_request_timeout(DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS),
                 }
                 model_kwargs.update(_temperature_kwargs(llm_cfg.model, 0.1))
                 model_kwargs.update(_summary_provider_kwargs(llm_cfg, disable_thinking=False))
@@ -864,9 +869,11 @@ def generate_json(
                 )
                 if llm_cfg.platform_snapshot:
                     from src.model_platforms.integration import invoke
-                    response = invoke(llm_cfg, messages, max_tokens=model_kwargs["max_tokens"])
+                    from src.agent.capabilities.context_usage import invoke_observed
+                    response = invoke_observed(llm_cfg, messages, lambda: invoke(llm_cfg, messages, max_tokens=model_kwargs["max_tokens"]))
                 else:
-                    response = model.invoke(messages)
+                    from src.agent.capabilities.context_usage import invoke_observed
+                    response = invoke_observed(llm_cfg, messages, lambda: model.invoke(messages))
                 diagnostics = _response_diagnostics(response, model_kwargs["max_tokens"])
                 print(f"[llm-json-response] provider={llm_cfg.provider} model={llm_cfg.model} diagnostics={json.dumps(diagnostics)}")
                 text = _final_response_text(response, diagnostics)

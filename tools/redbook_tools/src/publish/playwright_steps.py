@@ -1358,356 +1358,66 @@ def _bottom_draft_click_point(viewport_size: Optional[dict]) -> tuple[int, int]:
     return x, y
 
 
-def _click_draft(page) -> tuple[bool, str]:
-    def _action_contexts() -> list[tuple[str, Any]]:
-        contexts: list[tuple[str, Any]] = [("current", page)]
-        try:
-            frames = list(getattr(page, "frames", []) or [])
-            main_frame = getattr(page, "main_frame", None)
-        except Exception:
-            frames = []
-            main_frame = None
-        for idx, frame in enumerate(frames):
-            if main_frame is not None and frame == main_frame:
+def _click_shadow_draft_button(page) -> tuple[bool, str]:
+    """Click only an identified save button inside the platform component."""
+    session = None
+    try:
+        session = page.context.new_cdp_session(page)
+        root = session.send("DOM.getDocument", {"depth": -1, "pierce": True})["root"]
+
+        def walk(node):
+            yield node
+            for key in ("children", "shadowRoots"):
+                for child in node.get(key, []):
+                    yield from walk(child)
+
+        def attributes(node):
+            values = node.get("attributes", [])
+            return dict(zip(values[::2], values[1::2]))
+
+        for host in walk(root):
+            if host.get("nodeName", "").lower() != "xhs-publish-btn":
                 continue
-            contexts.append((f"frame{idx}", frame))
-        return contexts
-
-    def _visible_button_texts() -> list[str]:
-        script = """
-        () => {
-          const visible = (el) => {
-            const style = window.getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
-            return style && style.visibility !== 'hidden' && style.display !== 'none'
-              && rect.width > 0 && rect.height > 0;
-          };
-          const nodes = Array.from(document.querySelectorAll('button, [role="button"], .d-button, .btn'));
-          return nodes
-            .filter(visible)
-            .map(el => (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' '))
-            .filter(Boolean)
-            .slice(0, 40);
-        }
-        """
-        try:
-            values = page.evaluate(script)
-        except Exception:
-            return []
-        return [str(v) for v in values if str(v).strip()]
-
-    def _collect_draft_text_candidates(context=page) -> list[dict]:
-        script = """
-        (texts) => {
-          const visible = (el) => {
-            const style = window.getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
-            return style && style.visibility !== 'hidden' && style.display !== 'none'
-              && rect.width > 0 && rect.height > 0;
-          };
-          const out = [];
-          const nodes = Array.from(document.querySelectorAll('body *'));
-          for (const el of nodes) {
-            if (!visible(el)) continue;
-            const value = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
-            if (!value || value.includes('发布') && !texts.some(t => value.includes(t))) continue;
-            const matched = texts.find(t => value.includes(t));
-            if (!matched) continue;
-            const target = el.closest('button,[role="button"],a,[class*="button"],[class*="btn"]') || el;
-            if (!visible(target)) continue;
-            const rect = target.getBoundingClientRect();
-            out.push({
-              text: matched,
-              x: Math.round(rect.left + rect.width / 2),
-              y: Math.round(rect.top + rect.height / 2),
-              bottom: Math.round(rect.bottom),
-              width: Math.round(rect.width),
-              height: Math.round(rect.height)
-            });
-          }
-          return out.slice(0, 80);
-        }
-        """
-        try:
-            values = context.evaluate(script, DRAFT_TEXTS)
-        except Exception:
-            return []
-        return [v for v in values if isinstance(v, dict)]
-
-    def _click_ranked_candidate(prefix: str, context=page) -> tuple[bool, str]:
-        if context is not page:
-            return False, ""
-        picked = _pick_draft_click_candidate(_collect_draft_text_candidates(context))
-        if not picked:
-            return False, ""
-        try:
-            x = int(picked.get("x") or 0)
-            y = int(picked.get("y") or 0)
-            page.mouse.click(x, y)
-            return True, f"{prefix}:ranked-text:{picked.get('text')}:x={x},y={y}"
-        except Exception:
-            return False, ""
-
-    def _click_direct_candidates(prefix: str, context=page) -> tuple[bool, str]:
-        for text in DRAFT_TEXTS:
-            if _click_first(context.get_by_role("button", name=text)):
-                return True, f"{prefix}:role-button:{text}"
-        for text in DRAFT_TEXTS:
+            if attributes(host).get("save-disabled", "").lower() == "true":
+                continue
+            for node in walk(host):
+                attrs = attributes(node)
+                if node.get("nodeName") != "BUTTON" and attrs.get("role") != "button":
+                    continue
+                text = "".join(child.get("nodeValue", "") for child in walk(node)
+                               if child.get("nodeType") == 3).strip()
+                if text not in DRAFT_TEXTS or "disabled" in attrs or attrs.get("aria-disabled") == "true":
+                    continue
+                backend_id = node["backendNodeId"]
+                session.send("DOM.scrollIntoViewIfNeeded", {"backendNodeId": backend_id})
+                box = session.send("DOM.getBoxModel", {"backendNodeId": backend_id})["model"]["content"]
+                x, y = sum(box[::2]) / 4, sum(box[1::2]) / 4
+                hit = session.send("DOM.getNodeForLocation", {
+                    "x": int(x), "y": int(y), "includeUserAgentShadowDOM": True,
+                })
+                if hit.get("backendNodeId") not in {child.get("backendNodeId") for child in walk(node)}:
+                    continue
+                page.mouse.click(x, y)
+                return True, f"shadow-save-button:{text}"
+    except Exception as exc:
+        return False, f"draft component unavailable: {type(exc).__name__}"
+    finally:
+        if session is not None:
             try:
-                if _click_first(context.get_by_text(text, exact=True), force=True, timeout_ms=2000):
-                    return True, f"{prefix}:text-exact:{text}"
+                session.detach()
             except Exception:
                 pass
-            try:
-                if _click_first(context.get_by_text(text), force=True, timeout_ms=2000):
-                    return True, f"{prefix}:text:{text}"
-            except Exception:
-                pass
+    return False, "no enabled save button in draft component"
+
+
+def _click_draft(page) -> tuple[bool, str]:
+    # Never infer saving from a host click or guess a coordinate near Publish.
+    contexts = [page] + [frame for frame in page.frames if frame != page.main_frame]
+    for context in contexts:
         for text in DRAFT_TEXTS:
-            selectors = [
-                f"button:has-text('{text}')",
-                f"[role='button']:has-text('{text}')",
-                f".d-button:has-text('{text}')",
-            ]
-            for sel in selectors:
-                if _click_first(context.locator(sel)):
-                    return True, f"{prefix}:{sel}"
-        return False, ""
-
-    def _click_by_text_js(prefix: str, context=page) -> tuple[bool, str]:
-        script = """
-        (texts) => {
-          const visible = (el) => {
-            const style = window.getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
-            return style && style.visibility !== 'hidden' && style.display !== 'none'
-              && rect.width > 0 && rect.height > 0;
-          };
-          const selectors = ['button', '[role="button"]', '.d-button', '.btn'];
-          const candidates = Array.from(document.querySelectorAll(selectors.join(',')));
-          for (const text of texts) {
-            for (const el of candidates) {
-              const value = (el.innerText || el.textContent || '').trim();
-              if (!value.includes(text) || !visible(el)) continue;
-              el.scrollIntoView({ block: 'center', inline: 'center' });
-              el.click();
-              return text;
-            }
-            const textMatches = Array.from(document.querySelectorAll('body *'))
-              .filter(el => {
-                const value = (el.innerText || el.textContent || '').trim();
-                if (!value.includes(text) || !visible(el)) return false;
-                return true;
-              })
-              .sort((a, b) => {
-                const ar = a.getBoundingClientRect();
-                const br = b.getBoundingClientRect();
-                return (ar.width * ar.height) - (br.width * br.height);
-              });
-            if (textMatches.length) {
-              const el = textMatches[0];
-              const target = el.closest('button,[role="button"],a,[class*="button"],[class*="btn"]') || el;
-              target.scrollIntoView({ block: 'center', inline: 'center' });
-              target.click();
-              return text;
-            }
-          }
-          return '';
-        }
-        """
-        try:
-            clicked = context.evaluate(script, DRAFT_TEXTS)
-        except Exception:
-            clicked = ""
-        if clicked:
-            return True, f"{prefix}:js-text:{clicked}"
-        return False, ""
-
-    def _click_coordinate_js() -> tuple[bool, str]:
-        try:
-            x, y = _bottom_draft_click_point(page.viewport_size)
-        except Exception:
-            return False, ""
-        script = """
-        ([x, y, texts]) => {
-          const visible = (el) => {
-            if (!el) return false;
-            const style = window.getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
-            return style && style.visibility !== 'hidden' && style.display !== 'none'
-              && rect.width > 0 && rect.height > 0;
-          };
-          const raw = document.elementFromPoint(x, y);
-          if (!raw || !visible(raw)) return '';
-          const target = raw.closest('button,[role="button"],a,[class*="button"],[class*="btn"],.d-button,.btn') || raw;
-          if (!target || !visible(target)) return '';
-          const text = (target.innerText || target.textContent || raw.innerText || raw.textContent || '')
-            .trim()
-            .replace(/\\s+/g, ' ');
-          if (!texts.some(t => text.includes(t))) return '';
-          target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'mouse' }));
-          target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-          target.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse' }));
-          target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-          target.click();
-          const tag = String(target.tagName || raw.tagName || 'el').toLowerCase();
-          return `${tag}:${text}`.slice(0, 120);
-        }
-        """
-        try:
-            detail = page.evaluate(script, [x, y, DRAFT_TEXTS])
-        except Exception:
-            detail = ""
-        if detail:
-            return True, f"coordinate-js:x={x},y={y}:{detail}"
-        return False, ""
-
-    def _click_xhs_publish_save_component() -> tuple[bool, str]:
-        script = """
-        (texts) => {
-          const visible = (el) => {
-            if (!el) return false;
-            const style = window.getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
-            return style && style.visibility !== 'hidden' && style.display !== 'none'
-              && rect.width > 0 && rect.height > 0;
-          };
-          const dispatchClick = (target) => {
-            target.scrollIntoView({ block: 'center', inline: 'center' });
-            target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'mouse' }));
-            target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-            target.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse' }));
-            target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-            target.click();
-          };
-          const textOf = (el) => (el && (el.innerText || el.textContent || '') || '').trim().replace(/\\s+/g, ' ');
-          const matchesSave = (value, saveText) => {
-            const text = String(value || '');
-            return text.includes(saveText) || texts.some(t => text.includes(t));
-          };
-          const hosts = Array.from(document.querySelectorAll('xhs-publish-btn'));
-          for (const host of hosts) {
-            if (!visible(host)) continue;
-            const saveText = host.getAttribute('save-text') || texts[0];
-            const disabled = String(host.getAttribute('save-disabled') || '').toLowerCase();
-            if (disabled === 'true') continue;
-            const root = host.shadowRoot || host;
-            if (root && typeof root.querySelectorAll === 'function') {
-              const candidates = Array.from(root.querySelectorAll('button,[role="button"],a,.d-button,.btn,[class*="button"],[class*="btn"]'));
-              for (const target of candidates) {
-                if (!visible(target)) continue;
-                const value = textOf(target);
-                if (!matchesSave(value, saveText)) continue;
-                dispatchClick(target);
-                return `xhs-publish-btn:${saveText}`;
-              }
-            }
-            const rect = host.getBoundingClientRect();
-            const y = rect.top + rect.height / 2;
-            const points = [
-              [rect.left + rect.width * 0.24, y],
-              [rect.left + rect.width * 0.34, y],
-              [rect.left + 60, y],
-            ];
-            for (const [x, pointY] of points) {
-              const raw = document.elementFromPoint(x, pointY);
-              if (!raw || !visible(raw)) continue;
-              const target = raw.closest('button,[role="button"],a,[class*="button"],[class*="btn"],.d-button,.btn') || raw;
-              const value = textOf(target) || textOf(raw) || saveText;
-              if (!(target === host || raw === host || matchesSave(value, saveText))) continue;
-              dispatchClick(target);
-              return `xhs-publish-btn:${saveText}`;
-            }
-          }
-          return '';
-        }
-        """
-        try:
-            detail = page.evaluate(script, DRAFT_TEXTS)
-        except Exception:
-            detail = ""
-        if detail:
-            return True, str(detail)
-        return False, ""
-
-    for prefix, context in _action_contexts():
-        ok, detail = _click_ranked_candidate(prefix, context)
-        if ok:
-            return True, detail
-        ok, detail = _click_direct_candidates(prefix, context)
-        if ok:
-            return True, detail
-        ok, detail = _click_by_text_js(prefix, context)
-        if ok:
-            return True, detail
-
-    for prefix, scroll_script in (
-        (
-            "bottom",
-            """
-            (() => {
-              const root = document.scrollingElement || document.documentElement || document.body;
-              if (root) root.scrollTop = root.scrollHeight;
-              window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
-              for (const el of Array.from(document.querySelectorAll('*'))) {
-                if (el.scrollHeight > el.clientHeight + 20) {
-                  el.scrollTop = el.scrollHeight;
-                }
-              }
-            })()
-            """,
-        ),
-        ("top", "window.scrollTo(0, 0)"),
-    ):
-        try:
-            page.evaluate(scroll_script)
-            page.wait_for_timeout(300)
-        except Exception:
-            pass
-        ok, detail = _click_ranked_candidate(prefix, page)
-        if ok:
-            return True, detail
-        for context_prefix, context in _action_contexts():
-            full_prefix = prefix if context is page else f"{prefix}-{context_prefix}"
-            ok, detail = _click_direct_candidates(full_prefix, context)
-            if ok:
-                return True, detail
-            ok, detail = _click_by_text_js(full_prefix, context)
-            if ok:
-                return True, detail
-
-    ok, detail = _click_xhs_publish_save_component()
-    if ok:
-        return True, detail
-
-    ok, detail = _click_coordinate_js()
-    if ok:
-        return True, detail
-
-    try:
-        x, y = _bottom_draft_click_point(page.viewport_size)
-        page.mouse.click(x, y)
-        return True, f"coordinate-bottom-draft:x={x},y={y}"
-    except Exception:
-        pass
-
-    publish_candidates = [
-        page.get_by_role("button", name="\u53d1\u5e03"),
-        page.get_by_role("button", name="\u53d1\u5e03\u7b14\u8bb0"),
-        page.locator("button:has-text('\u53d1\u5e03')"),
-    ]
-    for cand in publish_candidates:
-        _click_first(cand)
-    for text in DRAFT_TEXTS:
-        if _click_first(page.locator(f"button:has-text('{text}')")):
-            return True, f"menu:{text}"
-    try:
-        x, y = _bottom_draft_click_point(page.viewport_size)
-        page.mouse.click(x, y)
-        return True, f"coordinate-bottom-draft:x={x},y={y}"
-    except Exception:
-        pass
-    return False, f"draft button not found; visible_buttons={_visible_button_texts()}"
+            if _click_first(context.get_by_role("button", name=text, exact=True), timeout_ms=2000):
+                return True, f"save-button:{text}"
+    return _click_shadow_draft_button(page)
 
 
 def _click_first(locator, *, force: bool = False, timeout_ms: int | None = None) -> bool:
@@ -2884,6 +2594,11 @@ def _run_collect_platform_drafts_sync_unlocked(
                 for item in raw_items
             ]
             result["total"] = len(result["items"])
+            result["advertised_total"] = _extract_draft_count(page)
+            result["enumeration_verified"] = (
+                result["advertised_total"] == result["total"]
+                and all(str(item.get("title") or "").strip() for item in result["items"])
+            )
             result["complete"] = True
             _emit_progress(
                 progress_callback,
@@ -4208,7 +3923,23 @@ def _run_update_draft_sync_unlocked(
             if dry_run:
                 _step("update_title_body", "skipped", "dry_run")
                 _step("save_draft", "skipped", "dry_run")
-                exec_rec.result = "pending"
+                _step("readback_saved_draft", "in_progress", "")
+                readback = _verify_draft_readback_snapshot(
+                    _read_editor_draft_snapshot(page), post,
+                    actual_image_count=_count_editor_images(page),
+                )
+                steps[-1].detail = json.dumps({
+                    "actual_title": readback.actual_title, "actual_body": readback.actual_body,
+                    "actual_image_count": readback.actual_image_count,
+                    "expected_image_count": readback.expected_image_count,
+                    "title_ok": readback.title_ok, "body_ok": readback.body_ok,
+                    "image_ok": readback.image_ok, "read_only": True,
+                }, ensure_ascii=False)
+                steps[-1].status = "success" if readback.ok else "failed"
+                if not readback.ok:
+                    raise RuntimeError("readonly draft readback verification failed")
+                exec_rec.result = "verified_draft"
+                _emit_progress(progress_callback, "verify_draft_chain", "success", post.id)
                 return exec_rec
 
             _step("update_title_body", "in_progress", "")

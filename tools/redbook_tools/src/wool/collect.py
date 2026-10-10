@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.agent.capabilities.dispatcher import governed
 
 from collections.abc import Iterable
 from datetime import date, datetime, timedelta, timezone
@@ -357,6 +358,7 @@ def extract_wool_offers(
 WoolProgress = Callable[[str, str], None]
 
 
+@governed('builtin:wool.search', 'preparation')
 def collect_daily_wool_offers(
     *,
     now: datetime | date | None = None,

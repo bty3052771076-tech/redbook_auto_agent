@@ -29,12 +29,17 @@ def test_agent_model_management_and_per_plan_selection_with_real_backend(tmp_pat
     current = Workbench(tmp_path, conversation_store=Conversations())
     monkeypatch.setattr(module.app.state, 'service', current)
     monkeypatch.setattr(module, 'ensure_review_schema', lambda: None)
-    class TestKnowledge:
-        def status(self):
-            return {'status': 'ready'}
-    monkeypatch.setattr(module.KnowledgeStore, 'from_env', lambda: TestKnowledge())
+    monkeypatch.setattr(module.KnowledgeStore, 'status', lambda self: {'status':'ready'})
     sock = socket.socket()
-    sock.bind(('127.0.0.1', 0))
+    for candidate in range(49152, 65000):
+        try:
+            sock.bind(('127.0.0.1', candidate))
+            break
+        except OSError:
+            continue
+    else:
+        sock.close()
+        raise RuntimeError('no browser-safe test port available')
     port = sock.getsockname()[1]
     monkeypatch.setenv('REDBOOK_AGENT_PORT', str(port))
     server = uvicorn.Server(uvicorn.Config(module.app, log_level='error', lifespan='off'))

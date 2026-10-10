@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional
 
 from src.config import load_llm_configs
+from src.agent.capabilities.dispatcher import contextual_callback
 from src.ai_digest.collect import collect_ai_digest_updates
 from src.ai_digest.generate import (
     _concrete_action_in_text,
@@ -1190,7 +1191,7 @@ def _prefetch_daily_news_context(
         thread_name_prefix="redbook-source-lookup",
     ) as workers:
         futures = {
-            workers.submit(prepare, index, candidate): index
+            workers.submit(contextual_callback(prepare), index, candidate): index
             for index, candidate in enumerate(picks, start=1)
         }
         for future in as_completed(futures):
@@ -8908,7 +8909,7 @@ def _run_parallel_daily_news_candidates(
         coordinator_error: BaseException | None = None
 
         def submit_candidate(**kwargs):
-            future = workers.submit(_prepare_daily_news_candidate, **kwargs)
+            future = workers.submit(contextual_callback(_prepare_daily_news_candidate), **kwargs)
             submitted_futures.append(future)
             return future
 

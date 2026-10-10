@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import nullcontext
 from typing import Any
 
 from psycopg.types.json import Jsonb
@@ -15,14 +16,17 @@ class ConversationConflict(RuntimeError):
 class PostgresConversationStore:
     """PostgreSQL-backed conversation state with append-only normalized messages."""
 
-    def __init__(self, knowledge_store: KnowledgeStore | None = None):
+    def __init__(self, knowledge_store: KnowledgeStore | None = None, *, namespace: str = 'local'):
         self.knowledge_store = knowledge_store or KnowledgeStore.from_env()
+        if not isinstance(namespace, str) or not namespace or len(namespace) > 160:
+            raise ValueError('invalid conversation namespace')
+        self.namespace = namespace
 
-    def get(self, conversation_id: str) -> dict[str, Any]:
-        with self.knowledge_store.connection() as conn:
+    def get(self, conversation_id: str, *, connection=None) -> dict[str, Any]:
+        with (nullcontext(connection) if connection is not None else self.knowledge_store.connection()) as conn:
             row = conn.execute(
-                "SELECT payload,revision,last_message_seq FROM agent.conversations WHERE conversation_id=%s",
-                (conversation_id,),
+                "SELECT payload,revision,last_message_seq FROM agent.conversations WHERE conversation_id=%s AND account_namespace=%s",
+                (conversation_id, self.namespace),
             ).fetchone()
             if row is None:
                 raise KeyError(conversation_id)
@@ -41,6 +45,9 @@ class PostgresConversationStore:
 
     def context_messages(self, conversation_id: str) -> list[dict[str, Any]]:
         with self.knowledge_store.connection() as conn:
+            if conn.execute('SELECT 1 FROM agent.conversations WHERE conversation_id=%s AND account_namespace=%s',
+                            (conversation_id, self.namespace)).fetchone() is None:
+                raise KeyError(conversation_id)
             rows = conn.execute(
                 "SELECT seq,content FROM agent.messages WHERE conversation_id=%s ORDER BY seq",
                 (conversation_id,),
@@ -55,17 +62,25 @@ class PostgresConversationStore:
                    FROM agent.conversations c
                    JOIN agent.compaction_snapshots s
                      ON s.conversation_id=c.conversation_id AND s.version=c.active_snapshot_version
-                   WHERE c.conversation_id=%s""",
-                (conversation_id,),
+                   WHERE c.conversation_id=%s AND c.account_namespace=%s AND s.status='active'""",
+                (conversation_id, self.namespace),
             ).fetchone()
         return dict(row) if row else None
 
     def save_snapshot(self, conversation_id: str, *, expected_revision: int, snapshot: dict[str, Any]) -> dict[str, Any]:
         with self.knowledge_store.connection() as conn, conn.transaction():
+            task_state = snapshot.get('task_state') or {}
+            if 'memory_policy_revisions' in task_state:
+                conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (self.namespace + ':memory-context',))
+                policies = conn.execute('''SELECT resource_id,revision FROM agent.capability_settings
+                    WHERE namespace=%s AND kind='memory' ''', (self.namespace,)).fetchall()
+                observed = {policy['resource_id']: policy['revision'] for policy in policies}
+                if observed != task_state['memory_policy_revisions']:
+                    raise ConversationConflict('memory policy changed while compacting; reload before retrying')
             row = conn.execute(
                 """SELECT active_snapshot_version,revision FROM agent.conversations
-                   WHERE conversation_id=%s AND account_namespace='local' FOR UPDATE""",
-                (conversation_id,),
+                   WHERE conversation_id=%s AND account_namespace=%s FOR UPDATE""",
+                (conversation_id, self.namespace),
             ).fetchone()
             if row is None:
                 raise KeyError(conversation_id)
@@ -102,9 +117,9 @@ class PostgresConversationStore:
                           c.last_message_seq,
                           (SELECT count(*) FROM agent.messages m WHERE m.conversation_id=c.conversation_id) AS message_count
                    FROM agent.conversations c
-                   WHERE c.account_namespace='local'
+                   WHERE c.account_namespace=%s
                    ORDER BY c.updated_at DESC LIMIT %s""",
-                (max(1, min(500, int(limit))),),
+                (self.namespace, max(1, min(500, int(limit)))),
             ).fetchall()
         result = []
         for row in rows:
@@ -122,7 +137,7 @@ class PostgresConversationStore:
             })
         return result
 
-    def save(self, conversation: dict[str, Any]) -> dict[str, Any]:
+    def save(self, conversation: dict[str, Any], *, connection=None) -> dict[str, Any]:
         value = deepcopy(conversation)
         conversation_id = str(value["id"])
         expected_revision = int(value.pop("_revision", 0))
@@ -133,14 +148,14 @@ class PostgresConversationStore:
         created_at = float(value.get("created_at") or 0)
         updated_at = float(value.get("updated_at") or 0)
 
-        with self.knowledge_store.connection() as conn, conn.transaction():
+        with (nullcontext(connection) if connection is not None else self.knowledge_store.connection()) as conn, conn.transaction():
             if expected_revision == 0:
                 row = conn.execute(
                     """INSERT INTO agent.conversations
                        (conversation_id,account_namespace,title,status,payload,revision,created_at,updated_at,last_message_seq)
-                       VALUES (%s,'local',%s,%s,%s,1,to_timestamp(%s),to_timestamp(%s),0)
+                       VALUES (%s,%s,%s,%s,%s,1,to_timestamp(%s),to_timestamp(%s),0)
                        ON CONFLICT(conversation_id) DO NOTHING RETURNING revision,last_message_seq""",
-                    (conversation_id, title, status, Jsonb(value), created_at or updated_at, updated_at or created_at),
+                    (conversation_id, self.namespace, title, status, Jsonb(value), created_at or updated_at, updated_at or created_at),
                 ).fetchone()
                 if row is None:
                     raise ConversationConflict("conversation already exists; reload before saving")
@@ -151,9 +166,9 @@ class PostgresConversationStore:
                     """UPDATE agent.conversations
                        SET title=%s,status=%s,payload=%s,revision=revision+1,
                            updated_at=to_timestamp(%s)
-                       WHERE conversation_id=%s AND account_namespace='local' AND revision=%s
+                       WHERE conversation_id=%s AND account_namespace=%s AND revision=%s
                        RETURNING revision,last_message_seq""",
-                    (title, status, Jsonb(value), updated_at or created_at, conversation_id, expected_revision),
+                    (title, status, Jsonb(value), updated_at or created_at, conversation_id, self.namespace, expected_revision),
                 ).fetchone()
                 if row is None:
                     raise ConversationConflict("conversation changed in another process; reload before saving")
@@ -185,8 +200,7 @@ class PostgresConversationStore:
                 (last_message_seq, conversation_id),
             )
 
-        saved = self.get(conversation_id)
-        return saved
+            return self.get(conversation_id, connection=conn)
 
     def import_legacy(self, conversation: dict[str, Any]) -> dict[str, Any]:
         """Import an old JSON conversation once; the source file remains untouched."""

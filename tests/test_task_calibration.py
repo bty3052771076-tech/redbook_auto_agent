@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 import time
 import threading
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,6 +17,7 @@ from apps.cli import _load_agent_job_plan
 class Conversations:
     def __init__(self):
         self.rows = {}
+        self.namespace = 'unit_plan_' + uuid4().hex
 
     def get(self, key):
         return deepcopy(self.rows[key])
@@ -30,6 +32,7 @@ class Conversations:
 
 @pytest.fixture
 def workbench(tmp_path, monkeypatch):
+    from backend.plan_service import PlanService
     monkeypatch.chdir(tmp_path)
     current = Workbench(tmp_path, conversation_store=Conversations())
     monkeypatch.setattr(current, "environment", lambda: {})
@@ -38,6 +41,8 @@ def workbench(tmp_path, monkeypatch):
     monkeypatch.setattr(current, "_run", lambda *args: pytest.fail("Recognition started a content worker"))
     monkeypatch.setattr(module.app.state, "service", current)
     monkeypatch.setattr(module, "ensure_review_schema", lambda: None)
+    monkeypatch.setattr(PlanService, '_model_runtime', lambda self, plan: {
+        'snapshots':{}, 'legacy_roles':{}, 'legacy_configs':{}, 'namespace':'test'})
     return current
 
 
@@ -55,6 +60,25 @@ def candidate():
                           "evidence_source": "user_message", "evidence_quote": "伊朗、关税"}],
         "clarifications": [], "summary": "生成5篇新闻，关注伊朗、关税，速度优先，仅生成本地稿",
     }
+
+
+@pytest.mark.parametrize('address', [
+    'https://private-secret@example.test/v1',
+    'https://example.test/v1?api_key=private-secret',
+    'https://example.test/v1#private-secret',
+    'https://example.test:99999/v1',
+])
+def test_legacy_calibration_rejects_unsafe_base_before_creating_model_request(calibration, monkeypatch, address):
+    from backend.task_recognition import resolve_controller
+    from src.model_platforms import PlatformError
+    current, _, _, _, _, calls = calibration
+    env = current.environment()
+    monkeypatch.setattr(current, 'environment', lambda: {**env, 'MINIMAX_BASE_URL': address})
+    with pytest.raises(PlatformError) as error:
+        resolve_controller(current)
+    assert error.value.code == 'UNSAFE_ADDRESS'
+    assert 'private-secret' not in str(error.value)
+    assert calls == []
 
 
 @pytest.fixture
@@ -133,6 +157,37 @@ def test_keyword_requirement_maps_to_actual_keyword_field(calibration, monkeypat
     assert result["candidate"]["requirements"][0]["target"] == "job.keywords"
 
 
+def test_soft_topic_calibration_can_be_adopted_without_executing_a_worker(calibration, monkeypatch):
+    workbench, client, _, _, _, _ = calibration
+    message = ("生成10条每日新闻，优先关注知名平台禁令与解禁、消费者权益争议；"
+               "每日新闻优先筛选有意外变化的事件，约3条作为软偏好，不设硬配额")
+    cid = workbench.create_agent_conversation()["id"]
+    plan = workbench.append_agent_message(cid, message)["plan"]
+    value = candidate()
+    value["jobs"][0].update(count=10, keywords=[], topic_brief="偏向有反差的权益事件")
+    value["options"]["delivery"] = "save_draft"
+    value["requirements"] = []
+    monkeypatch.setattr(module, "recognition_call", lambda config, payload: json.dumps(value, ensure_ascii=False))
+    route = f"/api/conversations/{cid}/task-recognitions"
+    body = {"source_message_id": plan["source_message_id"], "base_plan_id": plan["id"],
+            "base_plan_version": plan["version"]}
+    response = client.post(route, headers={"X-Workbench": "1"}, json=body)
+    assert response.status_code == 200, response.text
+    rid = response.json()["id"]
+    result = wait_recognition(client, cid, rid)
+    assert result["status"] == "ready", result
+    adopted = client.post(f"{route}/{rid}/adopt", headers={"X-Workbench": "1"},
+                          json={"base_plan_version": plan["version"]})
+    assert adopted.status_code == 200, adopted.text
+    job = adopted.json()["plan"]["jobs"][0]
+    assert job["keyword_mode"] == "default"
+    assert job["count"] == 10
+    assert job['topic_brief'] == '偏向有反差的权益事件'
+    assert '约3条作为软偏好' not in job['prompt']
+    assert '知名平台禁令与解禁' not in job['prompt']
+    assert workbench.get_agent_conversation(cid)["runs"] == []
+
+
 def test_requirement_scope_schema_exposes_allowed_columns():
     from backend.task_recognition import RecognizedTask
 
@@ -181,7 +236,12 @@ def test_bad_model_output_preserves_local_plan(calibration, monkeypatch, bad):
     route = f"/api/conversations/{cid}/task-recognitions"
     result = client.post(route, headers={"X-Workbench": "1"}, json=body)
     outcome = wait_recognition(client, cid, result.json()["id"])
-    assert outcome["status"] == "failed", outcome
+    expected = 'failed' if bad in {'invalid_json', 'unknown_field', 'duplicate_key'} else 'needs_input' if bad in {'bad_count', 'public_publish'} else 'ready'
+    assert outcome["status"] == expected, outcome
+    if bad == 'invented_evidence':
+        assert outcome['candidate']['requirements'][0]['verification'] == 'unverified'
+    if bad in {'lost_keywords', 'changed_count', 'changed_delivery'}:
+        assert any(w['code'] == 'PLAN_DIFFERS' for w in outcome['candidate']['warnings'])
     assert workbench.get_agent_conversation(cid)["plans"][-1]["id"] == plan["id"]
     assert workbench.get_agent_conversation(cid)["runs"] == []
 

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 from .runtime import RuntimeClient
 from .store import PlatformError, PlatformStore
@@ -16,6 +17,20 @@ _SNAPSHOT_FIELDS = {
     'base_url', 'paths', 'network', 'auth_mode', 'credential_ref', 'credential_revision', 'authorization',
     'billing', 'parameters', 'concurrency', 'rate_limit_group', 'proxy_mode', 'fallbacks',
 }
+
+
+def _safe_legacy_address(base):
+    try:
+        parsed=urlsplit(base)
+        parsed.port
+        valid=(parsed.scheme in {'http','https'} and parsed.hostname and not
+               (parsed.username or parsed.password or parsed.query or parsed.fragment or
+                '\\' in base or any(ord(char)<33 for char in base)))
+    except (ValueError,TypeError):
+        valid=False
+    if not valid:
+        raise PlatformError('UNSAFE_ADDRESS','API基址不能包含凭据、查询参数、片段或无效端口') from None
+    return base.rstrip('/')
 
 
 def checkpoint_models(env=None, *, saved=None):
@@ -89,7 +104,7 @@ def frozen_legacy_config(role='writer', *, env=None):
     metadata = json.loads(env.get('RUN_LEGACY_MODEL_CONFIGS') or '{}').get(role) or {}
     if metadata and (metadata['model'] != model or metadata['provider'] != provider):
         raise PlatformError('SNAPSHOT_INVALID', '旧模型配置与冻结标识不一致')
-    return replace(config, base_url=metadata.get('base_url') or config.base_url)
+    return replace(config, base_url=_safe_legacy_address(metadata.get('base_url') or config.base_url))
 
 
 def freeze_run_environment(env, *, roles=('agent', 'writer')):
@@ -197,6 +212,7 @@ def legacy_controller(env, *, model='', provider='', role='agent'):
     if not key:
         raise PlatformError('CREDENTIAL_UNAVAILABLE', '主控凭据缺失，请在连接管理配置')
     base_url = env.get(url_key) or (env.get('MINIMAX_LLM_BASE_URL') if provider == 'minimax' else '') or file_cfg.get('base_url') or base
+    base_url = _safe_legacy_address(base_url)
     return LLMConfig(model=model or (env.get('AGENT_LLM_MODEL') if role == 'agent' else '') or env.get(model_key) or file_cfg.get('model') or DEFAULT_MINIMAX_LLM_MODEL,
                      api_key=key, base_url=base_url,
                      provider=provider, cost_class='subscription_included' if provider == 'minimax' else 'free')

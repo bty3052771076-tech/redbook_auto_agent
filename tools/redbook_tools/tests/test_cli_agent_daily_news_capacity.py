@@ -21,6 +21,10 @@ def adapter(monkeypatch, tmp_path):
     monkeypatch.setattr(psycopg, "connect", forbidden)
     monkeypatch.setattr(cli, "_prepare_auto_pipeline", forbidden)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('MODEL_PLATFORMS_DIR', str(tmp_path / 'model-platforms'))
+    monkeypatch.setenv('MODEL_PLATFORMS_NAMESPACE', 'agent')
+    monkeypatch.setenv('MINIMAX_TOKEN_PLAN_API_KEY', 'offline-test-not-a-real-key')
+    monkeypatch.setenv('AGENT_LLM_PROVIDER', 'minimax')
     retained = {}
     saves = []
 

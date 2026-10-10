@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.agent.capabilities.dispatcher import governed
 
 import json
 import os
@@ -247,6 +248,7 @@ def _download_image(*, url: str, dest_dir: Path, timeout_s: float) -> Path:
     return dest
 
 
+@governed('builtin:image.generate', 'generate')
 def generate_siliconflow_image(
     *,
     post_id: str,

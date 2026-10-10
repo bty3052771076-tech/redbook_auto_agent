@@ -44,9 +44,11 @@ def test_invalid_reference_cannot_be_repaired_by_discarding_its_text(calibration
     current, _, _, base, _, _ = calibration
     value = candidate()
     value["requirements"][0]["evidence_quote"] = reference
-    with pytest.raises(ValueError, match="r1") as error:
-        validate_candidate(RecognizedTask.model_validate(value), TEXT, base, current)
-    diagnostics = getattr(error.value, "diagnostics", [])
+    plan = validate_candidate(RecognizedTask.model_validate(value), TEXT, base, current)
+    assert plan['requirements'][0]['verification'] == 'unverified'
+    assert plan['requirements'][0]['evidence_quote'] == reference
+    assert plan['executable'] is True
+    diagnostics = plan['validation_diagnostics']
     assert diagnostics == [{"requirement_id": "r1", "field": "evidence_quote", "reason": reason,
                             "supplied_reference": reference}]
 
@@ -73,7 +75,8 @@ def test_failure_record_preserves_specific_validation_diagnostics(calibration, m
     response = client.post(root, headers={"X-Workbench": "1"}, json=body)
     rid = response.json()["id"]
     result = wait_recognition(client, cid, rid)
-    assert result["status"] == "failed"
+    assert result["status"] == "ready"
+    assert result['candidate']['requirements'][0]['verification'] == 'unverified'
     assert result.get("validation_diagnostics") == [{"requirement_id": "r1", "field": "evidence_quote",
         "reason": "reference_text_mismatch", "supplied_reference": "@u1 关键词：伊朗、关税"}]
     assert client.get(f"{root}/{rid}").json()["validation_diagnostics"] == result["validation_diagnostics"]
@@ -83,8 +86,8 @@ def test_failure_record_preserves_specific_validation_diagnostics(calibration, m
 
 def test_schema_diagnostics_name_invalid_fields_without_echoing_input():
     value = candidate()
-    value["options"]["delivery"] = "test-secret-input-do-not-echo"
+    value["options"]["delivery"] = {'secret': 'test-secret-input-do-not-echo'}
     with pytest.raises(ValueError) as error:
         parse_task(json.dumps(value))
-    assert getattr(error.value, "diagnostics", []) == [{"field": "options.delivery", "reason": "literal_error"}]
+    assert getattr(error.value, "diagnostics", []) == [{"field": "options.delivery", "reason": "string_type"}]
     assert "test-secret-input" not in str(error.value)

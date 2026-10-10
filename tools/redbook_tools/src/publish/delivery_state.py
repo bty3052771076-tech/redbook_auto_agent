@@ -192,3 +192,20 @@ class DeliveryStateStore:
             if action.status in {"submitting", "uncertain"}:
                 return action.__class__(**{**asdict(action), "status": "uncertain", "next_action": "reconcile"})
             return action
+
+    def allow_absent_draft_retry(self, action_id: str, *, expected_version: int, evidence_ref: str) -> DeliveryAction:
+        """Reopen only an uncertain save after independently persisted absence evidence."""
+        from .draft_recovery import absence_proven
+        evidence = json.loads(Path(evidence_ref).read_text(encoding="utf-8"))
+        with self._transaction() as records:
+            key, action = self._find(action_id, records)
+            if action.version != expected_version:
+                raise DeliveryStateError("DELIVERY_STATE_VERSION_CONFLICT", "Reconciliation is stale")
+            if action.action != "save_draft" or action.status not in {"submitting", "uncertain"}:
+                raise DeliveryStateError("DELIVERY_ACTION_INVALID", "Only uncertain draft saves can be reconciled")
+            if not absence_proven(evidence, action):
+                raise DeliveryStateError("DELIVERY_ACTION_RECONCILE_REQUIRED", "Draft absence is not proven")
+            updated = action.__class__(**{**asdict(action), "status": "prepared", "next_action": "submit",
+                "evidence_ref": evidence_ref, "last_error": "", "version": action.version + 1})
+            records[key] = asdict(updated)
+            return updated

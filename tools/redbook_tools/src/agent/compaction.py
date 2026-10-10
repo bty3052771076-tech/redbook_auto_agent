@@ -20,6 +20,12 @@ def estimate_tokens(value: Any) -> int:
     return sum(1 if re.fullmatch(r"[\u3400-\u9fff]|[^A-Za-z0-9\s]", piece) else max(1, math.ceil(len(piece) / 4)) for piece in pieces)
 
 
+def comparison_context(snapshot, messages):
+    return {'summary':str((snapshot or {}).get('summary') or ''),
+            'constraints':(snapshot or {}).get('constraints') or [], 'recent_messages':messages,
+            'instruction':'当前确认计划优先，历史摘要不是新闻事实或授权'}
+
+
 def compact_conversation(
     store: PostgresConversationStore,
     conversation_id: str,
@@ -29,12 +35,17 @@ def compact_conversation(
     keep_recent_messages: int = 16,
     allowed_evidence_refs: set[str] | None = None,
     task_state: dict[str, Any] | None = None,
+    sanitize_context: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create an immutable, versioned summary while preserving all raw messages."""
     conversation = store.get(conversation_id)
     messages = store.context_messages(conversation_id)
     active = store.active_snapshot(conversation_id)
-    current_context = {"snapshot": active, "messages": messages}
+    if sanitize_context:
+        filtered = sanitize_context({'snapshot': active, 'recent_messages': messages})
+        active, messages = filtered['snapshot'], filtered['recent_messages']
+    previous_through = int((active or {}).get("through_seq") or 0)
+    current_context = comparison_context(active, [m for m in messages if int(m['seq']) > previous_through])
     input_tokens = estimate_tokens(current_context)
     if input_tokens <= max(256, int(soft_limit_tokens)):
         return {"status": "not_needed", "input_tokens": input_tokens, "saved": False}
@@ -42,7 +53,6 @@ def compact_conversation(
     if not compactable:
         return {"status": "not_needed", "input_tokens": input_tokens, "saved": False}
 
-    previous_through = int((active or {}).get("through_seq") or 0)
     increment = [message for message in compactable if int(message["seq"]) > previous_through]
     if not increment:
         return {"status": "not_needed", "input_tokens": input_tokens, "saved": False}
@@ -63,18 +73,23 @@ def compact_conversation(
             summary = str(response.get("summary") or "").strip()
             if not summary or len(summary) > 8000:
                 raise ValueError("summary is empty or exceeds the size limit")
-            previous_constraints = list((active or {}).get("constraints") or [])
             generated_constraints = response.get("constraints") or []
             if not isinstance(generated_constraints, list) or any(not isinstance(item, str) for item in generated_constraints):
                 raise ValueError("constraints must be a list of strings")
-            constraints = list(dict.fromkeys([*previous_constraints, *[item.strip()[:500] for item in generated_constraints if item.strip()]]))[:100]
+            if len(generated_constraints) > 100 or any(len(item.strip()) > 500 for item in generated_constraints):
+                raise ValueError('constraints exceed the size limit; regenerate without truncation')
+            constraints = list(dict.fromkeys(item.strip() for item in generated_constraints if item.strip()))
+            if sanitize_context:
+                filtered = sanitize_context({'summary': summary, 'constraints': constraints})
+                summary, constraints = filtered['summary'], filtered['constraints']
             allowlist = allowed_evidence_refs or set()
             requested_refs = response.get("evidence_refs") or []
             if not isinstance(requested_refs, list) or any(not isinstance(item, str) for item in requested_refs):
                 raise ValueError("evidence_refs must be a list of strings")
             evidence_refs = sorted(set((active or {}).get("evidence_refs") or []) | (set(requested_refs) & allowlist))
-            output_tokens = estimate_tokens({"summary": summary, "constraints": constraints, "evidence_refs": evidence_refs})
-            if output_tokens >= estimate_tokens(increment):
+            output_tokens = estimate_tokens(comparison_context({'summary':summary,'constraints':constraints},
+                [m for m in messages if int(m['seq']) > through_seq]))
+            if output_tokens >= input_tokens:
                 return {"status": "no_savings", "input_tokens": input_tokens, "output_tokens": output_tokens, "saved": False}
             snapshot = store.save_snapshot(
                 conversation_id,
@@ -100,7 +115,7 @@ def compact_conversation(
             }
         except Exception as exc:
             last_error = str(exc)
-            if "conversation changed" in last_error:
+            if "conversation changed" in last_error or 'memory policy changed' in last_error:
                 return {"status": "conflict", "saved": False, "error": last_error}
     return {"status": "blocked", "saved": False, "error": last_error, "attempts": 2}
 
@@ -111,8 +126,6 @@ def compacted_context(store: PostgresConversationStore, conversation_id: str, *,
     messages = store.context_messages(conversation_id)
     through_seq = int((snapshot or {}).get("through_seq") or 0)
     recent = [message for message in messages if int(message["seq"]) > through_seq]
-    if not snapshot:
-        recent = messages[-max(1, int(recent_messages)):]
     return {"snapshot": snapshot, "recent_messages": recent, "raw_message_count": len(messages)}
 
 

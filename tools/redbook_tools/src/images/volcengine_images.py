@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.agent.capabilities.dispatcher import governed
 
 import base64
 import json
@@ -247,6 +248,7 @@ def _extract_image_data(resp: dict[str, Any]) -> tuple[str | None, bytes | None,
     raise RuntimeError("Volcengine image response missing image url/b64_json")
 
 
+@governed('builtin:image.generate', 'generate')
 def generate_volcengine_image(
     *,
     post_id: str,

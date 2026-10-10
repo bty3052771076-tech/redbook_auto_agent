@@ -9,4 +9,5 @@ def test_reader_preference_and_metrics_refresh_are_declared_host_capabilities(wo
     assert payload["capabilities"]["reader_preferences"] == "selection_soft_preference"
     assert payload["capabilities"]["published_metrics_sync"] == "preflight_freshness_check"
     assert all(row["quote"] in text for row in payload["user_evidence"])
-    assert "prompt" not in payload["local_plan"]["jobs"][0]
+    assert 'local_plan' not in payload
+    assert 'base_plan' not in payload

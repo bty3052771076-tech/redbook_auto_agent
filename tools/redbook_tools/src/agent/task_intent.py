@@ -46,6 +46,21 @@ def _topic_value(text: str, start: int) -> str:
     return re.split(boundary, value, maxsplit=1)[0].strip(" ,，")
 
 
+def _preference_keywords(value: str) -> list[str]:
+    parts = re.findall(r'[“"‘\']([^”"’\']+)[”"’\']|([^、,，;；\s]+)', value)
+    result = []
+    for quoted, plain in parts:
+        word = (quoted or plain).strip(" :：。.!！")
+        word = re.sub(r"^(?:其余|其他|其它|同时)(?:新闻|内容|选题)?(?:兼顾|关注|考虑|涵盖|包含)", "", word)
+        if re.match(r"^(?:(?:约|大约|约占|大概)?\d+(?:\.\d+)?\s*(?:条|篇|%|％)|"
+                    r"(?:不要|无需|不需要|禁止|不设|不作|不作为)|(?:作为|仅作|只作).*(?:偏好|配额|比例))", word):
+            continue
+        # Long editorial instructions stay in topic_brief, not search keywords.
+        if word and len(word) <= 80 and word not in result:
+            result.append(word)
+    return result[:16]
+
+
 def extract_job_topics(text: str, kinds: list[str]) -> dict[str, dict]:
     result = {kind: {"keywords": [], "keyword_mode": "default", "topic_brief": ""} for kind in kinds}
 
@@ -53,7 +68,13 @@ def extract_job_topics(text: str, kinds: list[str]) -> dict[str, dict]:
         if not scope:
             return
         topic = result[scope]
-        words = list(dict.fromkeys([*topic["keywords"], *split_keywords(value)]))
+        if mode == "filter":
+            previous = topic["keywords"] if topic["keyword_mode"] == "filter" else []
+            words = list(dict.fromkeys([*previous, *split_keywords(value)]))
+        elif topic["keyword_mode"] == "filter":
+            words = topic["keywords"]
+        else:
+            words = list(dict.fromkeys([*topic["keywords"], *_preference_keywords(value)]))[:16]
         if len(words) > 16:
             raise ValueError("关键词最多16个，每个不超过80字；请精简后重新发送")
         topic["keywords"] = words

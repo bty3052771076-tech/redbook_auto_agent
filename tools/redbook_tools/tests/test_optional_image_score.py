@@ -132,6 +132,11 @@ def test_score_policy_survives_plan_confirmation_and_resume(tmp_path, workbench_
     service = workbench_factory(tmp_path)
     conversation = service.create_agent_conversation()
     planned = service.append_agent_message(conversation['id'], '生成1条每日新闻并存入草稿箱，关闭图片评分硬门槛')['plan']
+    # This direct Workbench entry point represents a pre-v3 workflow plan.
+    # The new GUI confirms v3 plans through PlanService and freezes execution.
+    saved = service._read_agent_conversation(conversation['id'])
+    saved['plans'][-1]['plan_schema_version'] = 'editorial-plan.v2'
+    service._write_agent_conversation(saved)
     monkeypatch.setattr(service, 'agent_context_status', lambda _: {'status': 'ready', 'context': {}})
     submitted = []
     run_id = 'c' * 32
@@ -144,8 +149,33 @@ def test_score_policy_survives_plan_confirmation_and_resume(tmp_path, workbench_
     job = service.execute_agent_plan(conversation['id'], planned['id'], planned['version'], 'first')
     service.jobs[run_id] = job
     frozen = json.loads((service.directory / 'conversations' / conversation['id'] / 'plans' / f"{planned['id']}.json").read_text(encoding='utf-8'))
+    assert service._read_agent_conversation(conversation['id'])['plans'][-1]['plan_schema_version'] == 'editorial-plan.v2'
     assert frozen['image_score_required'] is False and submitted[0]['image_score_required'] is False
     monkeypatch.setenv('AUTO_VLM_SCORE_REQUIRED', '1')
     monkeypatch.setattr(service, '_agent_checkpoint_state', lambda _: {'status': 'failed'})
     service.resume_agent_run(conversation['id'], run_id, 'resume')
     assert submitted[1]['image_score_required'] is False and submitted[1]['run_id'] == run_id
+
+
+@pytest.mark.parametrize('reuse', [False, True])
+def test_advisory_low_score_is_explicitly_reference_only(tmp_path, monkeypatch, reuse):
+    from src.workflow.review_cache import stamp_vision_cache
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('AUTO_VLM_SCORE_REQUIRED', '0')
+    monkeypatch.setenv('AUTO_VLM_REVIEW', '1')
+    monkeypatch.setattr(cli, 'configured_vision_review_model', lambda: True)
+    monkeypatch.setattr(cli, 'load_vision_review_config', lambda: SimpleNamespace(provider='test', model='test'))
+    monkeypatch.setattr(cli, 'review_post_image', lambda *a, **kw: _result(3))
+    monkeypatch.setattr(cli, 'regenerate_daily_news_post_image', lambda *a, **kw: pytest.fail('no redraw'))
+    events = []
+    monkeypatch.setattr(cli, '_emit_progress_event', lambda *a: events.append(a))
+    post = _post(tmp_path, news=False)
+    if reuse:
+        post.platform['quality_gate'] = {'vision': stamp_vision_cache(post, {'ok': False, 'score': 3}, 'neutral')}
+        monkeypatch.setattr(cli, 'review_post_image', lambda *a, **kw: pytest.fail('reuse cached score'))
+    errors = cli._run_auto_quality_gate([post], expected_count=1, evaluation_viewpoint='neutral',
+                                      require_vision=True, reuse_vision_results=True)
+    assert errors == []
+    assert post.platform['quality_gate']['image_score_mode'] == 'advisory'
+    assert post.platform['quality_gate']['vision']['score'] == 3
+    assert any('仅供参考' in str(event) for event in events)

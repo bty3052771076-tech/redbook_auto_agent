@@ -10,7 +10,8 @@ def test_calibration_payload_separates_host_defaults_from_user_evidence(calibrat
     assert wait_recognition(client, cid, started.json()['id'])['status'] == 'ready'
     payload = calls[0][1]
     assert payload['user_evidence'][0] == {'id': 'u1', 'quote': '生成5条每日新闻'}
-    assert all('prompt' not in job for job in payload['local_plan']['jobs'])
+    assert 'local_plan' not in payload
+    assert payload['output_schema']['properties']['schema_version']['const'] == 'task-recognition.v3'
     assert all(row['quote'] in payload['user_message'] for row in payload['user_evidence'])
 
 
@@ -41,5 +42,8 @@ def test_invalid_evidence_still_rejected_and_names_the_requirement(calibration, 
     value = candidate()
     value['requirements'][0]['evidence_quote'] = quote
     text = '生成5条每日新闻，关键词：伊朗、关税；速度优先，不上传'
-    with pytest.raises(ValueError, match='r1'):
-        validate_candidate(RecognizedTask.model_validate(value), text, base, current)
+    plan = validate_candidate(RecognizedTask.model_validate(value), text, base, current)
+    assert plan['executable'] is True
+    assert plan['requirements'][0]['evidence_quote'] == quote
+    assert plan['requirements'][0]['verification'] == 'unverified'
+    assert plan['validation_diagnostics'][0]['requirement_id'] == 'r1'

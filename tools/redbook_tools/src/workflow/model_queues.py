@@ -11,6 +11,7 @@ from __future__ import annotations
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from threading import Event, Lock
 from typing import Callable, Generic, TypeVar
+from src.agent.capabilities.dispatcher import contextual_callback
 
 
 T = TypeVar("T")
@@ -79,7 +80,7 @@ class ModelWorkQueues:
         with self._admission_lock:
             if self.stopped:
                 raise ModelWorkStopped("model work stopped before submission")
-            return executor.submit(self._invoke, fn, args, kwargs)
+            return executor.submit(self._invoke, contextual_callback(fn), args, kwargs)
 
     def submit_llm(self, fn: Callable[..., T], *args, **kwargs) -> Future[T]:
         return self._submit(self.llm, fn, args, kwargs)

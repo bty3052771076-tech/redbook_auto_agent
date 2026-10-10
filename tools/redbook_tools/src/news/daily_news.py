@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.agent.capabilities.dispatcher import governed
 
 import json
 import os
@@ -3776,6 +3777,7 @@ def _fetch_news_provider(
     )
 
 
+@governed('builtin:news.search', 'preparation')
 def fetch_daily_news_candidates(
     prompt_hint: str,
     *,

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.agent.capabilities.dispatcher import governed
 
 import json
 import os
@@ -499,6 +500,7 @@ def _poll_task_result(
         time.sleep(max(0.2, poll_interval_s))
 
 
+@governed('builtin:image.generate', 'generate')
 def generate_aliyun_image(
     *,
     post_id: str,

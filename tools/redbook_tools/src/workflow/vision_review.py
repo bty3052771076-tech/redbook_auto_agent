@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.agent.capabilities.dispatcher import governed
 
 import base64
 import json
@@ -189,6 +190,7 @@ def _image_data_url(path: Path) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
+@governed('builtin:image.review', 'evidence')
 def _invoke_vision_review_request(
     config: LLMConfig,
     *,

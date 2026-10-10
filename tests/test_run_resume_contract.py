@@ -5,6 +5,8 @@ import json
 import socket
 import threading
 import time
+from types import SimpleNamespace
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -33,7 +35,18 @@ class MemoryConversations:
 
 @pytest.fixture
 def isolated(monkeypatch, tmp_path):
+    from backend.plan_service import PlanService
+    from backend import capabilities
     service = Workbench(tmp_path, conversation_store=MemoryConversations())
+    namespace = 'resume_unit_' + uuid4().hex
+    snapshot = {'snapshot_id':'offline-test'}
+    manager = SimpleNamespace(store=SimpleNamespace(namespace=namespace,resources=lambda: []),
+        context=SimpleNamespace(policy=lambda cid: ({'mode':'manual'},0),
+                                prepare=lambda cid: pytest.fail('manual policy invoked compaction')),
+        plan_capabilities=lambda *args: {'memory':[],'skills':[]}, freeze_plan=lambda *args, **kwargs: snapshot)
+    monkeypatch.setattr(capabilities, 'manager', lambda current: manager)
+    monkeypatch.setattr(PlanService, '_model_runtime', lambda self, plan: {
+        'snapshots':{}, 'legacy_roles':{}, 'legacy_configs':{}, 'namespace':'test'})
     service._test_checkpoint_states = {}
 
     def checkpoint_state(run_id):

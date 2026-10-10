@@ -67,11 +67,19 @@ def test_plan_role_override_is_versioned_and_does_not_change_defaults(calibratio
     assert current.providers()['bindings']['agent'] == ''
     assert calls == []
     assert client.put(route, headers={'X-Workbench': '1'}, json={'version': plan['version'], 'model_roles': roles}).status_code == 409
-    response = client.put(route, headers={'X-Workbench': '1'}, json={'version': updated['version'], 'model_roles': {**roles, 'agent': 'm_missing'}})
-    assert response.status_code == 404
+    current_route = f'/api/conversations/{cid}/plans/{updated["id"]}/models'
+    response = client.put(current_route, headers={'X-Workbench': '1'}, json={'version': updated['version'], 'model_roles': {**roles, 'agent': 'm_missing'}})
+    assert response.status_code == 200, response.text
+    assert response.json()['plan']['executable'] is False
+    assert any(row['code'] == 'MODEL_NOT_AVAILABLE' for row in response.json()['plan']['field_errors'])
+    displayed = client.get(f'/api/conversations/{cid}').json()['plans'][-1]
+    assert displayed['executable'] is False
+    assert any(row['code'] == 'MODEL_NOT_AVAILABLE' for row in displayed['field_errors'])
 
 
 def test_agent_cli_uses_runtime_directory_and_agent_namespace(tmp_path, monkeypatch):
+    import os
+    from unittest.mock import patch
     from pathlib import Path
     from types import SimpleNamespace
     from typer.testing import CliRunner
@@ -85,6 +93,9 @@ def test_agent_cli_uses_runtime_directory_and_agent_namespace(tmp_path, monkeypa
         captured.append((Path(directory), namespace))
         return SimpleNamespace(state=lambda: {'roles': {}})
     monkeypatch.setattr(cli, 'PlatformStore', create)
-    result = CliRunner().invoke(app, ['model-platforms', 'roles'])
+    previous = dict(os.environ)
+    with patch.dict(os.environ):
+        result = CliRunner().invoke(app, ['model-platforms', 'roles'])
+    assert dict(os.environ) == previous
     assert result.exit_code == 0, result.output
     assert captured == [(tmp_path / 'runtime/data/model_platforms', 'agent')]

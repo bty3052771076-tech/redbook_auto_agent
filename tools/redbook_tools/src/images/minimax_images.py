@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.agent.capabilities.dispatcher import governed
 
 import base64
 import json
@@ -217,6 +218,7 @@ def _model_candidates(model: Optional[str]) -> list[str]:
     return [selected] if selected else list(DEFAULT_MODELS)
 
 
+@governed('builtin:image.generate', 'generate')
 def generate_minimax_image(
     *,
     post_id: str,

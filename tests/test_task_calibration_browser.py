@@ -117,6 +117,19 @@ def test_restored_candidate_is_not_called_again_and_can_be_discarded(browser):
     context.close()
 
 
+def test_pending_calibration_has_one_candidate_and_blocks_execution(browser):
+    scenario = CalibrationScenario()
+    scenario.finish()
+    scenario.conversation['task_recognitions'] = [scenario.record]
+    context, page, errors = prepare(browser, scenario)
+    expect(page.locator('.task-calibration')).to_have_count(1)
+    expect(page.get_by_role('button', name='采用校准计划', exact=True)).to_have_count(1)
+    expect(page.get_by_role('button', name='确认并执行', exact=True)).to_be_disabled()
+    assert not any('/confirm' in path for _, path in scenario.calls)
+    assert not errors
+    context.close()
+
+
 def test_failed_or_unresolved_calibration_keeps_original_plan(browser):
     scenario = CalibrationScenario()
     scenario.finish("failed")
@@ -129,7 +142,24 @@ def test_failed_or_unresolved_calibration_keeps_original_plan(browser):
     scenario.record["error"] = ""
     scenario.record["candidate"].update(executable=False, unresolved_requirements=["需要明确平台"])
     page.reload()
-    expect(page.get_by_role("button", name="采用校准计划", exact=True)).to_be_disabled()
+    expect(page.get_by_role("button", name="采用校准计划", exact=True)).to_be_enabled()
+    expect(page.get_by_role("button", name="确认并执行", exact=True)).to_be_disabled()
     expect(page.locator(".calibration-issues")).to_contain_text("需要明确平台")
+    assert not errors
+    context.close()
+
+
+def test_duplicate_annotations_and_invalid_mode_are_not_misrepresented(browser):
+    scenario = CalibrationScenario()
+    scenario.finish('needs_input')
+    scenario.record['candidate'].update(performance_mode='fast', warnings=[
+        {'code': 'ANNOTATION_UNVERIFIED', 'field': f'annotations.{index}',
+         'message': '有1项来源标注待核对，可对照原始指令编辑计划'} for index in range(8)
+    ])
+    scenario.conversation['task_recognitions'] = [scenario.record]
+    context, page, errors = prepare(browser, scenario)
+    expect(page.locator('.calibration-status li')).to_have_count(1)
+    expect(page.locator('.calibration-options')).to_contain_text('待修正（fast）')
+    assert not any('/confirm' in path for _, path in scenario.calls)
     assert not errors
     context.close()

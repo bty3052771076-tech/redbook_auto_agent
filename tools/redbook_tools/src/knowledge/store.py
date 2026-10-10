@@ -91,6 +91,11 @@ class KnowledgeStore:
             conn.execute("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
             conn.execute("CREATE SCHEMA IF NOT EXISTS knowledge")
             conn.execute("CREATE SCHEMA IF NOT EXISTS agent")
+            conn.execute('''CREATE TABLE IF NOT EXISTS knowledge.document_policies (
+                account_namespace text NOT NULL, record_id text NOT NULL, revision integer NOT NULL,
+                excluded_purposes text[] NOT NULL DEFAULT '{}', annotation text NOT NULL DEFAULT '',
+                source_ref text NOT NULL DEFAULT '', updated_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY(account_namespace,record_id))''')
             conn.execute("CREATE TABLE IF NOT EXISTS knowledge.schema_migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS knowledge.documents (
@@ -272,7 +277,7 @@ class KnowledgeStore:
         item["allowed_purposes"] = [p for p in (item.get("allowed_purposes") or "").split(",") if p]
         return item
 
-    def pending_documents(self, *, limit: int = 128) -> list[dict[str, Any]]:
+    def pending_documents(self, *, limit: int = 128, account_namespace: str | None = None) -> list[dict[str, Any]]:
         if self._memory:
             raise RuntimeError("RAG indexing is disabled in test-only in-memory mode")
         with self.connection() as conn:
@@ -281,13 +286,13 @@ class KnowledgeStore:
                        d.source_published_at,d.observed_at,d.status,d.visibility,d.allowed_purposes,
                        d.metadata,d.content_hash
                 FROM knowledge.documents d
-                WHERE (d.title || d.body) ~ '[^[:space:]]' AND NOT EXISTS (
+                WHERE (%s::text IS NULL OR d.account_namespace=%s) AND (d.title || d.body) ~ '[^[:space:]]' AND NOT EXISTS (
                     SELECT 1 FROM knowledge.chunks c WHERE c.document_id=d.id
                     AND c.document_version=d.content_hash AND c.model_id=%s
                     AND c.chunk_version=%s AND c.index_status='ready'
                 )
                 ORDER BY d.id LIMIT %s
-            """, (_MODEL_ID, _CHUNK_VERSION, max(1, min(1000, int(limit))))).fetchall()
+            """, (account_namespace, account_namespace, _MODEL_ID, _CHUNK_VERSION, max(1, min(1000, int(limit))))).fetchall()
         result = []
         for row in rows:
             item = dict(row)
@@ -295,7 +300,7 @@ class KnowledgeStore:
             result.append(item)
         return result
 
-    def index_progress(self) -> dict[str, int]:
+    def index_progress(self, *, account_namespace: str | None = None) -> dict[str, int]:
         if self._memory:
             return {"documents": len(self._memory_documents), "indexed_documents": 0, "pending_documents": len(self._memory_documents)}
         with self.connection() as conn:
@@ -307,8 +312,8 @@ class KnowledgeStore:
                            AND c.chunk_version=%s AND c.index_status='ready'
                        )) AS indexed_documents,
                        count(*) FILTER (WHERE NOT ((d.title || d.body) ~ '[^[:space:]]')) AS empty_documents
-                FROM knowledge.documents d
-            """, (_MODEL_ID, _CHUNK_VERSION)).fetchone()
+                FROM knowledge.documents d WHERE (%s::text IS NULL OR d.account_namespace=%s)
+            """, (_MODEL_ID, _CHUNK_VERSION, account_namespace, account_namespace)).fetchone()
         total, indexed, empty = int(row["documents"]), int(row["indexed_documents"]), int(row["empty_documents"])
         return {"documents": total, "indexed_documents": indexed, "empty_documents": empty,
                 "pending_documents": total - indexed - empty}
@@ -331,7 +336,7 @@ class KnowledgeStore:
                 """, (chunk["chunk_id"], row["id"], row["content_hash"], chunk["chunk_index"], chunk["content"], chunk["char_start"], chunk["char_end"], chunk["token_count"], Vector(chunk["embedding"]), _MODEL_ID, _CHUNK_VERSION, chunk["batch_id"]))
         return len(chunks)
 
-    def search(self, query: str, *, purpose: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    def search(self, query: str, *, purpose: str | None = None, limit: int = 20, account_namespace: str = 'local') -> list[dict[str, Any]]:
         query = str(query or "").strip()
         if not query:
             return []
@@ -340,6 +345,8 @@ class KnowledgeStore:
             terms = [term.casefold() for term in query.split() if term]
             hits = []
             for item in self._memory_documents.values():
+                if item['account_namespace'] != account_namespace:
+                    continue
                 if purpose and purpose not in item["allowed_purposes"]:
                     continue
                 text = f"{item['title']} {item['body']}".casefold()
@@ -352,7 +359,7 @@ class KnowledgeStore:
         query_vector = Vector(embedder.embed_query(query))
         purpose_filter = purpose or ""
         with self.connection() as conn:
-            ready = conn.execute("SELECT count(*) AS n FROM knowledge.chunks WHERE index_status='ready' AND model_id=%s AND chunk_version=%s", (_MODEL_ID, _CHUNK_VERSION)).fetchone()["n"]
+            ready = conn.execute("SELECT count(*) AS n FROM knowledge.chunks c JOIN knowledge.documents d ON d.id=c.document_id WHERE d.account_namespace=%s AND c.document_version=d.content_hash AND index_status='ready' AND model_id=%s AND chunk_version=%s", (account_namespace, _MODEL_ID, _CHUNK_VERSION)).fetchone()["n"]
             if not ready:
                 raise RuntimeError("KNOWLEDGE_INDEX_NOT_READY: no ready vector chunks for the configured embedding model")
             rows = conn.execute("""
@@ -360,13 +367,19 @@ class KnowledgeStore:
                     SELECT c.chunk_id, row_number() OVER (ORDER BY c.embedding <=> %s) AS rank
                     FROM knowledge.chunks c JOIN knowledge.documents d ON d.id=c.document_id
                     WHERE c.index_status='ready' AND c.model_id=%s AND c.chunk_version=%s
+                      AND c.document_version=d.content_hash
                       AND d.account_namespace=%s AND (%s='' OR (','||d.allowed_purposes||',') LIKE ('%%,'||%s||',%%'))
+                      AND NOT EXISTS (SELECT 1 FROM knowledge.document_policies p WHERE p.account_namespace=d.account_namespace
+                          AND p.record_id=d.record_id AND (%s=ANY(p.excluded_purposes) OR %s='' AND cardinality(p.excluded_purposes)>0))
                     ORDER BY c.embedding <=> %s LIMIT 40
                 ), lexical AS (
                     SELECT c.chunk_id, row_number() OVER (ORDER BY similarity(lower(d.title||' '||c.content),lower(%s)) DESC) AS rank
                     FROM knowledge.chunks c JOIN knowledge.documents d ON d.id=c.document_id
                     WHERE c.index_status='ready' AND c.model_id=%s AND c.chunk_version=%s
+                      AND c.document_version=d.content_hash
                       AND d.account_namespace=%s AND (%s='' OR (','||d.allowed_purposes||',') LIKE ('%%,'||%s||',%%'))
+                      AND NOT EXISTS (SELECT 1 FROM knowledge.document_policies p WHERE p.account_namespace=d.account_namespace
+                          AND p.record_id=d.record_id AND (%s=ANY(p.excluded_purposes) OR %s='' AND cardinality(p.excluded_purposes)>0))
                       AND (lower(d.title||' '||c.content) %% lower(%s) OR lower(d.title||' '||c.content) LIKE ('%%'||lower(%s)||'%%'))
                     ORDER BY similarity(lower(d.title||' '||c.content),lower(%s)) DESC LIMIT 40
                 ), fused AS (
@@ -379,7 +392,9 @@ class KnowledgeStore:
                        c.chunk_id,c.content AS matched_chunk,c.char_start,c.char_end,f.score
                 FROM fused f JOIN knowledge.chunks c USING(chunk_id) JOIN knowledge.documents d ON d.id=c.document_id
                 ORDER BY f.score DESC LIMIT %s
-            """, (query_vector,_MODEL_ID,_CHUNK_VERSION,"local",purpose_filter,purpose_filter,query_vector,query,_MODEL_ID,_CHUNK_VERSION,"local",purpose_filter,purpose_filter,query,query,query,capped)).fetchall()
+            """, (query_vector,_MODEL_ID,_CHUNK_VERSION,account_namespace,purpose_filter,purpose_filter,purpose_filter,purpose_filter,
+                  query_vector,query,_MODEL_ID,_CHUNK_VERSION,account_namespace,purpose_filter,purpose_filter,purpose_filter,purpose_filter,
+                  query,query,query,capped)).fetchall()
         result = []
         seen = set()
         for row in rows:

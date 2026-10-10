@@ -19,6 +19,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from psycopg import OperationalError
+from psycopg_pool import PoolClosed, PoolTimeout
 
 from .settings import configure_runtime
 
@@ -32,6 +34,8 @@ from src.storage.files import load_post  # noqa: E402
 from .evidence import source_evidence
 from .runs import local_draft_ids
 from .task_recognition import RecognitionService, call_model
+from .plan_service import PlanService
+from src.agent.plan_contract import PlanContractError
 from .progress import activity_reply, build_activity, checkpoint_job_records, is_status_question, read_checkpoint, run_overview
 
 
@@ -51,10 +55,13 @@ class SourceCheckCreate(BaseModel):
 
 
 class PlanConfirm(BaseModel):
+    model_config = {'extra': 'forbid'}
     conversation_id: str
     version: int
     skill_mode: str = "off"
     skill_names: list[str] = Field(default_factory=list)
+    semantic_hash: str | None = Field(default=None, max_length=64)
+    configuration_fingerprint: str | None = Field(default=None, max_length=64)
 
 
 class ModelRoles(BaseModel):
@@ -71,9 +78,26 @@ class TaskRecognitionCreate(BaseModel):
     controller_model_ref: str = Field(default="", max_length=260)
 
 
-class TaskRecognitionAdopt(BaseModel):
+class PlanEdit(BaseModel):
     model_config = {"extra": "forbid"}
     base_plan_version: int = Field(ge=1, strict=True)
+    conversation_revision: int | None = Field(default=None, ge=0, strict=True)
+    editable_fields: dict = Field(default_factory=dict)
+    review_decisions: list[dict] = Field(default_factory=list, max_length=50)
+
+
+class TaskRecognitionAdopt(PlanEdit):
+    accepted_candidate_paths: list[str] = Field(default_factory=list, max_length=32)
+
+
+class PlanRestore(PlanEdit):
+    restore_plan_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+class PlanCopy(BaseModel):
+    model_config = {'extra':'forbid'}
+    base_plan_version: int = Field(ge=1,strict=True)
+    conversation_revision: int = Field(ge=0,strict=True)
 
 
 class PlanModels(BaseModel):
@@ -92,6 +116,7 @@ app = FastAPI(title="采编智能体", docs_url=None, redoc_url=None, openapi_ur
 app.state.token = secrets.token_urlsafe(32)
 app.state.service = None
 app.state.recognitions = None
+app.state.review_schema_ready = False
 recognition_call = call_model
 
 
@@ -99,7 +124,12 @@ def service() -> Workbench:
     if app.state.service is None:
         store = KnowledgeStore.from_env()
         if store.status().get("status") != "ready":
-            raise RuntimeError("独立 PostgreSQL 不可用，请检查 E 盘运行区的数据库")
+            from src.agent.capabilities.models import CapabilityError
+            raise CapabilityError('POSTGRES_UNAVAILABLE', 'PostgreSQL 暂不可用，操作未完成',
+                status=503, next_action='检查 E 盘数据库服务和连接配置，恢复连接后重试')
+        if not app.state.review_schema_ready:
+            ensure_review_schema()
+            app.state.review_schema_ready = True
         app.state.service = Workbench(root=RUNTIME)
     return app.state.service
 
@@ -167,10 +197,26 @@ def authenticated(request: Request):
 @app.exception_handler(FileNotFoundError)
 async def user_error(_request: Request, exc: Exception):
     from src.model_platforms import PlatformError
+    from src.agent.capabilities.models import CapabilityError
+    if isinstance(exc, CapabilityError):
+        return JSONResponse(exc.public(), status_code=exc.status)
+    if isinstance(exc, PlanContractError):
+        return JSONResponse(exc.public(), status_code=exc.status)
+    from src.agent.conversation_store import ConversationConflict
+    if isinstance(exc, ConversationConflict):
+        return JSONResponse({'code': 'CONVERSATION_CONFLICT', 'error': '对话已更新，请刷新后合并；当前编辑内容请保留'}, status_code=409)
     if isinstance(exc, PlatformError):
         return JSONResponse(exc.public(), status_code=exc.status)
     current = app.state.service
     return JSONResponse({"error": current.redact(str(exc)) if current else str(exc)}, status_code=400)
+
+
+@app.exception_handler(OperationalError)
+@app.exception_handler(PoolTimeout)
+@app.exception_handler(PoolClosed)
+async def database_error(_request: Request, _exc: Exception):
+    return JSONResponse({'code':'POSTGRES_UNAVAILABLE', 'error':'PostgreSQL 暂不可用，操作未完成',
+        'next_action':'检查 E 盘数据库服务和连接配置，恢复连接后重试；写入结果请用原请求键核对'}, status_code=503)
 
 
 @app.get("/api/health")
@@ -209,7 +255,12 @@ def create_conversation(body: ConversationCreate):
 
 @app.get("/api/conversations/{conversation_id}", dependencies=[Depends(authenticated)])
 def conversation(conversation_id: str):
-    return service().get_agent_conversation(valid_conversation_id(conversation_id))
+    current = service()
+    result = current.get_agent_conversation(valid_conversation_id(conversation_id))
+    plans = PlanService(current)
+    result['plans'] = [plans.describe(plan) if plan.get('plan_kind') != 'draft_management' else plan
+                       for plan in result.get('plans', [])]
+    return result
 
 
 @app.post("/api/conversations/{conversation_id}/messages", dependencies=[Depends(authenticated)])
@@ -238,34 +289,28 @@ def add_message(conversation_id: str, body: MessageCreate):
 
 
 @app.put("/api/conversations/{conversation_id}/plans/{plan_id}/models", dependencies=[Depends(authenticated)])
-def plan_models(conversation_id: str, plan_id: str, body: PlanModels):
-    from src.model_platforms import PlatformError
-    current = service()
-    with current.lock:
-        saved = current._read_agent_conversation(valid_conversation_id(conversation_id))
-        plan = next((p for p in saved.get("plans", []) if p.get("id") == valid_id(plan_id)), None)
-        if not plan:
-            raise PlatformError("PLAN_NOT_FOUND", "计划不存在", status=404)
-        if plan.get("version") != body.version:
-            raise PlatformError("REVISION_CONFLICT", "计划已经变化，请刷新后保存", status=409)
-        if plan.get("job_id") or plan.get("resume_job_id"):
-            raise PlatformError("PLAN_FROZEN", "已执行计划不能修改模型，请新建计划", status=409)
-        recognition_service().assert_can_execute(conversation_id, plan_id)
-        roles = body.model_roles.model_dump()
-        catalog = {m["id"]: m for m in current.models()["rows"]}
-        for role, ref in roles.items():
-            if not ref:
-                continue
-            if ref.startswith("m_"):
-                current.model_platforms().resolve(role, ref)
-            else:
-                row = catalog.get(ref)
-                if not row or not row.get("selectable") or row["kind"] != ("image" if role == "image" else "llm"):
-                    raise PlatformError("MODEL_DISABLED", "此角色模型不可执行，请检查连接与模型")
-        plan["model_roles"] = roles
-        plan["version"] += 1
-        current._write_agent_conversation(saved)
-        return current.redact({"plan": plan})
+def plan_models(conversation_id: str, plan_id: str, body: PlanModels, idempotency_key: str = Header(default="")):
+    return PlanService(service()).save(valid_conversation_id(conversation_id), valid_id(plan_id),
+        {'base_plan_version': body.version, 'editable_fields': {'model_roles': body.model_roles.model_dump()}},
+        idempotency_key or uuid4().hex)
+
+
+@app.post('/api/conversations/{conversation_id}/plans/{plan_id}/revisions', dependencies=[Depends(authenticated)])
+def edit_plan(conversation_id: str, plan_id: str, body: PlanEdit, idempotency_key: str = Header(default='')):
+    return PlanService(service()).save(valid_conversation_id(conversation_id), valid_id(plan_id),
+                                       body.model_dump(), idempotency_key or uuid4().hex)
+
+
+@app.post('/api/conversations/{conversation_id}/plans/{plan_id}/restore', dependencies=[Depends(authenticated)])
+def restore_plan(conversation_id: str, plan_id: str, body: PlanRestore, idempotency_key: str = Header(default='')):
+    return PlanService(service()).restore(valid_conversation_id(conversation_id), valid_id(plan_id),
+                                          body.model_dump(), idempotency_key or uuid4().hex)
+
+
+@app.post('/api/conversations/{conversation_id}/plans/{plan_id}/copy', dependencies=[Depends(authenticated)])
+def copy_plan(conversation_id: str,plan_id: str,body: PlanCopy,idempotency_key: str=Header(default='')):
+    return PlanService(service()).copy(valid_conversation_id(conversation_id),valid_id(plan_id),
+                                      body.model_dump(),idempotency_key or uuid4().hex)
 
 
 @app.post("/api/plans/{plan_id}/confirm", dependencies=[Depends(authenticated)])
@@ -277,6 +322,9 @@ def confirm_plan(plan_id: str, body: PlanConfirm, idempotency_key: str = Header(
         raise ValueError("独立界面暂不执行公开发布；请在平台人工确认")
     with current.lock:
         recognition_service().assert_can_execute(body.conversation_id, plan_id)
+    if plan and plan.get('plan_schema_version') == 'editorial-plan.v3':
+        return PlanService(current).confirm(body.conversation_id, plan_id, body.model_dump(), idempotency_key or uuid4().hex)
+    with current.lock:
         return current.execute_agent_plan(
             valid_conversation_id(body.conversation_id), valid_id(plan_id), body.version,
             idempotency_key or uuid4().hex, skill_mode=body.skill_mode, skill_names=body.skill_names,
@@ -296,8 +344,9 @@ def task_recognition(conversation_id: str, recognition_id: str):
 
 
 @app.post("/api/conversations/{conversation_id}/task-recognitions/{recognition_id}/adopt", dependencies=[Depends(authenticated)])
-def adopt_task_recognition(conversation_id: str, recognition_id: str, body: TaskRecognitionAdopt):
-    return recognition_service().adopt(valid_conversation_id(conversation_id), valid_id(recognition_id), body.base_plan_version)
+def adopt_task_recognition(conversation_id: str, recognition_id: str, body: TaskRecognitionAdopt, idempotency_key: str = Header(default='')):
+    return recognition_service().adopt(valid_conversation_id(conversation_id), valid_id(recognition_id),
+                                       body.base_plan_version, body.model_dump(), idempotency_key or 'adopt:' + recognition_id)
 
 
 @app.post("/api/conversations/{conversation_id}/task-recognitions/{recognition_id}/discard", dependencies=[Depends(authenticated)])
@@ -486,6 +535,8 @@ async def model_platforms(path: str, request: Request):
                                    data, request.headers.get("Idempotency-Key", ""))
 
 app.include_router(create_wool_library_router(service), dependencies=[Depends(authenticated)])
+from .capabilities import create_capability_router
+app.include_router(create_capability_router(service, runtime_root=RUNTIME), dependencies=[Depends(authenticated)])
 
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend/dist"
 if FRONTEND.is_dir():
@@ -494,5 +545,14 @@ if FRONTEND.is_dir():
 
 @app.on_event("startup")
 def startup():
-    ensure_review_schema()
-    service()
+    from src.agent.capabilities.models import CapabilityError
+    try:
+        ensure_review_schema()
+        app.state.review_schema_ready = True
+        service()
+    except (OperationalError, PoolClosed, PoolTimeout):
+        app.state.review_schema_ready = False
+    except CapabilityError as exc:
+        if exc.code != 'POSTGRES_UNAVAILABLE':
+            raise
+        app.state.review_schema_ready = False

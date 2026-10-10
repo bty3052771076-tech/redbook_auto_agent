@@ -511,6 +511,7 @@ def test_agent_execution_plan_freezes_compacted_conversation_context(service, mo
         "through_seq": 18,
         "summary": snapshot["summary"],
         "constraints": snapshot["constraints"],
+        "recent_messages": [],
     }
     assert submitted["agent_jobs_file"] == str(plan_file.resolve())
     assert frozen["skill_mode"] == "manual"

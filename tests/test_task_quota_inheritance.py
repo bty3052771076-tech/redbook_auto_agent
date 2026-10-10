@@ -19,8 +19,9 @@ def test_express_request_for_unsupported_quota_sync_still_needs_input(calibratio
     value = candidate()
     value["options"]["skip_quota_sync"] = False
     plan = validate_candidate(RecognizedTask.model_validate(value), text, base, current)
-    assert plan["executable"] is False
-    assert any("不支持自动同步额度" in issue for issue in plan["unresolved_requirements"])
+    assert plan['skip_quota_sync'] is True
+    assert any(w['code'] == 'QUOTA_POLICY_READONLY' for w in plan['warnings'])
+    assert plan['executable'] is True
 
 
 def test_quota_balance_statement_is_not_a_sync_request(calibration):

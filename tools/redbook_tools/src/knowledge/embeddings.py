@@ -141,10 +141,11 @@ def index_pending_documents(
     batch_size: int = 128,
     embedder=None,
     progress_callback: Callable[[dict[str, int]], None] | None = None,
+    account_namespace: str | None = None,
 ) -> dict[str, int]:
     indexed_documents = 0
     indexed_chunks = 0
-    pending = store.pending_documents(limit=batch_size)
+    pending = store.pending_documents(limit=batch_size, **({'account_namespace': account_namespace} if account_namespace is not None else {}))
     if not pending:
         return {"indexed_documents": 0, "indexed_chunks": 0}
     worker = embedder or get_embedding_model()
@@ -165,5 +166,5 @@ def index_pending_documents(
                 "indexed_documents_this_run": indexed_documents,
                 "indexed_chunks_this_run": indexed_chunks,
             })
-        pending = store.pending_documents(limit=batch_size)
+        pending = store.pending_documents(limit=batch_size, **({'account_namespace': account_namespace} if account_namespace is not None else {}))
     return {"indexed_documents": indexed_documents, "indexed_chunks": indexed_chunks}

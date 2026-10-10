@@ -108,6 +108,7 @@ class EditorialAgentConfig:
     checkpoint_dir: Path = Path("data") / "runs" / "agent"
     resume_from: Path | None = None
     checkpoint_backend: str = "json"
+    capability_management: bool = False
     conversation_context: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> "EditorialAgentConfig":
@@ -133,20 +134,8 @@ class EditorialAgentConfig:
         raw_skills = self.conversation_context.get("skills") or []
         if not isinstance(raw_skills, list) or any(not isinstance(item, dict) for item in raw_skills):
             raise ValueError("conversation context skills must be objects")
-        conversation_context = {
-            "snapshot_version": max(0, int(self.conversation_context.get("snapshot_version") or 0)),
-            "through_seq": max(0, int(self.conversation_context.get("through_seq") or 0)),
-            "summary": str(self.conversation_context.get("summary") or "")[:6000],
-            "constraints": [item.strip()[:500] for item in raw_constraints[:30] if item.strip()],
-            "skills": [
-                {
-                    "name": str(item.get("name") or "")[:80],
-                    "version_hash": str(item.get("version_hash") or "")[:64],
-                    "body": str(item.get("body") or "")[:12000],
-                }
-                for item in raw_skills[:3]
-            ],
-        }
+        from src.agent.execution_context import normalize_execution_context
+        conversation_context = normalize_execution_context(self.conversation_context)
         return EditorialAgentConfig(
             provider=provider,
             use_subscription=self.use_subscription,
@@ -158,6 +147,7 @@ class EditorialAgentConfig:
             checkpoint_dir=Path(self.checkpoint_dir),
             resume_from=Path(self.resume_from) if self.resume_from else None,
             checkpoint_backend=checkpoint_backend,
+            capability_management=bool(self.capability_management),
             conversation_context=conversation_context,
         )
 
@@ -179,6 +169,8 @@ class EditorialAgentTools:
     upload_batch: Callable[[AgentJob, list[Any], dict[str, Any]], dict[str, tuple[bool, str]]] | None = None
     # Read-only audit of freshly loaded completed artifacts on explicit resume.
     revalidate_completed: Callable[[AgentJob, list[Any], dict[str, Any]], list[str]] | None = None
+    capability_cleanup: Callable[[], None] | None = None
+    reconcile_uploads: Callable[[AgentJob, list[str]], tuple[bool, str]] | None = None
 
 
 class AgentState(TypedDict, total=False):
@@ -550,10 +542,22 @@ def _build_graph(
             return persist(state, "sync_context")
         if state.get("conversation_memory"):
             context["conversation_memory"] = state["conversation_memory"]
+        context['mcp_preparation'] = state.get('controller_decision',{}).get('mcp_preparation',[])
+        context['skill_preparation'] = state.get('controller_decision',{}).get('skill_preparation',[])
         state["context"] = context
         tool_context(state)
         if context.get("platform_write_ready") is True:
             state["platform_paused"] = False
+        if (config.resume_from and state.get("platform_paused") and tools.reconcile_uploads is not None
+                and "XHS_WRITE_UNCERTAIN" in str(state.get("last_failure") or "")):
+            try:
+                ready, detail = tools.reconcile_uploads(job, list(state.get("reviewed_post_ids") or []))
+            except Exception as exc:
+                ready, detail = False, _redact_text(f"DRAFT_RECONCILIATION_UNAVAILABLE: {exc}")
+            _emit(state, progress, "reconcile_drafts", "success" if ready else "warning", detail)
+            if ready:
+                state["platform_paused"] = False
+                state["last_failure"] = ""
         if "knowledge_status" in context and context.get("knowledge_status") != "ready":
             code = str(context.get("error_code") or "KNOWLEDGE_DB_UNAVAILABLE")
             warning = str(context.get("knowledge_warning") or "PostgreSQL 知识库未就绪，已阻止生成。")
@@ -595,7 +599,8 @@ def _build_graph(
             previous = record.get("generation_failure") or {}
             repeated = int(previous.get("count", 0)) + 1 if previous.get("reason") == state["last_failure"] else 1
             record["generation_failure"] = {"reason": state["last_failure"], "count": repeated}
-            requires_resolution = any(code in state["last_failure"] for code in (
+            capability_denied = str(getattr(exc, 'code', '')).startswith('CAPABILITY_')
+            requires_resolution = capability_denied or any(code in state["last_failure"] for code in (
                 "OPENCODEX_PREVIOUS_REQUEST_UNCERTAIN", "OPENCODEX_RESULT_UNCERTAIN",
                 "OPENCODEX_PREVIOUS_REQUEST_REJECTED", "OPENCODEX_HTTP_400",
                 "OPENCODEX_HTTP_403", "OPENCODEX_HTTP_413", "OPENCODEX_HTTP_415",
@@ -616,7 +621,9 @@ def _build_graph(
             if requires_resolution or material_exhausted or verification_incomplete:
                 state["retryable"] = False
                 state["job_blocked"] = True
-                action = ("SOURCE_REFRESH_REQUIRED: 连续三次相同资讯材料错误，需补充或修正可核验材料后续跑；"
+                action = ("CAPABILITY_RESOLUTION_REQUIRED: 工具策略阻止执行，保留进度；请在能力中心核对；"
+                          if capability_denied else
+                          "SOURCE_REFRESH_REQUIRED: 连续三次相同资讯材料错误，需补充或修正可核验材料后续跑；"
                           if material_exhausted else
                           "SOURCE_VERIFICATION_REQUIRED: 请检查福利信源状态，恢复后续跑；"
                           if verification_incomplete else
@@ -660,6 +667,8 @@ def _build_graph(
                     approved = {_post_id(post): post for post in posts}
         except Exception as exc:
             errors = [f"review_error: {exc}"]
+            if str(getattr(exc, 'code', '')).startswith('CAPABILITY_'):
+                report['retryable'] = False
         # Tools can append replacements before returning or raising. Persist
         # those artifacts even when the batch is still short of its target.
         retained = {_post_id(post): post for post in state.get("posts") or []}
@@ -669,11 +678,22 @@ def _build_graph(
         state["reviewed_posts"] = list(approved.values())
         state["reviewed_post_ids"] = _post_ids(state["reviewed_posts"])
         state["approved_versions"] = {key: _content_version(post) for key, post in approved.items()}
+        rejected = set(report.get("rejected_post_ids") or []) & set(retained) - set(approved)
+        summary = {
+            "requested": job.count, "approved": len(approved), "rejected": len(rejected),
+            "pending": len(set(retained) - set(approved) - rejected),
+            "missing": max(0, job.count - len(approved)),
+        }
+        record = state.setdefault("job_states", {}).setdefault(str(state["job_index"]), {})
+        record["review_summary"] = summary
         state["retryable"] = bool(report.get("retryable", True))
         state["retry_delay_s"] = max(0.0, min(60.0, float(report.get("retry_after_s") or 0)))
         if len(approved) < job.count:
             errors.append(f"TARGET_DEFICIT: approved={len(approved)}/{job.count}")
         state["review_complete"] = not errors and len(approved) >= job.count
+        record["review_errors"] = [_redact_text(error) for error in errors]
+        _emit(state, progress, "review_summary", "info",
+              f"{job.kind} " + " ".join(f"{key}={value}" for key, value in summary.items()))
         if errors:
             safe_errors = [_redact_text(error) for error in errors]
             state["last_failure"] = "; ".join(safe_errors[:3])
@@ -700,7 +720,10 @@ def _build_graph(
         if state.get("platform_paused"):
             for post in state.get("reviewed_posts", []):
                 item_key = f"{state.get('job_index', 0)}:{_post_id(post)}:{_content_version(post)}"
-                item_status[item_key] = "skipped_platform_paused"
+                if item_status.get(item_key) != "saved":
+                    item_status[item_key] = "skipped_platform_paused"
+            state["job_blocked"] = True
+            state["last_failure"] = state.get("last_failure") or "XHS_PLATFORM_PAUSED: delivery pending"
             _emit(state, progress, "upload", "skipped", f"{job.kind} platform_paused")
             state["item_status"] = item_status
             return persist(state, "upload")
@@ -738,6 +761,8 @@ def _build_graph(
             except Exception as exc:
                 detail = f"upload_batch_error: {exc}"
                 outcomes = {_post_id(post): (False, detail) for post in pending_posts}
+                if str(getattr(exc, 'code', '')).startswith('CAPABILITY_'):
+                    state.update(retryable=False, job_blocked=True)
 
             for index, post in enumerate(pending_posts):
                 post_id = _post_id(post)
@@ -764,10 +789,14 @@ def _build_graph(
             state["uploaded_post_ids"] = list(dict.fromkeys(uploaded_ids))
             state["item_status"] = item_status
             failures = [_redact_text(error) for error in failures]
-            state["last_failure"] = "; ".join(failures[:3])
+            review_errors = state.get("job_states", {}).get(str(state["job_index"]), {}).get("review_errors", [])
+            state["last_failure"] = "; ".join((failures or review_errors)[:3])
             if failures:
                 state.setdefault("errors", []).extend(failures)
-            _emit(state, progress, "upload_batch", "failed" if failures else "success", f"{job.kind} uploaded={len(uploaded)}")
+            saved_count = sum(item_status.get(f"{state['job_index']}:{_post_id(post)}:{_content_version(post)}") == "saved"
+                              or _post_id(post) in uploaded_ids for post in state.get("reviewed_posts", []))
+            _emit(state, progress, "upload_batch", "failed" if failures else "success",
+                  f"{job.kind} uploaded={saved_count} total_uploaded={len(set(uploaded_ids))}")
             return persist(state, "upload")
 
         # The fallback loop is deliberately serial for adapters that have not
@@ -799,7 +828,8 @@ def _build_graph(
         state["uploaded_post_ids"] = list(dict.fromkeys(uploaded_ids))
         state["item_status"] = item_status
         failures = [_redact_text(error) for error in failures]
-        state["last_failure"] = "; ".join(failures[:3])
+        review_errors = state.get("job_states", {}).get(str(state["job_index"]), {}).get("review_errors", [])
+        state["last_failure"] = "; ".join((failures or review_errors)[:3])
         if failures:
             state.setdefault("errors", []).extend(failures)
         return persist(state, "upload")
@@ -900,7 +930,7 @@ def _build_graph(
     def after_review(state: AgentState) -> str:
         if state.get("provider_paused"):
             return "finish"
-        if state.get("review_complete"):
+        if state.get("review_complete") or state.get("reviewed_post_ids"):
             return "upload"
         return "recover"
 
@@ -929,7 +959,7 @@ def _build_graph(
         # failure, or uncertain submit from the generic recovery branch.
         if any(code in last_failure for code in TERMINAL_PLATFORM_FAILURE_CODES):
             return "next_job"
-        if not state.get("last_failure"):
+        if state.get("review_complete") and not state.get("last_failure"):
             return "next_job"
         return "recover"
 
@@ -994,6 +1024,9 @@ def run_editorial_agent(
     identifier = str(original_thread or resume_checkpoint.get("run_id") or resume_identifier or run_id or uuid4().hex)
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", identifier):
         raise ValueError("智能体运行编号无效")
+    if cfg.capability_management:
+        from src.agent.capabilities.execution import runtime_tools
+        tools = runtime_tools(tools, identifier, progress=progress,conversation_context=cfg.conversation_context)
     if cfg.checkpoint_backend == "postgres":
         from src.agent.artifact_store import AgentArtifactStore
         run_lease = AgentArtifactStore().lease(identifier)
@@ -1207,6 +1240,9 @@ def run_editorial_agent(
             if cfg.checkpoint_backend != "postgres":
                 _save_checkpoint(initial, cfg.checkpoint_dir)
             raise
+        finally:
+            if tools.capability_cleanup is not None:
+                tools.capability_cleanup()
         assert_lease_alive()
         processed_jobs = min(int(final.get("job_index", 0)), len(final.get("jobs") or []))
         failed_jobs = {
