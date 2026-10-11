@@ -74,10 +74,11 @@ def response_tokens(response):
 
 
 def invoke_observed(config, messages, callback):
+    from src.workflow.model_observation import observe_model_call
     from .dispatcher import current_invocation
     dispatcher, call_id, resource_id = current_invocation()
     if dispatcher is None or call_id is None:
-        return callback()
+        return observe_model_call(config, callback)
     identity = uuid4().hex
     snapshot = config.platform_snapshot or {}
     record = {**input_evidence(messages), 'request_id': identity, 'status': 'request_attempted',
@@ -87,7 +88,7 @@ def invoke_observed(config, messages, callback):
               'model_role': snapshot.get('role') or ('agent' if resource_id == 'builtin:controller.plan' else 'writer')}
     dispatcher.store.record_model_request(call_id, identity, record, append=True)
     try:
-        response = callback()
+        response = observe_model_call(config, callback)
     except Exception as error:
         dispatcher.store.record_model_request(call_id, identity, {
             'status': 'request_failed', 'error_type': type(error).__name__})

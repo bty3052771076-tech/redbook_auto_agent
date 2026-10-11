@@ -14,6 +14,7 @@ function legacyActivity(run: Run) {
   const active = activeStatuses.has(run.status);
   const stage = stageLabels[run.stage || ""] || run.stage || "等待运行记录";
   return {
+    pipeline: null,
     active, status_label: statusLabels[run.status] || "状态待确认", headline: active ? stage : statusLabels[run.status] || "状态待确认",
     started_at: run.started_at || run.created_at || null,
     elapsed_seconds: run.ended_at && run.started_at ? run.ended_at - run.started_at : 0,
@@ -50,6 +51,10 @@ export function RunProgress({ run, compact = false, connectionError = "", onRefr
     <p className="progress-current" aria-live="polite">{activity.headline}</p>
     <div className="progress-time"><Clock3 size={13} /><span>已用时 {duration(elapsed)}</span></div>
     {!compact && <>
+      {activity.pipeline && <div className="progress-counts" aria-label="候选处理进度">{([
+        ["候选正文通过", activity.pipeline.text_approved], ["图片就绪", activity.pipeline.image_ready],
+        ["正在修复", activity.pipeline.repairing], ["候选未通过", activity.pipeline.rejected],
+      ] as const).map(([label, count]) => <div key={label}><span>{label}</span><strong>{count}<small> 条</small></strong></div>)}</div>}
       <div className="progress-counts">{([
         ["产出记录", activity.counts.generated], ["通过审查", activity.counts.reviewed],
         ["平台保存", activity.counts.saved], ["回读确认", activity.counts.verified],

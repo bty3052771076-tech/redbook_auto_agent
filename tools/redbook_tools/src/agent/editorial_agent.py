@@ -110,6 +110,7 @@ class EditorialAgentConfig:
     checkpoint_backend: str = "json"
     capability_management: bool = False
     conversation_context: dict[str, Any] = field(default_factory=dict)
+    generation_pipeline_version: str = "legacy"
 
     def validate(self) -> "EditorialAgentConfig":
         provider = str(self.provider or "").strip().lower().replace("-", "_")
@@ -126,6 +127,8 @@ class EditorialAgentConfig:
             raise ValueError("agent step window and no-progress policy are invalid")
         if checkpoint_backend not in {"json", "postgres"}:
             raise ValueError("checkpoint backend must be json or postgres")
+        if self.generation_pipeline_version not in {"legacy", "staged_v2"}:
+            raise ValueError("generation pipeline must be legacy or staged_v2")
         if not isinstance(self.conversation_context, dict):
             raise ValueError("conversation context must be an object")
         raw_constraints = self.conversation_context.get("constraints") or []
@@ -149,6 +152,7 @@ class EditorialAgentConfig:
             checkpoint_backend=checkpoint_backend,
             capability_management=bool(self.capability_management),
             conversation_context=conversation_context,
+            generation_pipeline_version=self.generation_pipeline_version,
         )
 
 
@@ -175,6 +179,7 @@ class EditorialAgentTools:
 
 class AgentState(TypedDict, total=False):
     run_id: str
+    generation_pipeline_version: str
     model_runtime: dict[str, Any]
     jobs: list[dict[str, Any]]
     job_index: int
@@ -267,6 +272,7 @@ def _checkpoint_payload(state: AgentState) -> dict[str, Any]:
     from src.model_platforms.integration import checkpoint_models
     return {
         "run_id": state.get("run_id", ""),
+        "generation_pipeline_version": state.get("generation_pipeline_version", "legacy"),
         "model_runtime": checkpoint_models(saved=state['model_runtime']) if state.get('model_runtime') else {},
         "jobs": _safe_value(state.get("jobs", [])),
         "job_index": int(state.get("job_index", 0)),
@@ -457,6 +463,7 @@ def _build_graph(
         context = dict(state.get("context") or {})
         context.update({
             "agent_run_id": state["run_id"],
+            "generation_pipeline_version": state.get("generation_pipeline_version", "legacy"),
             "agent_job_key": str(state["job_index"]),
             "agent_target_count": int(state["current_job"]["count"]),
             "agent_approved_post_ids": list(state.get("reviewed_post_ids") or []),
@@ -610,6 +617,7 @@ def _build_graph(
                 "OPENCODEX_API_CREDENTIAL_ROUTE_FORBIDDEN", "OPENCODEX_LOOPBACK_URL_REQUIRED",
                 "OPENCODEX_CACHE_ARTIFACT_INVALID", "OPENCODEX_REFERENCE_TOO_LARGE",
                 "OPENCODEX_REFERENCE_FORMAT_INVALID", "OPENCODEX_TWO_REFERENCES_REQUIRED",
+                "STAGE_PENDING_OR_UNKNOWN", "STAGE_LEASE_LOST", "MODEL_CAPACITY_UNCERTAIN", "IMAGE_CACHE_INVALID",
             ))
             material_exhausted = job.kind == "daily_ai_digest" and repeated >= 3 and any(
                 marker in state["last_failure"] for marker in (
@@ -1041,6 +1049,10 @@ def run_editorial_agent(
         from src.model_platforms.integration import checkpoint_models
         initial: AgentState = {
             "run_id": identifier,
+            "generation_pipeline_version": (
+                resume_checkpoint.get("generation_pipeline_version", "legacy")
+                if cfg.resume_from else cfg.generation_pipeline_version
+            ),
             "model_runtime": checkpoint_models(saved=resume_checkpoint.get('model_runtime')),
             "jobs": [job.__dict__ for job in normalized_jobs],
             "job_index": 0,

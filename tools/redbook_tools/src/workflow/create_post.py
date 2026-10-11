@@ -6531,7 +6531,20 @@ def create_daily_ai_digest_posts(
     evaluation_viewpoint: str = DEFAULT_EVALUATION_VIEWPOINT,
     lookback_days: object = None,
     performance_mode: str | None = None,
+    generation_pipeline_version: str = "legacy",
+    stage_context: Any = None,
 ) -> list[Post]:
+    if generation_pipeline_version not in {"legacy", "staged_v2"}:
+        raise ValueError("unsupported generation_pipeline_version")
+    incremental_runtime = None
+    incremental_cfgs = None
+    if generation_pipeline_version == "staged_v2":
+        from src.workflow.news_execution import build_stage_runtime
+        incremental_cfgs = load_llm_configs()
+        incremental_runtime = build_stage_runtime(incremental_cfgs,job_key="daily_ai_digest",
+            options={"prompt": "frozen-job-context" if stage_context else prompt_hint,
+                     "date_policy":"beijing-two-days","viewpoint":evaluation_viewpoint},
+            context=stage_context,performance_mode=performance_mode)
     performance_policy = (
         PerformancePolicy.from_value(performance_mode)
         if performance_mode is not None
@@ -7233,14 +7246,24 @@ def create_daily_ai_digest_posts(
         )
     try:
         generation_cfgs = llm_configs_cache if llm_configs_cache is not None else load_llm_configs()
-        brief = generate_ai_digest_brief_with_llm(
-            generation_cfgs,
-            llm_items,
-            target_count=generation_target,
-            min_domestic_model_count=effective_min_domestic_model_count,
-            min_foreign_ai_count=effective_min_foreign_ai_count,
-        )
+        if incremental_runtime:
+            from src.ai_digest.incremental import generate_incremental_brief
+            from src.ai_digest.generate import _today_date
+            from src.workflow.model_capacity import ModelCapacityStore
+            provider = infer_llm_provider(incremental_cfgs)
+            with ModelWorkQueues(llm_workers=performance_policy.llm_workers_for_provider(provider),
+                                 llm_provider=provider,capacity=ModelCapacityStore(incremental_runtime.store.store)) as queues:
+                brief = generate_incremental_brief(incremental_cfgs,llm_items,date=_today_date(),
+                                                   runtime=incremental_runtime,queues=queues)
+        else:
+            brief = generate_ai_digest_brief_with_llm(
+                generation_cfgs, llm_items, target_count=generation_target,
+                min_domestic_model_count=effective_min_domestic_model_count,
+                min_foreign_ai_count=effective_min_foreign_ai_count,
+            )
     except Exception as exc:
+        if incremental_runtime:
+            raise
         generation_mode = "fallback"
         llm_error = str(exc)
         if progress is not None:
@@ -8193,10 +8216,22 @@ def _prepare_daily_news_candidate(
         return stopped_result()
     wow_column = column == DAILY_WOW_CONTENT_TYPE
     review_attempts: list[dict[str, Any]] = []
+    staged = getattr(model_queues, "pipeline_version", "legacy") == "staged_v2" and not wow_column
+    stage_runtime = getattr(model_queues, "stage_runtime", None) if staged else None
+    if stage_runtime:
+        from src.workflow.news_contracts import content_hash
+        stage_runtime = stage_runtime.for_candidate(content_hash(asdict(picked)))
     rewrite_count = 0
     image_event_audit: dict[str, Any] = {}
     lookup_meta: dict[str, Any] = {}
     focus_meta: dict[str, Any] = {}
+
+    def pipeline_progress(phase: str):
+        if staged:
+            from src.workflow.news_contracts import content_hash
+            item = stage_runtime.context.candidate_id if stage_runtime else content_hash(asdict(picked))
+            _emit_daily_news_progress(progress_callback, "pipeline_item", "success",
+                                      kind=column, item=item, phase=phase)
 
     def rejection_diagnostics(reason: str, error: str = "") -> dict[str, Any]:
         return _daily_news_reject_diagnostics(
@@ -8206,6 +8241,7 @@ def _prepare_daily_news_candidate(
         )
 
     def persist_rejection(candidate: dict[str, Any], reason: str, error: str = "") -> Post:
+        pipeline_progress("rejected")
         diagnostics = rejection_diagnostics(reason, error)
         # Use only sanitized snapshots in the rejection artifact/revision.
         final = _daily_news_reject_diagnostics(
@@ -8300,7 +8336,16 @@ def _prepare_daily_news_candidate(
         picked,
     )
     news_prompt = _daily_news_prompt(picked, prompt_norm, viewpoint_norm, column=column)
-    if target_count > 1:
+    evidence_bundle = None
+    if staged:
+        from src.workflow.news_contracts import StageContext, content_hash
+        from src.workflow.news_evidence import build_evidence_bundle
+        evidence_context = (stage_runtime.context if stage_runtime else StageContext(
+            "test", "test", "news", content_hash(asdict(picked)), "isolated", "isolated", pipeline_version="staged_v2"))
+        evidence_bundle = build_evidence_bundle(picked, snapshot=_daily_news_context_text(picked), context=evidence_context)
+        news_prompt += ("\n证据快照摘要：" + evidence_bundle.snapshot_hash +
+                        "。保留每个数字对应的主体、动作、单位、约/至少、计划/否定状态；公告日不能替代事件日。")
+    if target_count > 1 and not staged:
         news_prompt = f"（候选 {candidate_index}）\n{news_prompt}"
 
     _emit_daily_news_progress(
@@ -8312,15 +8357,13 @@ def _prepare_daily_news_candidate(
         candidate_index=candidate_index,
     )
     try:
-        draft = model_queues.submit_llm(
-            generate_draft,
-            cfgs,
-            title_hint="每日新闻",
-            prompt_hint=news_prompt,
-            asset_paths=asset_paths,
-            preserve_body=not wow_column,
-            concise_news=not wow_column,
-        ).result()
+        def write_initial():
+            return model_queues.submit_llm(
+                generate_draft, cfgs, title_hint="每日新闻", prompt_hint=news_prompt,
+                asset_paths=asset_paths, preserve_body=not wow_column, concise_news=not wow_column,
+            ).result()
+        draft = (stage_runtime.call("writer", {"source":asdict(picked),"prompt":news_prompt,"assets":asset_paths}, write_initial)
+                 if stage_runtime else write_initial())
     except CancelledError:
         return stopped_result()
     except Exception as exc:
@@ -8385,7 +8428,9 @@ def _prepare_daily_news_candidate(
 
     image_event_audit = {"writer_value": str(draft.get("image_event") or "")}
 
-    def review_draft(candidate: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    def review_draft(candidate: dict[str, Any], *, locked_scope: str = "") -> tuple[dict[str, Any], str]:
+        locked_text = ({key: deepcopy(candidate.get(key)) for key in ("title", "body", "topics")}
+                       if locked_scope in {"scene", "comment"} else None)
         record = {"attempt": len(review_attempts) + 1,
                   "stage": "writer" if not review_attempts else "rewrite",
                   "raw_draft": deepcopy(candidate), "reason": "", "error": ""}
@@ -8398,8 +8443,11 @@ def _prepare_daily_news_candidate(
             if isinstance(embedded.get("topics"), list) and embedded["topics"]:
                 candidate["topics"] = embedded["topics"]
         candidate["body"] = _ensure_daily_news_sections(candidate.get("body", ""), prompt_norm)
-        candidate["body"] = _ensure_news_publish_date(candidate["body"], picked.seendate)
-        if _daily_news_body_has_prompt_leak(candidate.get("body", "")) or _daily_news_body_is_too_generic(candidate.get("body", "")):
+        # Staged normalization writes the trusted date through the field renderer.
+        # Appending a legacy 发布时间 label here can be parsed as comment text.
+        if not staged:
+            candidate["body"] = _ensure_news_publish_date(candidate["body"], picked.seendate)
+        if not locked_text and (_daily_news_body_has_prompt_leak(candidate.get("body", "")) or _daily_news_body_is_too_generic(candidate.get("body", ""))):
             candidate["title"] = _normalize_daily_news_title(picked.title, picked, prompt_norm)
             candidate["body"] = _daily_news_offline_body(picked, prompt_norm)
             candidate["topics"] = [DAILY_WOW_TOPIC if wow_column else "每日新闻"]
@@ -8424,12 +8472,12 @@ def _prepare_daily_news_candidate(
             if wow_column else _normalize_daily_news_topics(topics, prompt_norm, topics_context)
         )
         try:
-            candidate["body"] = _finalize_daily_news_body(
+            candidate["body"] = candidate["body"] if locked_text else _finalize_daily_news_body(
                 candidate.get("body", ""), picked, prompt_norm,
                 title_hint=str(candidate.get("title") or ""),
                 preserve_length=not wow_column,
             )
-            candidate["body"] = _repair_daily_news_mismatched_comment(
+            candidate["body"] = candidate["body"] if locked_text else _repair_daily_news_mismatched_comment(
                 candidate["body"], picked, prompt_norm,
                 title_hint=str(candidate.get("title") or ""),
                 preserve_length=not wow_column,
@@ -8441,6 +8489,10 @@ def _prepare_daily_news_candidate(
         if wow_column:
             candidate["body"] = _daily_wow_repair_comment(candidate["body"], picked, prompt_norm)
         candidate = _simplify_daily_news_draft(candidate)
+        if locked_text:
+            # Read-only re-review of a field patch cannot run legacy whole-body
+            # repairs or silently replace already accepted text.
+            candidate.update(locked_text)
         issue = (
             _daily_wow_quality_issue(candidate.get("title", ""), candidate.get("body", ""), prompt_norm)
             if wow_column else _daily_news_quality_issue(candidate.get("title", ""), candidate.get("body", ""), prompt_norm)
@@ -8454,6 +8506,19 @@ def _prepare_daily_news_candidate(
                 candidate, picked, rewrite_count=rewrite_count,
             )
             issue = issue or length_issue
+        if staged and not issue and evidence_bundle is not None:
+            from src.workflow.news_evidence import review_numeric_claims
+            claims = review_numeric_claims(_daily_news_body_quality_fields(candidate["body"]).get("内容", ""), evidence_bundle)
+            if claims:
+                issue = claims[0].code
+        if stage_runtime and not issue:
+            accepted_text = {key: candidate.get(key) for key in ("title", "body", "topics")}
+            stage_runtime.call("text_approved", {"source":asdict(picked),"text":accepted_text},
+                               lambda: accepted_text, external=False)
+            _emit_daily_news_progress(progress_callback,"正文已通过","success",candidate_index=candidate_index,
+                                      candidate_id=stage_runtime.context.candidate_id)
+        if staged and not issue:
+            pipeline_progress("text_approved")
         if not issue and not wow_column and (auto_image_enabled or str(candidate.get("image_event") or "").strip()):
             candidate["image_event"] = _to_simplified_common(_normalize_daily_news_image_event(
                 str(candidate.get("image_event") or ""), picked=picked,
@@ -8474,12 +8539,39 @@ def _prepare_daily_news_candidate(
         # User-supplied material remains the source of truth for this fallback.
         draft = _source_grounded_single_material_draft(picked, prompt_norm, preserve_length=not wow_column)
         draft, quality_issue = review_draft(draft)
-    if quality_issue in {
+    repairable_issues = {
         "thin_content", "missing_lead_event", "generic_title", "generic_body",
         "bad_body_language", "unsupported_numeric_claim", "image_scene_unverified",
         "content_too_long", "comment_too_long", "body_too_long",
         "incomplete_comment", "comment_multiple_sentences",
-    } and not wow_column:
+    }
+    if staged and quality_issue in repairable_issues:
+        from src.workflow.news_repairs import repair_draft, repair_scope
+        used_scopes: set[str] = set()
+        while quality_issue in repairable_issues:
+            scope = repair_scope(quality_issue)
+            budget_scope = "scene" if scope == "scene" else "text"
+            if budget_scope in used_scopes:
+                break
+            used_scopes.add(budget_scope)
+            pipeline_progress("repairing")
+            _emit_daily_news_progress(progress_callback, "定向修复", "in_progress",
+                                      candidate_index=candidate_index, reason=quality_issue, scope=scope)
+            try:
+                def generate_patch(**kwargs):
+                    invoke = lambda: model_queues.submit_llm(generate_json,cfgs,**kwargs,max_tokens=3000).result()
+                    return stage_runtime.call("repair_"+scope,kwargs,invoke) if stage_runtime else invoke()
+                draft = repair_draft(draft,quality_issue,source_prompt=news_prompt,generate_patch=generate_patch)
+                if budget_scope == "text":
+                    rewrite_count = 1
+                image_event_audit["rewrite_value"] = str(draft.get("image_event") or "")
+                draft, quality_issue = review_draft(draft, locked_scope=scope)
+            except CancelledError:
+                return stopped_result(draft,paths=[Path(path) for path in asset_paths],copy_result_assets=copy_assets)
+            except Exception as exc:
+                rewrite_error = str(exc)
+                break
+    if not staged and quality_issue in repairable_issues and not wow_column:
         _emit_daily_news_progress(
             progress_callback, "质量复核", "in_progress",
             draft_index=candidate_index, target=target_count,
@@ -8568,7 +8660,14 @@ def _prepare_daily_news_candidate(
     draft["image_event"] = image_event
     if not wow_column:
         draft["image_event_audit"] = image_event_audit
+    post_identity = {}
+    if stage_runtime:
+        from uuid import uuid4
+        post_identity = stage_runtime.call("post_identity", {"source":asdict(picked),
+                                           "draft":{key:draft.get(key) for key in ("title","body","topics","image_event")}},
+                                           lambda: {"id":uuid4().hex}, external=False)
     post = Post(
+        **post_identity,
         type="image",
         status=PostStatus.draft,
         title=draft["title"],
@@ -8622,22 +8721,14 @@ def _prepare_daily_news_candidate(
                 target=target_count,
                 candidate_index=candidate_index,
             )
-            image_paths, image_metas, image_fallback = model_queues.submit_image(
-                _fetch_daily_news_related_images,
-                title=_preferred_image_title(post, post.title),
-                body=post.body,
-                topics=post.topics,
-                prompt_hint=_preferred_image_hint(post, prompt_norm),
-                dest_dir=dest_dir,
-                exclude_ids=set(),
-                ai_first=True,
+            image_args = dict(title=_preferred_image_title(post, post.title),body=post.body,topics=post.topics,
+                prompt_hint=_preferred_image_hint(post,prompt_norm),dest_dir=dest_dir,exclude_ids=set(),ai_first=True,
                 image_policy="ai_preferred" if single_material_mode else "ai_required",
-                prompt_override=(
-                    _daily_wow_image_prompt_for_post(post)
-                    if wow_column
-                    else None
-                ),
-            ).result()
+                prompt_override=_daily_wow_image_prompt_for_post(post) if wow_column else None)
+            create_image = lambda: model_queues.submit_image(_fetch_daily_news_related_images,**image_args).result()
+            image_paths, image_metas, image_fallback = (
+                stage_runtime.images({key:value for key,value in image_args.items() if key not in {"dest_dir","exclude_ids"}},create_image)
+                if stage_runtime else create_image())
             if image_fallback:
                 post.platform["image_fallback"] = image_fallback
             post.platform.setdefault("image", image_metas[0])
@@ -8708,6 +8799,8 @@ def _prepare_daily_news_candidate(
             )
 
     post.assets = _build_asset_infos(resolved_assets)
+    if resolved_assets:
+        pipeline_progress("image_ready")
     if model_queues.stopped:
         return stopped_result(draft, post, resolved_assets,
                               copy_result_assets=effective_copy_assets)
@@ -8806,6 +8899,7 @@ def _run_parallel_daily_news_candidates(
     discovery: DailyNewsDiscovery | None = None,
     column: str = "daily_news",
     post_saved_callback: Callable[[Post], None] | None = None,
+    stage_runtime: Any = None,
 ) -> list[Post]:
     """Run candidate preparation in two lanes and accept results in order."""
     # Re-assert the protected editorial lane after any LLM reordering. This
@@ -8900,6 +8994,11 @@ def _run_parallel_daily_news_candidates(
         image_workers=performance_policy.image_workers,
         llm_provider=llm_provider,
     ) as model_queues:
+        if stage_runtime is not None:
+            from src.workflow.model_capacity import ModelCapacityStore
+            model_queues.pipeline_version = "staged_v2"
+            model_queues.stage_runtime = stage_runtime
+            model_queues.capacity = ModelCapacityStore(stage_runtime.store.store)
         workers = ThreadPoolExecutor(
             max_workers=coordinator_workers,
             thread_name_prefix="redbook-candidate",
@@ -9463,6 +9562,8 @@ def create_daily_news_posts(
     column: str = "daily_news",
     exclude_story_keys: set[str] | None = None,
     post_saved_callback: Callable[[Post], None] | None = None,
+    generation_pipeline_version: str = "legacy",
+    stage_context: Any = None,
 ) -> list[Post]:
     """
     Special workflow for title="每日新闻".
@@ -9483,6 +9584,15 @@ def create_daily_news_posts(
         else PerformancePolicy.from_environment()
     )
     cfgs = load_llm_configs()
+    from src.workflow.news_contracts import PIPELINE_VERSIONS
+    if generation_pipeline_version not in PIPELINE_VERSIONS:
+        raise ValueError("unsupported generation_pipeline_version")
+    stage_runtime = None
+    if generation_pipeline_version == "staged_v2":
+        from src.workflow.news_execution import build_stage_runtime
+        stage_runtime = build_stage_runtime(cfgs,job_key=column,
+            options={"prompt":prompt_hint,"viewpoint":evaluation_viewpoint,"lookback":str(lookback_days),"column":column},
+            context=stage_context,performance_mode=performance_mode)
     single_material_mode = bool(str(single_news_material_file or "").strip())
     prompt_norm = "" if single_material_mode else (prompt_hint or "").strip()
     viewpoint_norm = normalize_evaluation_viewpoint(evaluation_viewpoint)
@@ -9651,6 +9761,7 @@ def create_daily_news_posts(
         discovery=discovery,
         column=column_norm,
         post_saved_callback=post_saved_callback,
+        **({"stage_runtime":stage_runtime} if stage_runtime is not None else {}),
     )
     # The runner may ask the discovery session for more candidates after a
     # quality failure. Read the final mutable ``picks`` list after it returns,

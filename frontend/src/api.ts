@@ -16,6 +16,7 @@ export type Plan = {
   source_message_id?: string;
   recognition_source?: "rules" | "llm";
   performance_mode?: string;
+  generation_pipeline_version?: 'legacy' | 'staged_v2';
   image_score_required?: boolean;
   unresolved_requirements?: string[];
   model_roles?: Record<string, string>;
@@ -42,6 +43,7 @@ export type TaskRecognition = {
 };
 export type Conversation = { id: string; title: string; messages: Message[]; plans: Plan[]; runs: string[]; status: string; conversation_revision?: number; task_recognitions?: TaskRecognition[] };
 export type Activity = {
+  pipeline?: { text_approved: number; image_ready: number; repairing: number; rejected: number } | null;
   status: string; status_label: string; active: boolean; headline: string; summary: string;
   stage: string; current_job: string; started_at: number | null; ended_at: number | null;
   elapsed_seconds: number; last_update: number | null; requested: number | null;

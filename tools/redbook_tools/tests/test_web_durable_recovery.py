@@ -122,6 +122,11 @@ def resumable(workbench):
     saved = service._read_agent_conversation(cid)
     plan = saved["plans"][0]
     plan.update(job_id=ROOT_ID, agent_run_id=ROOT_ID, status="running", budget_minutes=120)
+    # A running v3 plan must represent a confirmed task, not just a proposal.
+    from src.agent.plan_contract import execution_fields, digest
+    frozen = execution_fields(plan)
+    frozen.update(host_environment={}, model_runtime={}, capability_namespace="offline-recovery")
+    plan.update(frozen_execution=frozen, frozen_execution_hash=digest(frozen))
     saved["runs"] = [ROOT_ID]
     service._write_agent_conversation(saved)
     plan_file = service.directory / "conversations" / cid / "plans" / f"{planned['plan']['id']}.json"

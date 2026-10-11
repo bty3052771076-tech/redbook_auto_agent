@@ -1,0 +1,16 @@
+{
+  "schema": "news-performance-baseline.v1",
+  "recorded_at": "2026-10-10",
+  "first_run_id": "9eb3d1636c444123b2393ed41877f2c5",
+  "first_run_wall_seconds": 4926.72,
+  "first_run_complete_delivery": false,
+  "full_log_sha256": "775b824a70b69f1ecc1aa71c1143a37af8ef57c294b931c56ead15ed64882217",
+  "writer": "MiniMax-M3",
+  "image": "OpenCodex/gpt-image-2",
+  "recorded_text_responses": 218,
+  "numeric_rejection_records": 54,
+  "numeric_records_manually_labelled": false,
+  "resume_run_id": "b7742c69acbb46d1829dda3c974d5097",
+  "resume_wall_seconds": 707.26,
+  "scope": "Historical mixed failed-and-resumed run; not a paired performance benchmark. Private account data and source bodies are excluded."
+}

@@ -9,6 +9,7 @@ the caller's serial upload loop.
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from threading import Event, Lock
 from typing import Callable, Generic, TypeVar
 from src.agent.capabilities.dispatcher import contextual_callback
@@ -51,8 +52,10 @@ class ModelWorkQueues:
         llm_workers: int = 2,
         image_workers: int = 2,
         llm_provider: str | None = None,
+        capacity=None,
     ) -> None:
         self.llm_provider = _normalize_provider(llm_provider)
+        self.capacity = capacity
         llm_maximum = 5 if self.llm_provider == "minimax" else 2
         self.llm_workers = _cap_workers(llm_workers, maximum=llm_maximum)
         self.image_workers = _cap_workers(image_workers, maximum=2)
@@ -69,18 +72,27 @@ class ModelWorkQueues:
         with self._admission_lock:
             self.stop_event.set()
 
-    def _invoke(self, fn: Callable[..., T], args: tuple, kwargs: dict) -> T:
+    def _invoke(self, fn: Callable[..., T], args: tuple, kwargs: dict, modality: str = "text") -> T:
         # Admission and stop are ordered; never hold this lock during IO.
         with self._admission_lock:
             if self.stopped:
                 raise ModelWorkStopped("model work stopped before invocation")
-        return fn(*args, **kwargs)
+        # Adapter fallback lists can reach the same account through different
+        # aliases. Until every dispatch has explicit account identity, all text
+        # invocations share the conservative group, including mixed providers.
+        group = "text:shared-unclassified" if modality == "text" else "image:unknown"
+        limit = (5 if self.llm_provider == "minimax" else 2) if modality == "text" else 2
+        slot = (self.capacity.slot(group,modality=modality,limit=limit,stop_event=self.stop_event)
+                if self.capacity else nullcontext())
+        with slot:
+            return fn(*args, **kwargs)
 
     def _submit(self, executor: ThreadPoolExecutor, fn: Callable[..., T], args: tuple, kwargs: dict) -> Future[T]:
         with self._admission_lock:
             if self.stopped:
                 raise ModelWorkStopped("model work stopped before submission")
-            return executor.submit(self._invoke, contextual_callback(fn), args, kwargs)
+            return executor.submit(contextual_callback(self._invoke), fn, args, kwargs,
+                                   "image" if executor is self.image else "text")
 
     def submit_llm(self, fn: Callable[..., T], *args, **kwargs) -> Future[T]:
         return self._submit(self.llm, fn, args, kwargs)

@@ -11,6 +11,15 @@ logs/
 *.log
 *.key
 *credentials*.json
+.npm-cache/
+.pip-cache/
+.playwright-browsers/
+.mypy_cache/
+exports/
+output/
+.playwright-cli/
+tmp_*
+*.bak/
 
 # Private runtime, credentials and generated artifacts at any depth
 **/node_modules/
@@ -41,8 +50,25 @@ logs/
 **/storage-state*
 **/browser-profile/
 **/chrome-profile/
+.git-credentials
+.netrc
+.pypirc
+.npmrc
+.pgpass
+pgpass.conf
+.auth/
+.opencodex/
+.codex/
+auth.json
+connection.json
+accounts.json
+account-pool*.json
+account_pool*.json
 **/*api-key*
 **/*apikey*
+**/*api_key*.json
+**/*api_key*.toml
+**/*token*.local.*
 **/*access-token*
 **/*refresh-token*
 *.credentials.json
@@ -51,6 +77,11 @@ logs/
 *.snapshot.json
 config.local.*
 settings.local.*
+*.local.json
+*.local.toml
+*.local.yaml
+*.local.yml
+*.sql.gz
 *.png
 *.jpg
 *.jpeg

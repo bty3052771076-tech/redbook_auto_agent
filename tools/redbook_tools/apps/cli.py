@@ -2463,6 +2463,7 @@ def _mark_posts_published(posts: list[Post], result: dict) -> None:
 
 def create(
     title: str = typer.Option(..., help="初始标题/题目"),
+    generation_pipeline_version: str = typer.Option("legacy", "--generation-pipeline-version", help="legacy 或 staged_v2（PostgreSQL 阶段复用）"),
     prompt: str = typer.Option(
         "",
         "--keywords",
@@ -2552,6 +2553,7 @@ def create(
                 prompt_hint=prompt_norm,
                 asset_paths=asset_paths,
                 copy_assets=not no_copy,
+                generation_pipeline_version=generation_pipeline_version if isinstance(generation_pipeline_version, str) else "legacy",
                 count=1,
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
@@ -2581,6 +2583,7 @@ def create(
                 prompt_hint=prompt_norm,
                 asset_paths=asset_paths,
                 copy_assets=not no_copy,
+                generation_pipeline_version=generation_pipeline_version if isinstance(generation_pipeline_version, str) else "legacy",
                 count=count,
                 auto_image=True,
                 evaluation_viewpoint=evaluation_viewpoint,
@@ -2971,6 +2974,7 @@ def update_draft(
 def auto(
     ctx: typer.Context,
     title: str = typer.Option(..., help="初始标题/题目"),
+    generation_pipeline_version: str = typer.Option("legacy", "--generation-pipeline-version", help="legacy 或 staged_v2（PostgreSQL 阶段复用）"),
     prompt: str = typer.Option(
         "",
         "--keywords",
@@ -3175,6 +3179,7 @@ def auto(
                 evaluation_viewpoint=evaluation_viewpoint,
                 lookback_days=lookback_days,
                 performance_mode=performance_policy.mode,
+                generation_pipeline_version=generation_pipeline_version if isinstance(generation_pipeline_version, str) else "legacy",
             )
         except Exception as exc:
             typer.echo(_format_stage_error(_stage_from_create_exception(exc), exc))
@@ -3248,6 +3253,7 @@ def auto(
                 progress_callback=_daily_news_generation_progress,
                 post_quality_callback=post_quality_callback,
                 performance_mode=performance_policy.mode,
+                generation_pipeline_version=generation_pipeline_version if isinstance(generation_pipeline_version, str) else "legacy",
                 column=(
                     "daily_wow"
                     if _is_daily_wow_title(title_norm)
@@ -3616,6 +3622,7 @@ def auto(
 @app.command("agent")
 def editorial_agent_command(
     ctx: typer.Context,
+    generation_pipeline_version: str = typer.Option("legacy", "--generation-pipeline-version", help="legacy 或 staged_v2；恢复时以检查点为准"),
     prompt: str = typer.Option(
         DEFAULT_DAILY_NEWS_PROMPT,
         "--prompt",
@@ -3651,6 +3658,8 @@ def editorial_agent_command(
     skill_name: Optional[list[str]] = typer.Option(None, "--skill", help="手动加载的 Skill 名称，可重复指定"),
 ):
     """Run the autonomous editorial agent for news, AI digest and AI benefits."""
+    if not isinstance(generation_pipeline_version, str):
+        generation_pipeline_version = "legacy"
     if resume_from:
         from src.model_platforms.integration import resume_model_environment
         _apply_scoped_environment(ctx, resume_model_environment(load_agent_checkpoint(resume_from), os.environ))
@@ -3735,6 +3744,7 @@ def editorial_agent_command(
         try:
             jobs = _load_agent_job_plan(job_plan_file, agent_lookback_days, evaluation_viewpoint)
             plan_payload = json.loads(Path(job_plan_file).read_text(encoding="utf-8"))
+            generation_pipeline_version = str(plan_payload.get("generation_pipeline_version", "legacy"))
             raw_conversation_context = plan_payload.get("conversation_context") or {}
             if not isinstance(raw_conversation_context, dict):
                 raise ValueError("conversation_context must be an object")
@@ -3969,9 +3979,12 @@ def editorial_agent_command(
             f"phase={phase} requested={job.count} generate={count}",
         )
         partial_error: PartialDailyNewsError | None = None
+        from src.workflow.news_execution import job_stage_options
+        pipeline_options = job_stage_options(job, context, run_id=run_id, performance_mode=policy.mode)
         try:
             posts = create_daily_news_posts(
                 prompt_hint=f"{job.prompt}{preference_hint}{_conversation_hint(context)}{_skill_hint(context)}",
+                **pipeline_options,
                 asset_paths=assets,
                 copy_assets=True,
                 count=count,
@@ -3992,7 +4005,8 @@ def editorial_agent_command(
             retain_artifact(post, context, "generated")
         if partial_error is not None and any(
             marker.lower() in str(partial_error).lower()
-            for marker in (*TERMINAL_PROVIDER_FAILURE_MARKERS, "模型免费额度已耗尽", "模型额度不足")
+            for marker in (*TERMINAL_PROVIDER_FAILURE_MARKERS, "模型免费额度已耗尽", "模型额度不足",
+                           "STAGE_PENDING_OR_UNKNOWN", "STAGE_LEASE_LOST", "MODEL_CAPACITY_UNCERTAIN", "IMAGE_CACHE_INVALID")
         ):
             # The ledger is durable before surfacing exhaustion to the graph.
             raise partial_error
@@ -4080,8 +4094,10 @@ def editorial_agent_command(
                 + "; ".join(issues or [])[:1500]
             )
         if job.kind == "daily_ai_digest":
+            from src.workflow.news_execution import job_stage_options
             posts = create_daily_ai_digest_posts(
                 asset_paths=assets,
+                **job_stage_options(job, context, run_id=run_id, performance_mode=policy.mode),
                 copy_assets=True,
                 count=1,
                 auto_image=True,
@@ -4777,6 +4793,7 @@ def editorial_agent_command(
                 checkpoint_backend="postgres",
                 conversation_context=conversation_context,
                 capability_management=True,
+                generation_pipeline_version=generation_pipeline_version,
             ),
             progress=progress,
             run_id=run_id or None,

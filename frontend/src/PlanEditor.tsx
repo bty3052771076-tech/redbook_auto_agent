@@ -7,14 +7,14 @@ import './plan-editor.css';
 const columns: Record<string, string> = { daily_news: '每日新闻', daily_ai_digest: '每日AI讯息', daily_wool: 'AI鸡蛋', daily_wow: '每日我去', daily_global_map: '今日全球事件关注图' };
 const topicKinds = new Set(['daily_news', 'daily_ai_digest', 'daily_wow']);
 const jobFields = ['count', 'search_keywords', 'topic_preferences', 'topic_brief', 'topic_brief_strength', 'content_constraints', 'evaluation_viewpoint', 'legacy_extra_requirements'] as const;
-const optionFields = ['delivery', 'platform', 'performance_mode', 'image_score_required', 'model_roles'] as const;
+const optionFields = ['delivery', 'platform', 'performance_mode', 'image_score_required', 'model_roles', 'generation_pipeline_version'] as const;
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const fieldLabels: Record<string, string> = { count: '篇数', search_keywords: '检索词', topic_preferences: '选题偏向',
   topic_brief: '补充要求', topic_brief_strength: '要求强度', content_constraints: '结构化约束',
   evaluation_viewpoint: '评价视角', delivery: '交付方式', platform: '平台', performance_mode: '运行模式',
-  image_score_required: '图片评分硬门槛', model_roles: '模型选择' };
+  image_score_required: '图片评分硬门槛', model_roles: '模型选择', generation_pipeline_version: '生成流程' };
 const valueLabels: Record<string, string> = { generate_only: '仅生成本地稿', save_draft: '保存平台草稿',
-  speed: '速度优先', balanced: '速度与稳定平衡', preference: '选题偏好', requirement: '必须满足',
+  speed: '速度优先', balanced: '速度与稳定平衡', legacy: '现有流程', staged_v2: '阶段复用（试用）', preference: '选题偏好', requirement: '必须满足',
   xhs: '小红书', toutiao: '今日头条', both: '小红书＋今日头条' };
 function displayValue(value: unknown): string {
   if (value === null || value === undefined || value === '' || Array.isArray(value) && !value.length) return '已清空';
@@ -196,6 +196,7 @@ export function PlanEditor({ conversation, plan, models, candidate, recognitionI
           <div className="pe-add"><select aria-label="待添加栏目" value={addKind} onChange={e => setAddKind(e.target.value)}><option value="">选择栏目</option>{Object.entries(columns).filter(([kind]) => !draft.jobs.some(j => j.kind === kind)).map(([kind, label]) => <option key={kind} value={kind}>{label}</option>)}</select>
             <button className="quiet-button" disabled={!addKind} onClick={() => { setDraft(v => ({ ...v, jobs: [...v.jobs, { kind: addKind, title: columns[addKind], job_id: `new-${crypto.randomUUID()}`, count: 1, search_keywords: [], topic_preferences: [], topic_brief: '', evaluation_viewpoint: '无视角评价' }] })); setAddKind(''); }}><Plus size={15} />添加栏目</button></div>
           <section className="pe-options"><h3>执行选项</h3>
+            <fieldset className="pe-segments"><legend>生成流程</legend>{(['legacy', 'staged_v2'] as const).map(value => <label key={value}><input type="radio" name="generation_pipeline_version" checked={(draft.generation_pipeline_version || 'legacy') === value} onChange={() => setDraft(d => ({ ...d, generation_pipeline_version: value }))} />{valueLabels[value]}</label>)}</fieldset>
             {([['performance_mode', '运行模式', [['speed', '速度优先'], ['balanced', '速度与稳定平衡']]], ['delivery', '交付方式', [['generate_only', '仅生成本地稿'], ['save_draft', '保存平台草稿']]]] as const).map(([key, label, choices]) => <fieldset className="pe-segments" key={key}><legend>{label}</legend>{choices.map(([value, title]) => <label key={value}><input type="radio" name={key} checked={draft[key] === value} onChange={() => setDraft(d => ({ ...d, [key]: value }))} />{title}</label>)}</fieldset>)}
             <div className="pe-field"><label htmlFor="pe-platform">平台</label><select id="pe-platform" value={draft.platform} onChange={e => setDraft(d => ({ ...d, platform: e.target.value }))}><option value="xhs">小红书</option><option value="toutiao">今日头条</option><option value="both">小红书＋今日头条</option></select></div>
             <label className="pe-check"><input type="checkbox" checked={draft.image_score_required !== false} onChange={e => setDraft(d => ({ ...d, image_score_required: e.target.checked }))} />图片评分硬门槛</label>

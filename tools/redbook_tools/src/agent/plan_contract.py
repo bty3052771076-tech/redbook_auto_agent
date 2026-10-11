@@ -23,7 +23,8 @@ DEFAULT_PROMPTS = {
 LEGACY_NEWS_PROMPT = '国际冲突 科技产业 社会民生 财经产业'
 JOB_EDIT_FIELDS = {'kind','count','search_keywords','topic_preferences','topic_brief','topic_brief_strength',
                    'content_constraints','evaluation_viewpoint','legacy_extra_requirements'}
-OPTION_FIELDS = {'delivery','platform','performance_mode','model_roles','image_score_required'}
+OPTION_FIELDS = {'delivery','platform','performance_mode','model_roles','image_score_required',
+                 'generation_pipeline_version'}
 CAPABILITY_FIELDS = {'skill_mode', 'skill_names', 'disabled_tools'}
 EDITABLE_OPTIONS = OPTION_FIELDS | CAPABILITY_FIELDS
 STRENGTH_ALIASES = {'soft_preference': 'preference', 'hard_requirement': 'requirement'}
@@ -109,7 +110,8 @@ def suggestion_value_valid(field: str, value) -> bool:
         return (isinstance(value, dict) and not set(value) - {'agent', 'writer', 'image'}
                 and all(isinstance(ref, str) and len(ref) <= 260 for ref in value.values()))
     options = {'delivery': {'generate_only', 'save_draft'}, 'platform': {'xhs', 'toutiao', 'both'},
-               'performance_mode': {'speed', 'balanced'}}
+               'performance_mode': {'speed', 'balanced'},
+               'generation_pipeline_version': {'legacy', 'staged_v2'}}
     return field in options and isinstance(value, str) and value in options[field]
 
 
@@ -134,7 +136,8 @@ def _execution_inputs(plan: dict) -> dict:
             'jobs':[{k:deepcopy(j.get(k)) for k in ('job_id','kind','count','search_keywords','topic_preferences',
                     'topic_brief','topic_brief_strength','content_constraints','evaluation_viewpoint','lookback_days',
                     'legacy_extra_requirements')} for j in plan['jobs']],
-            **{key:deepcopy(plan[key]) for key in sorted(OPTION_FIELDS)},
+            **{key:deepcopy(plan[key]) for key in sorted(OPTION_FIELDS)
+               if key != 'generation_pipeline_version' or plan.get(key, 'legacy') != 'legacy'},
             **{key:deepcopy(plan[key]) for key, default in
                (('skill_mode', 'off'), ('skill_names', []), ('disabled_tools', []))
                if plan.get(key, default) != default},
@@ -158,12 +161,13 @@ def normalize_plan(value: dict) -> dict:
     plan.setdefault('review_decisions',[])
     plan.setdefault('warnings',[])
     defaults={'delivery':'save_draft','platform':'xhs','performance_mode':'balanced','image_score_required':True,
-              'model_roles':{'agent':'','writer':'','image':''},
+              'model_roles':{'agent':'','writer':'','image':''}, 'generation_pipeline_version':'legacy',
               'skill_mode':'off','skill_names':[],'disabled_tools':[]}
     for key,default in defaults.items():
         plan.setdefault(key,deepcopy(default))
     for key,allowed in (('delivery',{'generate_only','save_draft'}),('platform',{'xhs','toutiao','both'}),
-                        ('performance_mode',{'speed','balanced'})):
+                        ('performance_mode',{'speed','balanced'}),
+                        ('generation_pipeline_version',{'legacy','staged_v2'})):
         if not isinstance(plan[key],str) or plan[key] not in allowed:
             errors.append(_issue('OPTION_UNSUPPORTED',key,'该选项目前不受支持',plan[key]))
     if type(plan['image_score_required']) is not bool:

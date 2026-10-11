@@ -1,6 +1,10 @@
 # 独立采编智能体
 
+> 文档更新：2026-10-11。日常入口：`Start-Agent.cmd`，工作台：<http://127.0.0.1:8786>。首次克隆须先完成下文的依赖、数据库和本地凭据配置。
+
 本程序位于 `E:\AI\codex\redbook_agent`，通过 `redbook_tools` 调用新闻采集、写稿、生图和草稿上传工具；PostgreSQL、草稿、图片、日志和专用浏览器 profile 保存在 `E:\AI\codex\redbook_runtime`。启动和运行不读取旧 `redbook_workflow` 目录。旧项目及其 `Start-Web-GUI.cmd`、`apps.cli` 仍保留，可继续人工使用。
+
+人工工作流另见 [auto_redbook](https://github.com/bty3052771076-tech/auto_redbook)。本仓库的 `tools/redbook_tools` 是需要提交的领域工具源码，其他第三方工具副本、数据库、依赖和账号数据不随源码发布。
 
 所有领域工具代码实际从本项目 `tools/redbook_tools` 导入，不再依赖旁边的 `E:\AI\codex\redbook_tools`。第三方工具副本位于 `tools/worldmonitor`、`tools/RSSHub`、`tools/AIHOT`、`tools/opencodex` 和 `tools/postgresql/18.6/pgsql`，保留原始目录。数据、登录态与 API Key 继续使用原运行区，不复制或覆盖活动数据库。
 
@@ -8,13 +12,23 @@
 
 ## 快速开始
 
-1. 双击 `Start-Agent.cmd`。脚本仅在 E 盘启动独立 PostgreSQL（端口 5433），然后启动本地 API 与已构建的前端。
+以下适用于本机已经配置的环境；首次部署先阅读“从 GitHub 部署”。
+
+1. 双击 `Start-Agent.cmd`。脚本仅在 E 盘启动独立 PostgreSQL（端口 5433），然后启动本地 API 与已构建的前端。保留终端窗口，并手动打开下述网址；这个入口目前不会自动打开默认浏览器。
 2. 用浏览器打开 <http://127.0.0.1:8786>。浏览网页可以用默认浏览器；小红书登录请在“连接与模型”中点击“打开专用浏览器”。两者的浏览器 profile 彼此独立。
 3. 在“连接与模型”检查数据库状态，分别选择智能体主控、写稿和生图模型。“自动使用当前配置”会使用运行区的本地配置。密钥只填在 `E:\AI\codex\redbook_runtime\.env.gui`，不要放进代码、对话或 Git。
 4. 回到“对话任务”，输入例如“生成 1 条每日新闻，只生成本地稿，不上传平台”。查看右侧计划，确认栏目、数量、交付方式后再点“确认并执行”。对话中的“运行播报”会持续更新当前阶段、耗时、各栏目完成数量和错误原因；生成结果见“草稿审查”。
 5. 草稿页展示正文、图片、原始信源、日期和平台回读状态。来源、日期、内容、图文一致性应逐项人工核验。独立界面目前不执行公开发布；需要公开发布时请在平台人工确认。
 
 浏览器刷新不会取消后台任务。API 只绑定 `127.0.0.1`，不要将端口直接暴露公网。当前专用浏览器 profile 在新运行区，必须单独登录；没有验证登录前，不要假定能上传。
+
+### 一句话生成并保存草稿
+
+> 使用 MiniMax 订阅作为主控和写稿模型，按当前生图绑定，速度优先，不同步额度。生成10条每日新闻，选题偏向国际冲突、科技产业、社会民生和财经产业；再生成1篇每日AI讯息、1篇每日全球事件关注图。检查真实性、日期与重复信息，使用专用 profile 保存到小红书草稿箱，不公开发布。
+
+这段话只用于创建待确认计划。执行前检查右侧的数量、关键词、模型绑定和“保存到草稿箱”，再点“确认并执行”。栏目/数量不是成功保证；无近期合格材料、模型限额、平台登录或写入结果不确定时，会报告失败或部分完成。运行中从“运行播报”“运行记录”查看进度；恢复任务使用原记录，不重新发送相同生成指令。
+
+生成前关闭占用项目专用 profile 的手动浏览器窗口，默认浏览器的工作台可保持打开。不要同时运行两份后台或两个使用相同 profile 的平台任务。
 
 ### 指定新闻关键词与校准计划
 
@@ -29,6 +43,16 @@
 校准每次仅调用一次模型，网络超时为60秒，无自动重试或付费供应商降级。失败时保留原计划；无法映射的要求会明确提示，不允许悄悄忽略。校准记录保存在 PostgreSQL，刷新可恢复候选；服务重启时未完成的校准标为中断，需要手动重试。运行中的任务不可改写计划。
 
 ## 实时了解任务
+
+### 可选的阶段复用流程
+
+新任务的计划编辑面板中，在“生成流程”选择“阶段复用（试用）”，保存计划后再确认执行。终端对应选项是 `--generation-pipeline-version staged_v2`，适用于本仓库 `redbook_tools` 的 `auto`、`agent` 命令；CLI 当前未注册 `create`。默认仍为 `legacy`；已有任务按原检查点版本恢复，不会因更新程序自动切换。
+
+该模式使用真实 PostgreSQL 保存正文、定向修复和图片阶段结果。同一根任务恢复时优先复用输入、模型和规则未变化的结果；只修场景或评价时不重写已经通过的正文。AI 讯息按条目保存摘要，最多两批并行、每批最多六条，缺项只补对应条目。事实、时效、查重及图片硬错误的检查仍保留。
+
+当前这是阶段性实现：跨栏目并行、持久化 READY 队列的边生成边上传、旧 `redbook_workflow` 的优化移植尚未完成。平台仍由既有串行交付流程处理。恢复保留不等于已上传，新增阶段计数也不代替平台回读确认。
+
+数据库不可用时新模式明确报错，不降级。`STAGE_PENDING_OR_UNKNOWN` 或 `MODEL_CAPACITY_UNCERTAIN` 表示有请求结果需要核对，不能通过删库、换任务 ID 或清空租约盲目重发。当前需要人工核对并处理，尚无专用自助核对界面。详细完成范围和实测限制见 [提速实施报告](docs/plans/2026-10-10-news-performance-implementation-report.md)。尚未验证真实 10+1 端到端耗时，不承诺 30–40 分钟。
 
 - 对话中的“运行播报”和右侧“最近一次运行”使用中文摘要。详细页面仍在“运行记录”；原始输出放在可展开的“技术日志”中。
 - “产出记录”“通过审查”“平台保存”“回读确认”分别统计。未知数量显示“待记录”；本地成稿不等于上传成功，平台保存不等于回读确认。
@@ -50,6 +74,8 @@
 
 “每日AI讯息”可额外读取本项目 `tools/AIHOT` 的开源 AIHOT。运行前执行 `scripts/manage_aihot.ps1 -Action start -Worker`，结束后执行相同脚本的 `-Action stop`；站点地址为 <http://127.0.0.1:8768>。独立运行区的 `.env.gui` 已配置本地 API 地址。AIHOT 使用另一套 E 盘 PostgreSQL（5434），数据继续在 `E:\AI\codex\AIHOT-data`；两个程序不要同时启动两份服务。若该服务未启动，智能体会报告该聚合信源的连接失败，并继续尝试其余信源。AIHOT 仅提供可核验原始网址和发布时间的候选线索，最终仍由智能体执行时效、查重与内容质量检查。
 
+另外默认启用 AIHOT 公开日报，无需启动本地 AIHOT。显式配置 `AI_DIGEST_SOURCE_IDS` 时仍遵循白名单。日报只提供发现线索：程序按单篇文章解析标题/摘要/外链，有限并发核验受信任官方原文与发布时间，再执行两日时效及历史查重。未核验的线索不会当作官方消息，日报日期也不能替代原文发布时间。信源冷却到期后有限探测恢复，不因一次失败永久停用。
+
 ## 安装与更新
 
 ### ChatGPT 订阅生图
@@ -64,7 +90,7 @@ AI鸡蛋/AI福利沿用每日羊毛栏目，通过运行区 `assets/wool` 的构
 
 ```powershell
 Set-Location E:\AI\codex\redbook_agent\frontend
-npm ci
+npm ci --cache E:\AI\codex\redbook_agent\.npm-cache
 npm run build
 ```
 
@@ -72,7 +98,9 @@ npm run build
 
 ```powershell
 Set-Location E:\AI\codex\redbook_agent
-py -3.10 -m venv .venv
+$env:PIP_CACHE_DIR="$PWD\.pip-cache"
+$env:PLAYWRIGHT_BROWSERS_PATH="$PWD\.playwright-browsers"
+python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
@@ -89,15 +117,31 @@ py -3.10 -m venv .venv
 ```powershell
 Set-Location E:\AI\codex\redbook_agent
 .\.venv\Scripts\python.exe -m pytest -q tests
+$env:PYTHONPATH=(Get-Location).Path
 Set-Location E:\AI\codex\redbook_agent\tools\redbook_tools
 E:\AI\codex\redbook_agent\.venv\Scripts\python.exe -m pytest -q tests
 ```
 
+工具包的旧 Web 兼容入口会调用本仓库 `backend` 的冻结计划服务，因此单独测试工具包时需保留上面的 `PYTHONPATH`；它不指向旧工作流。自动化测试可能跳过需要显式授权、真实数据库或外部账号的案例，不能当成平台端到端验收。
+
 本地运行区、`.env.gui`、数据库凭据、浏览器 profile、草稿图片、日志和模型缓存均不得加入 Git。新程序的 `.gitignore` 与运行区的忽略规则已覆盖这些路径；提交前仍需检查暂存文件清单。没有完成新 profile 的真实平台登录、上传与回读验证之前，不应将“草稿已上传”作为测试通过结论。
+
+## 密钥与 Git 安全
+
+- 真实 API Key、密码、Token 只存放于运行区 `.env.gui`、环境变量或本地凭据文件。不要在 README、聊天、测试 fixture 或运行截图中填写真实值；示例只使用 `YOUR_API_KEY` 等占位符。
+- `.gitignore` 排除本地环境、账号池、Cookie、浏览器 profile、数据库导出、日志、图片和工具二进制，但不会让已跟踪的文件停止跟踪，也不能发现代码中任意命名的密钥。
+- 提交前检查 `git status --short`、`git diff --cached --stat`、`git diff --cached --check`，并扫描暂存内容中的真实凭据。`git ls-files --cached --ignored --exclude-standard` 可查已跟踪但被忽略的路径；不要把这个清单一律删除，部分可能是合法的源码或项目文档。
+- 密钥若曾进入 Git 历史，应立即撤销/轮换，再处理历史；新增忽略规则不等于历史已经清理。不要将运行区加入源码仓库，也不要使用 `git add -f` 强行加入私有文件。
 
 ## 从 GitHub 部署
 
 本仓库包含后端、前端源码、测试、领域工具包及无凭据的数据库初始化/管理脚本，不包含本机已经准备好的运行区。克隆源码不等于自动获得可用的模型账号、数据库或浏览器登录态。
+
+```powershell
+Set-Location E:\AI\codex
+git clone https://github.com/bty3052771076-tech/redbook_auto_agent.git redbook_agent
+Set-Location redbook_agent
+```
 
 1. 将仓库克隆到 E 盘，按上述命令建立 `.venv`、安装根目录 `requirements.txt` 并构建 `frontend`。Python 需要 3.10 或以上；Node.js 需满足 Vite 7 的版本要求。pip/npm/Playwright 的下载缓存也应设置到 E 盘。
 2. 新建 `E:\AI\codex\redbook_runtime`。将 `deployment/postgresql/initialize.ps1`、`manage.ps1` 放到运行区的 `data/runtime/postgresql/`。该目录还需自行准备 PostgreSQL 18.6 的 `18.6/pgsql/` Windows 二进制及匹配的 pgvector 扩展；本仓库不分发数据库二进制。不要覆盖已经存在的运行区和数据库。

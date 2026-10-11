@@ -118,6 +118,9 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
             for j in checkpoint.get("jobs", []) if isinstance(j, dict)]
     ids = [{"saved": set(), "local": set()} for _ in jobs]
     events = _events(run, checkpoint)
+    pipeline_items = {}
+    phase_labels = {"text_approved": "候选正文通过", "image_ready": "图片就绪",
+                    "repairing": "正在定向修复", "rejected": "候选未通过"}
     cursor = 0
     stage = "等待运行记录"
     timeline = []
@@ -130,6 +133,15 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
         if kind:
             cursor = next((i for i, j in enumerate(jobs) if j["kind"] == kind), cursor)
         job = jobs[cursor] if cursor < len(jobs) else None
+        phase = None
+        if node == "pipeline_item":
+            item_match = re.search(r"\bitem=([a-zA-Z0-9_-]+)\b", detail)
+            phase_match = re.search(r"\bphase=([a-z_]+)\b", detail)
+            if item_match and phase_match and phase_match[1] in phase_labels:
+                phase = phase_match[1]
+                item = pipeline_items.setdefault((cursor, item_match[1]), {"seen": set(), "latest": ""})
+                item["seen"].add(phase)
+                item["latest"] = phase
         stage = STAGES.get(node, node)
         label = job["title"] if job else KINDS.get(kind, "任务")
         agent = e.get("source") == "checkpoint" or e.get("agent")
@@ -145,7 +157,9 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
                 ids[cursor]["local"].add(post[1])
         if state in {"failed", "warning"} and agent:
             failures.append(_issue(detail))
-        if node == "wool_result" and "message=" in detail:
+        if phase:
+            sentence = f"{label} · {phase_labels[phase]}。"
+        elif node == "wool_result" and "message=" in detail:
             wool_notice = detail.split("message=", 1)[1].strip()
             sentence = wool_notice
         elif node == "finish":
@@ -248,11 +262,14 @@ def build_activity(run: dict, checkpoint: dict, *, now: float | None = None) -> 
     if wool_notice:
         summary += " " + wool_notice
     issues = list({issue["message"]: issue for issue in issues}.values())
+    pipeline = ({key: sum(key in item["seen"] if key in {"text_approved", "image_ready"}
+                          else item["latest"] == key for item in pipeline_items.values())
+                 for key in phase_labels} if pipeline_items else None)
     return {"status": status, "status_label": LABELS.get(status, "状态未记录"), "active": active,
             "headline": headline, "summary": summary, "stage": stage, "current_job": current_job,
             "started_at": started or None, "ended_at": ended or None, "elapsed_seconds": elapsed,
             "last_update": last_update, "requested": requested, "counts": counts, "jobs": jobs,
-            "timeline": timeline[-16:], "issues": issues}
+            "timeline": timeline[-16:], "issues": issues, "pipeline": pipeline}
 
 
 def activity_reply(activity: dict) -> str:
