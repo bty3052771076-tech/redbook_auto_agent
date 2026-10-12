@@ -117,29 +117,39 @@ def _goto_xhs_page(page, url: str, *, timeout_ms: int) -> None:
         session = page.context.new_cdp_session(page)
     except Exception:
         session = None
-    if session is not None:
-        result = session.send("Page.navigate", {"url": url})
-        error_text = str((result or {}).get("errorText") or "").strip()
-        if error_text:
-            raise RuntimeError(f"xiaohongshu navigation failed: {error_text}")
-        return
-
     navigation_timeout_ms = min(
         XHS_NAVIGATION_TIMEOUT_MS,
         max(30000, int(timeout_ms or 0)),
     )
-    for attempt in range(2):
-        try:
-            page.goto(url, wait_until="commit", timeout=navigation_timeout_ms)
-            return
-        except PlaywrightTimeoutError:
-            if attempt:
-                raise
+    retryable_errors = ("ERR_CONNECTION_CLOSED", "ERR_CONNECTION_RESET", "ERR_NETWORK_CHANGED")
+    try:
+        for attempt in range(3):
             try:
-                page.evaluate("window.stop()")
+                if session is not None:
+                    result = session.send("Page.navigate", {"url": url})
+                    error_text = str((result or {}).get("errorText") or "").strip()
+                    if error_text:
+                        raise RuntimeError(f"xiaohongshu navigation failed: {error_text}")
+                else:
+                    page.goto(url, wait_until="commit", timeout=navigation_timeout_ms)
+                return
+            except Exception as exc:
+                timed_out = isinstance(exc, PlaywrightTimeoutError)
+                limit = 1 if timed_out else 2
+                if attempt >= limit or not (timed_out or any(error in str(exc) for error in retryable_errors)):
+                    raise
+                if timed_out:
+                    try:
+                        page.evaluate("window.stop()")
+                    except Exception:
+                        pass
+                time.sleep(attempt + 1)
+    finally:
+        if session is not None:
+            try:
+                session.detach()
             except Exception:
                 pass
-            time.sleep(1)
 
 
 def _page_current_url(page) -> str:
@@ -2487,7 +2497,7 @@ def _open_platform_draft_list(
 ) -> None:
     url = _target_url_for_draft_type(draft_type)
     _emit_progress(progress_callback, "open_publish_page", "in_progress", url)
-    page.goto(url, wait_until="domcontentloaded")
+    _goto_xhs_page(page, url, timeout_ms=wait_timeout_ms)
     _wait_for_xhs_ready(
         page,
         login_hold=login_hold,
@@ -3838,10 +3848,50 @@ def run_save_draft_sync(
         )
 
 
+def _replace_editor_images(page, image_paths: list[str], *, progress_callback=None) -> None:
+    paths = [str(Path(path).resolve()) for path in image_paths]
+    if not paths or len(paths) > 18 or any(not Path(path).is_file() for path in paths):
+        raise ValueError("replacement image files are missing")
+    cards = page.locator(".img-container")
+    count = cards.count()
+    if count != _count_editor_images(page):
+        raise RuntimeError("existing draft image controls could not be identified")
+    # The editor requires one photo. Retain the last old thumbnail until new
+    # files are ready, then remove it; split at 17 to respect the 18-photo cap.
+    for remaining in range(count, 1, -1):
+        cards.first.hover(timeout=5000)
+        cards.first.locator(".close-btn").click(timeout=5000)
+        page.wait_for_function(
+            "expected => document.querySelectorAll('.img-container').length === expected",
+            arg=remaining - 1, timeout=5000,
+        )
+    for index, batch in enumerate((paths[:17], paths[17:])):
+        if not batch:
+            continue
+        expected = cards.count() + len(batch)
+        uploaded, _ = _try_upload_with_input(page, batch)
+        if not uploaded:
+            uploaded, _ = _try_upload_with_button(page, batch)
+        if not uploaded or not _wait_for_upload_ready(page, expected, progress_callback=progress_callback):
+            raise RuntimeError("replacement image upload did not complete")
+        if not _wait_for_processing_done(page) or not _wait_for_upload_settle(page, settle_s=2, timeout_ms=60000):
+            raise RuntimeError("replacement image processing did not complete")
+        if index == 0 and count:
+            cards.first.hover(timeout=5000)
+            cards.first.locator(".close-btn").click(timeout=5000)
+            page.wait_for_function(
+                "expected => document.querySelectorAll('.img-container').length === expected",
+                arg=expected - 1, timeout=5000,
+            )
+    if _count_editor_images(page) != len(paths):
+        raise RuntimeError("replacement image count does not match")
+
+
 def _run_update_draft_sync_unlocked(
     post: Post,
     *,
     existing_title: str = "",
+    image_paths: Optional[list[str]] = None,
     draft_type: str = "image",
     dry_run: bool = False,
     login_hold: int = 0,
@@ -3942,6 +3992,12 @@ def _run_update_draft_sync_unlocked(
                 _emit_progress(progress_callback, "verify_draft_chain", "success", post.id)
                 return exec_rec
 
+            if image_paths is not None:
+                _step("replace_images", "in_progress", f"{len(image_paths)} files")
+                _assert_xhs_operable(page, profile_dir=profile_dir)
+                _replace_editor_images(page, image_paths, progress_callback=progress_callback)
+                steps[-1].status = "success"
+
             _step("update_title_body", "in_progress", "")
             _assert_xhs_operable(page, profile_dir=profile_dir)
             title_ok, body_ok = _fill_text_fields(page, post.title, post.body)
@@ -4007,7 +4063,10 @@ def _run_update_draft_sync_unlocked(
                     actual_body = snapshot.get("actual_body", "")
                     verified_title = _draft_title_matches_expected(actual_title, post.title)
                     verified_body = _matches_body_value(actual_body, post.body)
-                    if verified_title and verified_body:
+                    readback = _verify_draft_readback_snapshot(
+                        snapshot, post, actual_image_count=_count_editor_images(page),
+                    )
+                    if readback.ok:
                         break
                     verify_error = RuntimeError("updated draft verification failed")
                 except RuntimeError as exc:
@@ -4015,9 +4074,15 @@ def _run_update_draft_sync_unlocked(
                 if verify_attempt < 2:
                     time.sleep(2)
             steps[-1].detail = f"title={verified_title} body={verified_body}"
-            if not (verified_title and verified_body):
+            if not (verified_title and verified_body and readback.ok):
                 raise verify_error or RuntimeError("updated draft verification failed")
             steps[-1].status = "success"
+            _step("readback_saved_draft", "success", json.dumps({
+                "actual_title": readback.actual_title, "actual_body": readback.actual_body,
+                "actual_image_count": readback.actual_image_count,
+                "expected_image_count": readback.expected_image_count,
+                "title_ok": readback.title_ok, "body_ok": readback.body_ok, "image_ok": readback.image_ok,
+            }, ensure_ascii=False))
             exec_rec.result = "saved_draft"
             _emit_progress(progress_callback, "update_draft_chain", "success", post.id)
     except Exception as exc:  # pragma: no cover
@@ -4048,6 +4113,7 @@ def run_update_draft_sync(
     post: Post,
     *,
     existing_title: str = "",
+    image_paths: Optional[list[str]] = None,
     draft_type: str = "image",
     dry_run: bool = False,
     login_hold: int = 0,
@@ -4061,6 +4127,7 @@ def run_update_draft_sync(
         return _run_update_draft_sync_unlocked(
             post,
             existing_title=existing_title,
+            image_paths=image_paths,
             draft_type=draft_type,
             dry_run=dry_run,
             login_hold=login_hold,

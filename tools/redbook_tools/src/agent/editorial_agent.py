@@ -362,7 +362,7 @@ def _emit(state: AgentState, progress: AgentProgress | None, node: str, status: 
 def _revalidate_completed_jobs(
     state: dict[str, Any], tools: EditorialAgentTools, progress: AgentProgress | None,
 ) -> dict[str, Any]:
-    """Invalidate only failed completed jobs; never trust serialized post copies."""
+    """Revalidate retained approvals from current files, not serialized copies."""
     if tools.revalidate_completed is None:
         return state
     state = dict(state)
@@ -373,7 +373,9 @@ def _revalidate_completed_jobs(
     state["errors"] = list(state.get("errors") or [])
     state["events"] = list(state.get("events") or [])
     jobs = state.get("jobs") or []
-    for index in sorted(completed.copy()):
+    retained = {int(key) for key, record in records.items()
+                if record.get("review_complete") and record.get("reviewed_post_ids")}
+    for index in sorted(completed | retained):
         record = records.setdefault(str(index), {})
         ids = list(record.get("post_ids") or _post_ids(record.get("posts") or []))
         blocked = False
@@ -402,6 +404,11 @@ def _revalidate_completed_jobs(
                 issues = [_redact_text(f"COMPLETED_REVALIDATION_UNAVAILABLE: job={index}: {exc}")]
                 blocked = True
         if not issues:
+            if index not in completed:
+                approved = set(record.get("reviewed_post_ids") or [])
+                record["reviewed_posts"] = [post for post in posts if _post_id(post) in approved]
+                if index == int(state.get("job_index", 0)):
+                    state.update(posts=posts, reviewed_posts=record["reviewed_posts"])
             continue
         if any(code in error for error in issues for code in TERMINAL_PLATFORM_FAILURE_CODES):
             state["platform_paused"] = True
@@ -528,6 +535,42 @@ def _build_graph(
         _emit(state, progress, "plan", "success", f"jobs={len(jobs)} index={index} provider={config.provider}" + (f" summary={summary}" if summary else ""))
         return persist(state, "plan")
 
+    def reconcile_platform_pause(state: AgentState) -> None:
+        if not (config.resume_from and state.get("platform_paused") and tools.reconcile_uploads is not None):
+            return
+        records = state.get("job_states") or {}
+        failures = [str(state.get("last_failure") or "")]
+        failures.extend(str(record.get("last_failure") or "") for record in records.values()
+                        if record.get("status") != "completed")
+        if any(code in failure for failure in failures for code in TERMINAL_PLATFORM_FAILURE_CODES
+               if code != "XHS_WRITE_UNCERTAIN"):
+            return
+        cases = {int(key): list(record.get("reviewed_post_ids") or [])
+                 for key, record in records.items()
+                 if record.get("status") != "completed"
+                 and "XHS_WRITE_UNCERTAIN" in str(record.get("last_failure") or "")}
+        if "XHS_WRITE_UNCERTAIN" in failures[0]:
+            cases.setdefault(int(state["job_index"]), list(state.get("reviewed_post_ids") or []))
+        if not cases or any(not ids for ids in cases.values()):
+            return
+        # Later jobs may overwrite last_failure; retain the original pause's job
+        # and reconcile all affected versions before allowing any new write.
+        for index, ids in cases.items():
+            try:
+                ready, detail = tools.reconcile_uploads(_job_from_dict(state["jobs"][index]), ids)
+            except Exception as exc:
+                ready, detail = False, _redact_text(f"DRAFT_RECONCILIATION_UNAVAILABLE: {exc}")
+            _emit(state, progress, "reconcile_drafts", "success" if ready else "warning", detail)
+            if not ready:
+                return
+        state["platform_paused"] = False
+        for index in cases:
+            if str(index) in records:
+                records[str(index)].update(status="pending", last_failure="", job_blocked=False,
+                                           retryable=True, no_progress_count=0, retry_at=0)
+        if int(state["job_index"]) in cases:
+            state.update(last_failure="", job_blocked=False, retryable=True)
+
     def sync_context(state: AgentState) -> AgentState:
         if int(state.get("job_index", 0)) >= len(state["jobs"]):
             return persist(state, "sync_context")
@@ -555,16 +598,7 @@ def _build_graph(
         tool_context(state)
         if context.get("platform_write_ready") is True:
             state["platform_paused"] = False
-        if (config.resume_from and state.get("platform_paused") and tools.reconcile_uploads is not None
-                and "XHS_WRITE_UNCERTAIN" in str(state.get("last_failure") or "")):
-            try:
-                ready, detail = tools.reconcile_uploads(job, list(state.get("reviewed_post_ids") or []))
-            except Exception as exc:
-                ready, detail = False, _redact_text(f"DRAFT_RECONCILIATION_UNAVAILABLE: {exc}")
-            _emit(state, progress, "reconcile_drafts", "success" if ready else "warning", detail)
-            if ready:
-                state["platform_paused"] = False
-                state["last_failure"] = ""
+        reconcile_platform_pause(state)
         if "knowledge_status" in context and context.get("knowledge_status") != "ready":
             code = str(context.get("error_code") or "KNOWLEDGE_DB_UNAVAILABLE")
             warning = str(context.get("knowledge_warning") or "PostgreSQL 知识库未就绪，已阻止生成。")
@@ -716,6 +750,7 @@ def _build_graph(
     def upload(state: AgentState) -> AgentState:
         job = _job_from_dict(state["current_job"])
         tool_context(state)
+        reconcile_platform_pause(state)
         uploaded = list(state.get("uploaded_posts", []))
         uploaded_ids = list(state.get("uploaded_post_ids") or _post_ids(uploaded))
         if uploaded_ids and tools.load_posts is not None and not uploaded:

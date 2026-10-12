@@ -41,14 +41,17 @@ def test_agent_ai_digest_defaults_are_soft_without_overriding_explicit_values(mo
 
 
 def test_agent_ai_digest_rejects_no_official_or_single_source():
+    day = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date().isoformat()
     post = Post(
         title="每日AI讯息",
         body="内容",
         platform={"ai_digest": {
             "items": [
                 {"source_type": "aggregator", "source_name": "arXiv cs.AI", "url": "https://arxiv.org/a",
+                 "published_at": day,
                  "title": "OpenAI新增Responses API语音接口", "summary": "OpenAI为Responses API新增语音输入输出接口，开发者可在单次请求中处理音频。"},
                 {"source_type": "aggregator", "source_name": "arXiv cs.AI", "url": "https://arxiv.org/b",
+                 "published_at": day,
                  "title": "研究团队提出离散扩散模型训练方法", "summary": "研究团队在论文中提出离散扩散模型的训练方法，并公开实验设置和评估结果。"},
             ],
             "source_meta": {"selected_official_count": 0},
@@ -66,6 +69,24 @@ def test_agent_ai_digest_rejects_no_official_or_single_source():
     post.platform["ai_digest"]["source_meta"]["selected_official_count"] = 1
     post.platform["ai_digest"]["source_distribution"] = {"OpenAI": 1, "arXiv cs.AI": 1}
     assert _agent_ai_digest_review_issues(post, min_official=1) == []
+
+
+def test_agent_ai_digest_rechecks_dates_even_when_previous_approval_exists():
+    day = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date().isoformat()
+    post = Post(title='AI', body='content', platform={'ai_digest': {
+        'items': [{'title': 'OpenAI新增Responses API语音接口',
+                   'summary': 'OpenAI为Responses API新增语音输入输出接口，开发者可在单次请求中处理音频。',
+                   'source_type': 'official', 'source_name': 'OpenAI',
+                   'url': 'https://openai.com/index/new-audio/', 'published_at': day}],
+        'source_meta': {'selected_official_count': 1}},
+        'quality_gate': {'deterministic_ok': True}})
+    assert _agent_ai_digest_review_issues(post, min_official=1) == []
+    post.platform['ai_digest']['items'][0]['published_at'] = '2025-09-03'
+    assert any('AI_DIGEST_SOURCE_EXPIRED' in issue for issue in
+               _agent_ai_digest_review_issues(post, min_official=1))
+    post.platform['ai_digest']['items'][0]['published_at'] = ''
+    assert any('AI_DIGEST_SOURCE_EXPIRED' in issue for issue in
+               _agent_ai_digest_review_issues(post, min_official=1))
 
 
 def test_agent_map_failure_explains_fresh_blocked_snapshot(tmp_path):

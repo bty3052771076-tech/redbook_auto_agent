@@ -64,13 +64,14 @@ export function ModelPlatforms({ call, legacyModels, onChanged }: {
   const [editingModel, setEditingModel] = useState("");
   const [form, setForm] = useState<Record<string, string>>({});
   const [roles, setRoles] = useState<Record<string, string>>({});
+  const [rolesReady, setRolesReady] = useState(false);
   const [error, setError] = useState(""), [notice, setNotice] = useState(""), [busy, setBusy] = useState(false);
   const [operation, setOperation] = useState<any>(null), [search, setSearch] = useState("");
   const modal = useRef<HTMLElement>(null), opener = useRef<HTMLElement | null>(null);
   const sequence = useRef(0);
   async function refresh() {
     const [state, bindings] = await Promise.all([call("/api/model-platforms/models"), call("/api/model-platforms/roles")]);
-    setCatalog(state); setRoles(bindings.roles);
+    setCatalog(state); setRoles(bindings.roles); setRolesReady(true);
     setSelected(previous => state.connections.some((c: Connection) => c.connection_id === previous) ? previous : state.connections[0]?.connection_id || "");
   }
   useEffect(() => { Promise.all([refresh(), call("/api/model-platforms/presets").then(value => setPresets(value.presets))]).catch(e => setError(String(e))); }, []);
@@ -172,8 +173,8 @@ export function ModelPlatforms({ call, legacyModels, onChanged }: {
           onClick={() => start("/api/model-platforms/checks", { model_ref: m.model_ref, purpose })}><PlayIcon />{label}</button>)}</div></article>)}
       {!catalog.models.length && <p>暂无自定义模型</p>}</section>}
     {tab === "roles" && <section className="mp-roles">{(["agent", "writer", "image"] as Role[]).map(role => <div className="mp-field" key={role}><span>{roleLabels[role]}</span>
-      <RolePicker label={roleLabels[role]} value={roles[role] || ""} choices={modelChoices(role)} onChange={ref => setRoles(previous => ({ ...previous, [role]: ref }))} /></div>)}
-      <button disabled={busy} onClick={() => mutate("/api/model-platforms/roles", "PUT", roles, "默认角色已保存")}><Save size={16} />保存默认模型</button></section>}
+      <RolePicker label={roleLabels[role]} value={roles[role] || ""} choices={modelChoices(role)} disabled={busy || checking || !rolesReady}
+        onChange={ref => mutate("/api/model-platforms/roles", "PUT", { [role]: ref }, "默认角色已保存")} /></div>)}</section>}
     {dialog && <div className="mp-backdrop"><section ref={modal} className="mp-dialog" role="dialog" aria-modal="true" aria-label={dialog === "connection" ? "添加供应商" : dialog === "model" ? "添加模型" : dialog === "credential" ? "替换凭据" : "费用授权"}>
       <header className="mp-heading"><h2>{dialog === "connection" ? "添加供应商" : dialog === "model" ? "添加模型" : dialog === "credential" ? "替换凭据" : "费用授权"}</h2><button title="关闭" aria-label="关闭" disabled={busy} onClick={close}><X size={18} /></button></header>
       {error && <p className="mp-error" role="alert">{error}</p>}

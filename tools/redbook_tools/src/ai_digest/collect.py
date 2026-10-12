@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 import urllib.request
 from typing import Any, Callable
 
@@ -32,6 +32,7 @@ from .fetchers import (
 )
 from .models import AIUpdateItem, strip_html_artifacts
 from .rank import (
+    ai_digest_official_count,
     ai_digest_quota_counts,
     ai_update_history_key,
     ai_update_quality_issues,
@@ -99,6 +100,8 @@ _VENDOR_OFFICIAL_HOSTS = {
     "runway": ("runwayml.com",),
     "langchain": ("langchain.com",),
     "sierra": ("sierra.ai",),
+    "sakana ai": ("sakana.ai",),
+    "morningai": ("morningai.com",),
     "cloudflare blog": ("cloudflare.com",),
     "github blog": ("github.blog", "github.com"),
     "apple machine learning research（rss）": ("apple.com",),
@@ -392,6 +395,25 @@ def resolve_aihot_detail_source(item: AIUpdateItem, *, timeout_s: float = 8.0) -
 
 def resolve_ai_digest_discovery_source(item: AIUpdateItem, *, timeout_s: float = 8.0) -> AIUpdateItem:
     """Promote a discovery lead only after its official original supplies a date and facts."""
+    if item.source_type == "search" and "aihot_original_unverified" not in item.tags:
+        from .fetchers import _LinkCollector
+        if urlsplit(item.url).scheme != "https":
+            return item
+        try:
+            parser = _LinkCollector()
+            parser.feed(_http_get_text(item.url, timeout_s=timeout_s))
+        except Exception:
+            return item
+        original = next((urljoin(item.url, href) for href, text in parser.links
+            if re.search(r"announcement|official|blog|report|公告|官方|报告", text, re.I)
+            and len(urlsplit(urljoin(item.url, href)).path.strip("/").split("/")) >= 2
+            and _is_known_official_discovery_url(urljoin(item.url, href))
+            and _matches_vendor_official_host(item, urljoin(item.url, href))), "")
+        if not original:
+            return item
+        item = item.model_copy(update={"url": original,
+            "evidence_urls": list(dict.fromkeys([item.url, *item.evidence_urls])),
+            "tags": [*item.tags, "aihot_original_unverified"]})
     if "aihot_original_unverified" not in item.tags:
         return item
     unverified = item.model_copy(update={"published_at": "", "source_type": "aggregator"})
@@ -950,6 +972,7 @@ def _needs_search_backfill(
     min_domestic_model_count: int,
     min_foreign_ai_count: int,
     require_target_count: bool = False,
+    min_official_count: int = 0,
 ) -> bool:
     required_min = (
         max(1, target_count)
@@ -959,6 +982,7 @@ def _needs_search_backfill(
     counts = ai_digest_quota_counts(ranked)
     return (
         len(ranked) < required_min
+        or ai_digest_official_count(ranked) < min(max(0, min_official_count), max(1, target_count))
         or counts["domestic_model"] < min_domestic_model_count
         or counts["foreign_ai"] < min_foreign_ai_count
     )
@@ -1231,6 +1255,7 @@ def collect_ai_digest_updates(
         or _needs_search_backfill(
             stream_ranked,
             target_count=target_count,
+            min_official_count=min_official_count,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
             require_target_count=include_pool_items,
@@ -1275,6 +1300,7 @@ def collect_ai_digest_updates(
         or _needs_search_backfill(
             ranked,
             target_count=target_count,
+            min_official_count=min_official_count,
             min_domestic_model_count=min_domestic_model_count,
             min_foreign_ai_count=min_foreign_ai_count,
             require_target_count=include_pool_items,
@@ -1372,6 +1398,7 @@ def collect_ai_digest_updates(
             or _needs_search_backfill(
                 ranked,
                 target_count=target_count,
+                min_official_count=min_official_count,
                 min_domestic_model_count=min_domestic_model_count,
                 min_foreign_ai_count=min_foreign_ai_count,
                 require_target_count=include_pool_items,
@@ -1387,6 +1414,14 @@ def collect_ai_digest_updates(
             progress=progress,
             performance_mode=performance_policy.mode,
         )
+        original_candidates = rank_ai_updates(extra, target_count=16, min_official_count=0,
+            max_age_days=max_age_days, now=now, max_items_per_source=None)
+        if original_candidates:
+            with ThreadPoolExecutor(max_workers=min(6, len(original_candidates))) as executor:
+                originals = list(executor.map(resolve_ai_digest_discovery_source, original_candidates))
+            resolved_by_url = {lead.url: original for lead, original in zip(original_candidates, originals)}
+            extra = [resolved_by_url.get(item.url, item) for item in extra]
+            search_backfill_meta["original_date_checks"] = len(original_candidates)
         fetched.extend(_exclude_history_items(extra, "search_backfill"))
         errors.extend(search_backfill_meta.get("errors") or [])
         _emit_progress(progress, "search_backfill", f"success items={len(extra)} errors={len(search_backfill_meta.get('errors') or [])}")
@@ -1426,6 +1461,7 @@ def collect_ai_digest_updates(
             or _needs_search_backfill(
                 ranked,
                 target_count=target_count,
+                min_official_count=min_official_count,
                 min_domestic_model_count=min_domestic_model_count,
                 min_foreign_ai_count=min_foreign_ai_count,
                 require_target_count=include_pool_items,

@@ -834,10 +834,10 @@ class Workbench:
         return env
 
     def redact(self, value: Any) -> Any:
-        secrets = gui.load_env_file(self.root / ".env.gui")
-        secrets.update({k: v for k, v in os.environ.items() if re.search(r"KEY|TOKEN|SECRET|PASSWORD", k)})
-        sensitive = tuple(secret for key, secret in secrets.items()
-                          if re.search(r"KEY|TOKEN|SECRET|PASSWORD", key) and len(secret) >= 6)
+        sources = (gui.load_env_file(self.root / ".env.gui"), os.environ)
+        sensitive = sorted({secret for source in sources for key, secret in source.items()
+                            if re.search(r"KEY|TOKEN|SECRET|PASSWORD", key) and len(secret) >= 6},
+                           key=len, reverse=True)
 
         def scrub(item: Any) -> Any:
             if isinstance(item, dict):
@@ -1612,9 +1612,27 @@ class Workbench:
                     job["resume_of"] = valid_id(str(request["resume_of"]))
             if request["kind"] in {"delete-preview", "delete-drafts"}:
                 job["deletion_scope"] = deletion_scope(request)
+            launch_cancelled = False
+
+            def run_if_admitted():
+                with self.lock:
+                    if launch_cancelled:
+                        return
+                self._run(job, args, env)
+
+            worker = threading.Thread(target=run_if_admitted, daemon=True)
             self.persist(job)
             self.jobs[job_id] = job
-            threading.Thread(target=self._run, args=(job, args, env), daemon=True).start()
+            try:
+                worker.start()
+            except Exception:
+                # Fence a delayed bootstrap before removing its journal. Keep
+                # both guards if deletion fails or a worker has already started.
+                if worker.ident is None:
+                    launch_cancelled = True
+                    (self.directory / "jobs" / f"{job_id}.json").unlink(missing_ok=True)
+                    self.jobs.pop(job_id, None)
+                raise
             return self.redact(job.copy())
 
     def persist(self, job: dict) -> None:

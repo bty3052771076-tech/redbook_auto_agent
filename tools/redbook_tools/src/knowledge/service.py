@@ -21,8 +21,8 @@ def prepare_local_knowledge_snapshot(
         if readiness.get("status") != "ready":
             raise RuntimeError(readiness.get("error") or "KNOWLEDGE_DB_UNAVAILABLE: schema is not ready")
         report = ingest_posts(current, data_root=data_root)
-        report.update(index_pending_documents(current, progress_callback=progress_callback))
-        report["index_progress"] = current.index_progress()
+        report.update(index_pending_documents(current, progress_callback=progress_callback, account_namespace="local"))
+        report["index_progress"] = current.index_progress(account_namespace="local")
         if report["index_progress"]["pending_documents"]:
             raise RuntimeError("KNOWLEDGE_INDEX_NOT_READY: vector indexing is incomplete")
         report["knowledge_status"] = "ready"
@@ -39,7 +39,11 @@ def prepare_local_knowledge_snapshot(
             "snapshot_id": "",
             "input_count": 0,
             "documents": 0,
-            "warning": f"PostgreSQL 知识库不可用，已阻止生成。请启动本地数据库并检查连接/迁移状态。详情：{exc}",
+            "warning": (
+                f"当前账号的知识库向量索引尚未完成，请完成增量索引后续跑。详情：{exc}"
+                if error_code == "KNOWLEDGE_INDEX_NOT_READY" else
+                f"知识库准备失败，请检查连接或嵌入模型状态。详情：{exc}"
+            ),
         }
 
 
@@ -54,23 +58,31 @@ def knowledge_context(
         status = store.status()
         if status.get("status") != "ready":
             raise RuntimeError(status.get("error") or "knowledge database unavailable")
-        if not status.get("index_ready"):
-            raise RuntimeError("KNOWLEDGE_INDEX_NOT_READY: vector index watermark is incomplete")
+        progress = store.index_progress(account_namespace="local")
+        if progress["pending_documents"]:
+            raise RuntimeError(
+                f"KNOWLEDGE_INDEX_NOT_READY: current account has {progress['pending_documents']} pending documents"
+            )
         hits = store.search(query, purpose="duplicate_reference", limit=8) if query else []
         return {
             "knowledge_status": status.get("status"),
-            "knowledge_documents": status.get("documents", 0),
+            "knowledge_documents": progress["documents"],
             "knowledge_hits": hits,
             "job_kind": job_kind,
         }
     except Exception as exc:
+        error_code = "KNOWLEDGE_INDEX_NOT_READY" if "KNOWLEDGE_INDEX_NOT_READY" in str(exc) else (
+            "EMBEDDING_MODEL_UNAVAILABLE" if "EMBEDDING_MODEL" in str(exc) else "KNOWLEDGE_DB_UNAVAILABLE"
+        )
         return {
             "knowledge_status": "blocked",
-            "error_code": "KNOWLEDGE_INDEX_NOT_READY" if "KNOWLEDGE_INDEX_NOT_READY" in str(exc) else (
-                "EMBEDDING_MODEL_UNAVAILABLE" if "EMBEDDING_MODEL" in str(exc) else "KNOWLEDGE_DB_UNAVAILABLE"
-            ),
+            "error_code": error_code,
             "knowledge_documents": 0,
             "knowledge_hits": [],
-            "knowledge_warning": f"PostgreSQL 知识库不可用，已阻止生成。请启动本地数据库并检查连接/迁移状态。详情：{exc}",
+            "knowledge_warning": (
+                f"当前账号的知识库向量索引尚未完成，请完成增量索引后续跑。详情：{exc}"
+                if error_code == "KNOWLEDGE_INDEX_NOT_READY" else
+                f"知识库查询失败，请检查连接或嵌入模型状态。详情：{exc}"
+            ),
             "job_kind": job_kind,
         }

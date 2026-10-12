@@ -9,6 +9,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Embedded tests also use the independent agent's disposable database.
+AGENT_TESTS = ROOT.parents[1] / "conftest.py"
+if AGENT_TESTS.is_file():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_agent_test_postgresql", AGENT_TESTS)
+    agent_tests = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent_tests)
+    pytest_sessionstart = agent_tests.pytest_sessionstart
+    pytest_sessionfinish = agent_tests.pytest_sessionfinish
+
 
 @pytest.fixture(autouse=True)
 def _isolate_local_news_credentials(monkeypatch):

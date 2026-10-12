@@ -79,6 +79,38 @@ def test_unknown_or_private_original_is_not_fetched(monkeypatch):
         assert collect.resolve_ai_digest_discovery_source(item).source_type == "aggregator"
 
 
+@pytest.mark.parametrize('original_date,expected', [('2026-10-06', 0), ('2026-10-12', 1)])
+def test_new_media_report_uses_linked_official_release_date(monkeypatch, original_date, expected):
+    from src.ai_digest.models import AIUpdateItem
+    from src.ai_digest.rank import rank_ai_updates
+    media = 'https://example.org/ai-report'
+    official = 'https://openai.com/index/math-release/'
+    pages = {media: f'<article><a href="{official}">official announcement</a></article>',
+             official: ARTICLE.replace('2026-10-09T19:56:06.371Z', original_date)}
+    monkeypatch.setattr(collect, '_http_get_text', lambda url, **k: pages[url])
+    item = AIUpdateItem(title='OpenAI publishes math research', vendor='OpenAI', source_type='search',
+        url=media, published_at='2026-10-12', summary='New media reporting of mathematical results')
+    resolved = collect.resolve_ai_digest_discovery_source(item)
+    assert resolved.url == official
+    assert resolved.published_at == original_date
+    assert media in resolved.evidence_urls
+    assert len(rank_ai_updates([resolved], target_count=1, min_official_count=1,
+        max_age_days=2, now=datetime(2026, 10, 12, 5, tzinfo=timezone.utc))) == expected
+
+
+def test_linked_official_date_failure_does_not_keep_media_date(monkeypatch):
+    from src.ai_digest.models import AIUpdateItem
+    media = 'https://example.org/ai-report'
+    def fetch(url, **kwargs):
+        if url == media:
+            return '<a href="https://openai.com/index/math-release/">official announcement</a>'
+        raise TimeoutError('official unavailable')
+    monkeypatch.setattr(collect, '_http_get_text', fetch)
+    item = AIUpdateItem(title='OpenAI publishes math research', vendor='OpenAI', source_type='search',
+        url=media, published_at='2026-10-12')
+    assert collect.resolve_ai_digest_discovery_source(item).published_at == ''
+
+
 def test_health_snapshot_uses_verified_original_dates(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_DIGEST_SEARCH_BACKFILL", "0")
     monkeypatch.setattr(collect, "_http_get_text", lambda *a, **k: ARTICLE)

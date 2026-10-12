@@ -21,6 +21,117 @@ def proposed():
             'clarifications':[],'field_suggestions':[],'summary':'建议生成5篇近期新闻'}
 
 
+@pytest.mark.parametrize('reference', ['minimax:MiniMax-M3', 'minimax', 'MiniMax'])
+def test_calibration_resolves_catalog_model_ids_and_provider_names(calibration, reference):
+    current, _, _, base, _, _ = calibration
+    value = proposed()
+    value['provider_requests']['writer'] = reference
+    result = validate_candidate(parse_task(json.dumps(value)), '生成5条每日新闻', base, current)
+    assert result['model_roles']['writer'] == 'minimax:MiniMax-M3'
+    assert result['executable'], result['field_errors']
+
+
+def test_manual_model_override_does_not_inherit_rejected_suggestion_error(calibration):
+    from src.agent.plan_contract import apply_edits
+    current, _, _, base, _, _ = calibration
+    roles = {**base['model_roles'], 'writer': 'minimax:MiniMax-M3'}
+    base = apply_edits(base, {'model_roles': roles})
+    value = proposed()
+    value['provider_requests']['writer'] = 'unconfigured-provider'
+    result = validate_candidate(parse_task(json.dumps(value)), '生成5条每日新闻', base, current)
+    assert result['model_roles'] == roles
+    assert result['executable'], result['field_errors']
+
+
+@pytest.mark.parametrize('kind,reason', [('image', ''), ('llm', '不支持主控')])
+def test_calibration_cannot_select_wrong_kind_or_role(calibration, monkeypatch, kind, reason):
+    current, _, _, base, _, _ = calibration
+    monkeypatch.setattr(current, 'models', lambda: {'rows': [
+        {'id': 'm_custom', 'provider': 'c_custom', 'kind': kind, 'selectable': True,
+         'role_reasons': {'agent': reason}}]})
+    value = proposed()
+    value['provider_requests']['agent'] = 'm_custom'
+    result = validate_candidate(parse_task(json.dumps(value)), '生成5条每日新闻', base, current)
+    assert not result['executable']
+    assert any(error['field'] == 'model_roles.agent' for error in result['field_errors'])
+
+
+def test_calibration_schema_defines_annotation_objects_and_includes_model_roles(calibration):
+    current, _, _, base, _, _ = calibration
+    payload = recognition_payload('生成5条每日新闻', base, current)
+    annotation = payload['output_schema']['properties']['annotations']['items']
+    assert annotation['properties']['evidence_ids']['items']['type'] == 'string'
+    assert 'evidence_ids' in annotation['required']
+    assert payload['current_model_roles'] == base['model_roles']
+
+
+def test_calibration_schema_uses_executable_option_values(calibration):
+    current, _, _, base, _, _ = calibration
+    payload = recognition_payload('生成5条每日新闻，速度优先', base, current)
+    options = payload['output_schema']['$defs']['EditableOptions']['properties']
+    assert options['performance_mode']['enum'] == ['speed', 'balanced', None]
+    assert options['delivery']['enum'] == ['save_draft', 'generate_only', None]
+    assert options['platform']['enum'] == ['xhs', 'toutiao', 'both', None]
+    assert payload['capabilities']['performance_modes'] == ['speed', 'balanced']
+
+
+def test_blank_model_request_inherits_current_selection(calibration, monkeypatch):
+    current, _, _, base, _, _ = calibration
+    monkeypatch.setattr(current, 'models', lambda: pytest.fail('Unchanged models should not load the catalog'))
+    value = proposed()
+    value['provider_requests']['writer'] = '  '
+    result = validate_candidate(parse_task(json.dumps(value)), '生成5条每日新闻', base, current)
+    assert result['model_roles'] == base['model_roles']
+
+
+def test_custom_and_image_model_references_reuse_one_catalog_snapshot(calibration, monkeypatch):
+    current, _, _, base, _, _ = calibration
+    reads = []
+
+    def models():
+        reads.append(True)
+        return {'rows': [
+            {'id': 'm_custom', 'provider': 'c_custom', 'kind': 'llm', 'selectable': True},
+            {'id': 'opencodex:gpt-image-2', 'provider': 'opencodex', 'kind': 'image', 'selectable': True},
+        ]}
+
+    monkeypatch.setattr(current, 'models', models)
+    value = proposed()
+    value['provider_requests'] = {'agent': 'm_custom', 'writer': 'm_custom', 'image': 'opencodex:gpt-image-2'}
+    result = validate_candidate(parse_task(json.dumps(value)), '生成5条每日新闻', base, current)
+    assert result['model_roles'] == value['provider_requests']
+    assert result['executable'], result['field_errors']
+    assert len(reads) == 1
+
+
+def test_history_reuses_configuration_per_request_but_not_across_requests(calibration, monkeypatch):
+    from backend.plan_service import PlanService
+    current, client, cid, base, _, _ = calibration
+    saved = current._read_agent_conversation(cid)
+    saved['plans'] = [{**deepcopy(base), 'id': str(index).zfill(32), 'version': index + 1} for index in range(12)]
+    current._write_agent_conversation(saved)
+    reads = []
+    model_reads = []
+    models = current.models
+
+    def fingerprint(self):
+        reads.append(True)
+        return str(len(reads))
+
+    def catalog():
+        model_reads.append(True)
+        return models()
+
+    monkeypatch.setattr(PlanService, 'configuration_fingerprint', fingerprint)
+    monkeypatch.setattr(current, 'models', catalog)
+    for revision in ('1', '2'):
+        result = client.get(f'/api/conversations/{cid}')
+        assert result.status_code == 200
+        assert len(result.json()['plans']) == 12
+        assert {p['configuration_fingerprint'] for p in result.json()['plans']} == {revision}
+    assert len(reads) == len(model_reads) == 2
+
+
 @pytest.mark.parametrize('field,value', [('count', 'eight'), ('search_keywords', '退款'),
     ('topic_preferences', {'unexpected': True}), ('image_score_required', 'false'),
     ('model_roles', {'unknown_role': 'secret'}), ('content_constraints', [{'type': 'execute', 'value': 'shell'}])])

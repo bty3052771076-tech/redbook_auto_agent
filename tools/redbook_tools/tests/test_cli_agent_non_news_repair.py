@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from typer.testing import CliRunner
@@ -56,9 +57,11 @@ def adapter(monkeypatch, tmp_path):
 
 
 def digest(post_id, *, official=True):
+    day = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date().isoformat()
     return Post(id=post_id, title=f"Digest {post_id}", body=f"Concrete event {post_id}", platform={
         "ai_digest": {"items": [{"source_name": "Vendor", "source_type": "official",
                                   "title": "OpenAI新增Responses API语音接口",
+                                  "published_at": day,
                                   "summary": "OpenAI为Responses API新增语音输入输出接口，开发者可以在单次请求中处理音频。",
                                   "url": f"https://vendor.example/{post_id}"}],
                       "source_meta": {"selected_official_count": int(official)}}})
@@ -135,6 +138,18 @@ def test_replacement_preserves_existing_platform_target_without_false_receipt(ad
     assert target.get("xhs", {}).get("title") == "Original platform title"
     assert "xhs_draft" not in posts[-1].platform
     assert not posts[-1].uploaded
+
+
+def test_digest_repair_passes_its_ancestor_to_history_filter(adapter, monkeypatch):
+    tools, _, context = adapter
+    old, fresh = digest("old", official=False), digest("fresh")
+    old.uploaded = True
+    received = []
+    monkeypatch.setattr(cli, "create_daily_ai_digest_posts", lambda **kw: received.append(kw) or [fresh])
+    monkeypatch.setattr(cli, "_run_auto_quality_gate", lambda *a, **kw: [])
+    result = tools.review(AgentJob("daily_ai_digest", "AI"), [old], context)
+    assert result["approved_post_ids"] == [fresh.id]
+    assert received[0].get("replacing_post") == old
 
 
 def test_upload_replacement_updates_existing_draft_without_creating_duplicate(adapter, monkeypatch):
@@ -410,3 +425,20 @@ def test_actual_core_uploads_only_approved_replacement_and_keeps_other_job(adapt
     checkpoint = agent.load_agent_checkpoint(result.checkpoint_path)
     assert checkpoint["job_states"]["1"]["post_ids"] == ["old", "fresh"]
     assert checkpoint["job_states"]["1"]["reviewed_post_ids"] == ["fresh"]
+
+
+def test_replacement_upload_passes_new_images_to_existing_draft(adapter, monkeypatch):
+    from src.publish.delivery_state import DeliveryStateStore
+    from src.storage.models import Execution
+
+    tools, _, context = adapter
+    post = digest("revision-images")
+    post.platform["agent_draft_replacement"] = {"xhs": {"title": "Old title", "post_id": "ancestor"}}
+    monkeypatch.setattr(cli, "DeliveryStateStore", lambda: DeliveryStateStore.in_memory())
+    paths = ["new-cover.png", "new-current-card.png"]
+    monkeypatch.setattr(cli, "_resolve_asset_paths", lambda *a: paths)
+    received = []
+    monkeypatch.setattr(cli, "run_update_draft_sync", lambda post, **kw:
+        received.append(kw) or Execution(post_id=post.id, result="saved_draft"))
+    assert tools.upload(AgentJob("daily_ai_digest", "AI"), post, context)[0]
+    assert received[0]["image_paths"] == paths

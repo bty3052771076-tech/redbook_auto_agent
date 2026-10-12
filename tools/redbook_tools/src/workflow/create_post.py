@@ -58,6 +58,7 @@ from src.images.auto_image import (
     is_auto_image_enabled,
 )
 from src.llm.generate import generate_draft, generate_json
+from src.publish.draft_delivery import content_revision_fingerprint, has_current_draft_receipt
 from src.news.length_policy import (
     assess_news_length, news_length_instruction, news_length_rewrite_instruction,
 )
@@ -5804,7 +5805,43 @@ def _ai_digest_source_cap_error(
     return ""
 
 
-def _uploaded_ai_digest_history_keys() -> set[str]:
+def _uploaded_ai_digest_history_keys(*, replacing_post: Post | None = None) -> set[str]:
+    posts = list_posts()
+    by_id = {post.id: post for post in posts}
+    if replacing_post is not None:
+        by_id[replacing_post.id] = replacing_post
+
+    def draft_lineage(post: Post) -> set[str]:
+        ids: set[str] = set()
+        while post.id not in ids:
+            published = post.status == PostStatus.published or any(
+                key.endswith("_publication") and isinstance(value, dict)
+                and value.get("visibility", value.get("observed_visibility")) in {"public", "private"}
+                for key, value in post.platform.items()
+            )
+            if published:
+                break
+            ids.add(post.id)
+            link = post.platform.get("agent_item_replacement")
+            if not isinstance(link, dict) or link.get("job_kind") != "daily_ai_digest":
+                break
+            old = by_id.get(str(link.get("replaces_post_id") or ""))
+            if old is None or link.get("replaces_version") != content_revision_fingerprint(old):
+                break
+            post = old
+        return ids
+
+    excluded = draft_lineage(replacing_post) if replacing_post is not None else set()
+    # Only a receipt for the current revision at the ancestor's destination
+    # proves that superseded content is no longer in the platform draft.
+    for post in posts:
+        destination = (post.platform.get("agent_draft_replacement") or {}).get("xhs")
+        if not isinstance(destination, dict) or not has_current_draft_receipt(post, platform="xhs"):
+            continue
+        ancestors = draft_lineage(post) - {post.id}
+        if destination.get("post_id") in ancestors:
+            excluded.update(ancestors)
+
     def created_on_beijing_date(post: Post, target_date: str) -> bool:
         # ``updated_at`` is excluded so re-saving an older digest does not
         # make it count as a same-day regeneration.
@@ -5834,7 +5871,9 @@ def _uploaded_ai_digest_history_keys() -> set[str]:
     }
     today = datetime.now(timezone.utc).astimezone(BEIJING_TZ).strftime("%Y-%m-%d")
     keys: set[str] = set()
-    for post in list_posts():
+    for post in posts:
+        if post.id in excluded:
+            continue
         if not (post.uploaded or post.status in {PostStatus.saved_draft, PostStatus.published}):
             continue
         if skip_today and created_on_beijing_date(post, today):
@@ -6533,6 +6572,7 @@ def create_daily_ai_digest_posts(
     performance_mode: str | None = None,
     generation_pipeline_version: str = "legacy",
     stage_context: Any = None,
+    replacing_post: Post | None = None,
 ) -> list[Post]:
     if generation_pipeline_version not in {"legacy", "staged_v2"}:
         raise ValueError("unsupported generation_pipeline_version")
@@ -6591,7 +6631,7 @@ def create_daily_ai_digest_posts(
     prompt_search_queries = _ai_digest_prompt_search_queries(prompt_hint)
     if progress is not None and prompt_search_queries:
         progress("prompt_topics", f"requested={len(prompt_search_queries)} targeted_search_backfill")
-    historical_keys = _uploaded_ai_digest_history_keys()
+    historical_keys = _uploaded_ai_digest_history_keys(replacing_post=replacing_post)
     adaptive_selection_meta: dict[str, Any] = {}
     impact_meta: dict[str, Any] = {}
     llm_configs_cache = None

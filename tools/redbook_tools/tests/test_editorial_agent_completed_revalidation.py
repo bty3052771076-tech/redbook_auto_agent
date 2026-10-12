@@ -16,6 +16,24 @@ class Post:
     title: str = 'original'
 
 
+def test_retained_approved_but_undelivered_job_is_revalidated(tmp_path):
+    old, updated = Post('ai'), Post('ai', 'updated evidence')
+    observed = []
+    state = {'run_id': 'retained', 'jobs': [agent.AgentJob('daily_ai_digest', 'AI').__dict__],
+             'job_index': 0, 'completed_job_indices': [], 'errors': [],
+             'job_states': {'0': {'status': 'blocked', 'posts': [old], 'post_ids': ['ai'],
+                                 'review_complete': True, 'reviewed_post_ids': ['ai'],
+                                 'approved_versions': {'ai': 'old'}}}}
+    tools = agent.EditorialAgentTools(lambda j: {}, lambda j,c: [], lambda *a: [], lambda *a: (True, 'saved'),
+        load_posts=lambda ids: [updated],
+        revalidate_completed=lambda j, posts, c: observed.append(posts[0].title) or ['stale source'])
+    result = agent._revalidate_completed_jobs(state, tools, None)
+    assert observed == ['updated evidence']
+    assert result['review_complete'] is False
+    assert result['job_states']['0']['reviewed_post_ids'] == []
+    assert result['job_states']['0']['status'] == 'pending'
+
+
 @pytest.fixture(params=['json', 'postgres'])
 def harness(request, tmp_path, monkeypatch):
     saver = InMemorySaver()

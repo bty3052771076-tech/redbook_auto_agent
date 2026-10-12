@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from typing import Literal
 from uuid import uuid4
@@ -118,19 +119,22 @@ app.state.service = None
 app.state.recognitions = None
 app.state.review_schema_ready = False
 recognition_call = call_model
+_service_lock = Lock()
 
 
 def service() -> Workbench:
     if app.state.service is None:
-        store = KnowledgeStore.from_env()
-        if store.status().get("status") != "ready":
-            from src.agent.capabilities.models import CapabilityError
-            raise CapabilityError('POSTGRES_UNAVAILABLE', 'PostgreSQL 暂不可用，操作未完成',
-                status=503, next_action='检查 E 盘数据库服务和连接配置，恢复连接后重试')
-        if not app.state.review_schema_ready:
-            ensure_review_schema()
-            app.state.review_schema_ready = True
-        app.state.service = Workbench(root=RUNTIME)
+        with _service_lock:
+            if app.state.service is None:
+                store = KnowledgeStore.from_env()
+                if store.status().get("status") != "ready":
+                    from src.agent.capabilities.models import CapabilityError
+                    raise CapabilityError('POSTGRES_UNAVAILABLE', 'PostgreSQL 暂不可用，操作未完成',
+                        status=503, next_action='检查 E 盘数据库服务和连接配置，恢复连接后重试')
+                if not app.state.review_schema_ready:
+                    ensure_review_schema()
+                    app.state.review_schema_ready = True
+                app.state.service = Workbench(root=RUNTIME)
     return app.state.service
 
 
@@ -258,8 +262,12 @@ def conversation(conversation_id: str):
     current = service()
     result = current.get_agent_conversation(valid_conversation_id(conversation_id))
     plans = PlanService(current)
-    result['plans'] = [plans.describe(plan) if plan.get('plan_kind') != 'draft_management' else plan
-                       for plan in result.get('plans', [])]
+    if any(plan.get('plan_kind') != 'draft_management' for plan in result.get('plans', [])):
+        catalog = {model['id']: model for model in current.models()['rows']}
+        fingerprint = plans.configuration_fingerprint()
+        result['plans'] = [plans.describe(plan, catalog=catalog, fingerprint=fingerprint)
+                          if plan.get('plan_kind') != 'draft_management' else plan
+                          for plan in result['plans']]
     return result
 
 

@@ -2111,6 +2111,8 @@ def _daily_wow_source_issues(posts: list[Post]) -> list[str]:
 
 def _agent_ai_digest_review_issues(post: Post, *, min_official: int) -> list[str]:
     from src.ai_digest.generate import stored_ai_digest_review_issues
+    from src.ai_digest.models import AIUpdateItem
+    from src.workflow.content_evidence import ai_digest_items_in_beijing_window
 
     digest = post.platform.get("ai_digest") if isinstance(post.platform, dict) else None
     if not isinstance(digest, dict):
@@ -2124,6 +2126,18 @@ def _agent_ai_digest_review_issues(post: Post, *, min_official: int) -> list[str
         if isinstance(source_meta, dict) else 0
     )
     issues = stored_ai_digest_review_issues(digest)
+    try:
+        parsed_items = [AIUpdateItem.model_validate(item) for item in items]
+        now = datetime.now(timezone.utc)
+        day = now.astimezone(timezone(timedelta(hours=8))).date().isoformat()
+        current, date_meta = ai_digest_items_in_beijing_window(parsed_items, publication_date=day, now=now)
+        if len(current) != len(parsed_items):
+            issues.append(
+                f"AI_DIGEST_SOURCE_EXPIRED: 最终资讯必须位于北京时间 {date_meta['earliest_date']}..{day}；"
+                f"当前仅 {len(current)}/{len(parsed_items)} 条符合日期要求，请修正过期或日期未核实的条目"
+            )
+    except (ValueError, TypeError):
+        issues.append("AI_DIGEST_SOURCE_EXPIRED: 最终资讯的日期或条目结构无法核验")
     if int(official_count or 0) < min_official:
         issues.append(
             f"每日AI讯息官网原始信源不足：最终仅 {official_count} 条，需要至少 {min_official} 条；"
@@ -4105,6 +4119,7 @@ def editorial_agent_command(
                 evaluation_viewpoint=job.evaluation_viewpoint,
                 lookback_days=job.lookback_days,
                 performance_mode=policy.mode,
+                replacing_post=replacing,
             )
         elif job.kind == "daily_wow":
             posts = create_daily_news_posts(
@@ -4514,7 +4529,8 @@ def editorial_agent_command(
                     }
                     if destination is not None:
                         execution = run_update_draft_sync(
-                            post, existing_title=str(destination["title"]), draft_type="image", **runner_kwargs,
+                            post, existing_title=str(destination["title"]), draft_type="image",
+                            image_paths=resolved_assets or None, **runner_kwargs,
                         )
                     else:
                         runner = run_save_draft_sync if target == "xhs" else run_save_toutiao_draft_sync

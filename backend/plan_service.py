@@ -65,9 +65,9 @@ class PlanService:
                      XHS_CDP_URL='',TOUTIAO_CDP_URL='',TOUTIAO_AUTO_ATTACH_CDP='0')
         return value
 
-    def describe(self, plan):
-        result = self.validate_models(plan)
-        result['configuration_fingerprint'] = self.configuration_fingerprint()
+    def describe(self, plan, *, catalog=None, fingerprint=None):
+        result = self.validate_models(plan, catalog=catalog)
+        result['configuration_fingerprint'] = self.configuration_fingerprint() if fingerprint is None else fingerprint
         return result
 
     def _receipt(self, saved, key, request_hash):
@@ -93,9 +93,10 @@ class PlanService:
             raise PlanContractError('PLAN_NOT_EDITABLE', '草稿管理继续使用原有确认流程')
         return normalize_plan(plan)
 
-    def validate_models(self, plan):
+    def validate_models(self, plan, *, catalog=None):
         plan = normalize_plan(plan)
-        catalog = {m['id']: m for m in self.current.models()['rows']}
+        if catalog is None:
+            catalog = {m['id']: m for m in self.current.models()['rows']}
         for role, ref in plan['model_roles'].items():
             if not ref:
                 continue
