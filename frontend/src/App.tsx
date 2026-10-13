@@ -244,6 +244,11 @@ function App() {
     } catch (cause) { fail(cause); } finally { setBusy(false); }
   }
 
+  async function refreshModelConfiguration() {
+    await load();
+    if (conversation) await openConversation(conversation.id);
+  }
+
   async function openProfile() {
     setBusy(true); setError("");
     try {
@@ -303,6 +308,7 @@ function App() {
               {conversation && planSubmitted && <CopyPlan key={plan.id} conversation={conversation} plan={plan}
                 disabled={busy || planEditing || capabilityPending} onSaved={()=>openConversation(conversation.id)} />}
               {conversation && <PlanModels conversationId={conversation.id} plan={plan} models={modelRows}
+                defaultRoles={roles} onDefaultsChanged={refreshModelConfiguration}
                 disabled={busy || planSubmitted || calibrationPending || planEditing} onChanged={updated => {
                   setPlan(updated); void openConversation(conversation.id);
                 }} />}
@@ -346,7 +352,7 @@ function App() {
           </> : <div className="empty-detail"><ClipboardList size={30} /><h2>选择一条草稿</h2><p>查看正文、图片和平台回读状态。</p></div>}</section>
         </div>}
         {ready && page === "runs" && <main className="standard-page"><div className="page-heading"><div><h1>运行记录</h1><p>查看每项任务的状态、耗时和错误原因。</p></div><button className="quiet-button" onClick={() => load().catch(fail)}><RefreshCw size={16} />刷新</button></div><div className="run-table"><div className="run-table-head"><span>任务</span><span>状态</span><span>开始时间</span><span>详细信息</span></div>{runs.map((item) => <button className="run-table-row" key={item.id} onClick={async () => { try { setActiveRun(await api<Run>(`/api/runs/${item.id}`)); setRunConnectionError(""); } catch (cause) { fail(cause); } }}><strong>{item.title || item.id}</strong><span className={["completed", "success"].includes(item.status) ? "status-good" : "status-amber"}>{item.status_label || "状态待读取"}</span><span>{niceDate(item.created_at)}</span><span>{item.display_message || "查看进度详情"}</span></button>)}{!runs.length && <p className="muted empty-list">尚无运行记录。</p>}</div>{activeRun && <div className="run-detail"><h2>任务详情</h2><RunProgress run={activeRun} connectionError={runConnectionError} onRefresh={refreshRun} />{activeRun.local_post_ids?.length ? <div className="run-draft-links"><strong>本地生成草稿，仍需人工审查</strong>{activeRun.local_post_ids.map((id) => <button className="quiet-button" key={id} onClick={() => showRunDraft(id)}>查看草稿 {id.slice(0, 8)}<ChevronRight size={14} /></button>)}</div> : null}<TechnicalLog run={activeRun} /></div>}</main>}
-        {ready && page === "connections" && <main className="standard-page connections-page"><div className="page-heading"><div><h1>连接与模型</h1><p>主控、写稿和生图分别选择；更改仅影响之后的新任务。</p></div></div><section className="db-line"><Database size={20} /><div><strong>PostgreSQL 与知识库</strong><p>{connections?.database.status === "ready" ? `连接正常 · 文档 ${connections.database.documents ?? 0} 条 · 已索引 ${connections.database.indexed_documents ?? 0} 条` : connections?.database.error || "未连接"}</p></div><button className="quiet-button" onClick={() => load().catch(fail)}><RefreshCw size={16} />检查连接</button></section><ModelPlatforms call={api} legacyModels={modelRows} onChanged={load} /><section className="db-line"><div><strong>小红书创作者中心</strong><p>{connections?.profile_configured ? "专用 profile 已配置" : "专用 profile 未配置"}</p></div><button className="quiet-button" onClick={openProfile} disabled={busy}>打开专用浏览器</button></section></main>}
+        {ready && page === "connections" && <main className="standard-page connections-page"><div className="page-heading"><div><h1>连接与模型</h1><p>主控、写稿和生图分别选择；更改仅影响之后的新任务。</p></div></div><section className="db-line"><Database size={20} /><div><strong>PostgreSQL 与知识库</strong><p>{connections?.database.status === "ready" ? `连接正常 · 文档 ${connections.database.documents ?? 0} 条 · 已索引 ${connections.database.indexed_documents ?? 0} 条` : connections?.database.error || "未连接"}</p></div><button className="quiet-button" onClick={() => load().catch(fail)}><RefreshCw size={16} />检查连接</button></section><ModelPlatforms call={api} legacyModels={modelRows} defaultRoles={roles} onChanged={refreshModelConfiguration} /><section className="db-line"><div><strong>小红书创作者中心</strong><p>{connections?.profile_configured ? "专用 profile 已配置" : "专用 profile 未配置"}</p></div><button className="quiet-button" onClick={openProfile} disabled={busy}>打开专用浏览器</button></section></main>}
       </div>
     </div>
   );

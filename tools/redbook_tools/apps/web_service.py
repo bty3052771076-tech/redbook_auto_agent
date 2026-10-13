@@ -368,13 +368,25 @@ class Workbench:
         from src.workflow.vision_review import image_score_required
 
         score_required = image_score_required(self.environment())
-        score_choices = list(re.finditer(
-            r"(?:关闭|禁用|取消|开启|启用)(?:图片|配图)(?:评分|分数)(?:硬门槛|硬要求|门槛|要求)?"
-            r"|(?:图片|配图)(?:评分|分数)(?:只供参考|仅供参考|不作硬门槛|不作为硬要求)",
-            cleaned,
-        ))
-        if score_choices:
-            score_required = score_choices[-1].group().startswith(("开启", "启用"))
+        image_subject = r"(?:图片|配图|图像|生图)\s*(?:的\s*)?(?:(?:进行|设置)\s*)?"
+        gate = r"(?:硬门槛|硬要求|硬限制|门槛|要求|限制|达标)"
+        score_subject = image_subject + rf"(?:(?:评分|分数|打分)\s*(?:的\s*)?(?:{gate})?|{gate})"
+        negation = r"(?:不要|不需要|无需|不用|不必|不)"
+        score_policy = (
+            rf"(?P<negation>{negation})?\s*(?P<action>关闭|禁用|取消|开启|启用|打开|恢复|强制)\s*{score_subject}"
+            rf"|{negation}\s*(?:对\s*)?{score_subject}"
+            rf"|{image_subject}(?:(?:评分|分数|打分)\s*(?:的\s*)?)?(?:{gate})?\s*"
+            rf"(?:只(?:供|做|作)参考|仅(?:供|做|作)参考|不(?:作|作为)(?:{gate}))"
+            rf"|{score_subject}\s*(?P<required>必须满足|必须达标|必须通过|需要达标)"
+        )
+        # The last explicit instruction wins; negating "disable" means enable.
+        for choice in re.finditer(score_policy, cleaned):
+            if choice['action']:
+                score_required = choice['action'] in {"开启", "启用", "打开", "恢复", "强制"}
+                if choice['negation']:
+                    score_required = not score_required
+            else:
+                score_required = bool(choice['required'])
         from src.agent.task_intent import enrich_local_plan
 
         return enrich_local_plan({
@@ -393,7 +405,7 @@ class Workbench:
                 + ("只生成本地稿，不上传平台。" if delivery == "generate_only" else "完成后保存到草稿箱。")
                 + ("图片评分硬门槛开启。" if score_required else "图片评分仅供参考，不因低分重画或补位。")
             ) if jobs else "请明确要生成的栏目，例如“生成1篇每日AI讯息”或“生成3条每日新闻并保存到小红书草稿”。",
-        }, cleaned)
+        }, re.sub(score_policy, "", cleaned))
 
     def append_agent_message(self, conversation_id: str, text: str) -> dict:
         conversation = self._read_agent_conversation(valid_conversation_id(conversation_id))

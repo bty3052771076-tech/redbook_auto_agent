@@ -122,6 +122,56 @@ def test_agent_request_passes_advisory_policy_to_cli(tmp_path, workbench_factory
     assert env['MINIMAX_ALLOW_PAYGO'] == '0' and env['MINIMAX_ALLOW_PAID_CREDITS'] == '0'
 
 
+@pytest.mark.parametrize('instruction,want', [
+    ('图片门槛只做参考', False),
+    ('不需要对图片进行评分硬门槛', False),
+    ('图片评分只做参考', False),
+    ('图片的评分硬门槛仅作参考', False),
+    ('配图分数不作为硬门槛', False),
+    ('无需对配图设置评分硬门槛', False),
+    ('不要强制图片评分达标', False),
+    ('关闭图片硬门槛', False),
+    ('不启用图片评分硬门槛', False),
+    ('不要关闭图片评分硬门槛', True),
+    ('图片评分仅供参考，随后启用图片评分硬门槛', True),
+    ('启用图片评分硬门槛，最后图片门槛只做参考', False),
+    ('图片评分硬门槛必须满足', True),
+])
+def test_local_score_policy_understands_natural_instructions(tmp_path, workbench_factory, instruction, want):
+    service = workbench_factory(tmp_path)
+    plan = service.append_agent_message(
+        service.create_agent_conversation()['id'], '生成1条每日新闻，' + instruction,
+    )['plan']
+    assert plan['recognition_source'] == 'rules'
+    assert plan['image_score_required'] is want
+    _, env = service.plan({'kind': 'agent', 'image_score_required': plan['image_score_required']}, 'e' * 32)
+    assert env['AUTO_VLM_SCORE_REQUIRED'] == ('1' if want else '0')
+
+
+@pytest.mark.parametrize('instruction,want', [
+    ('启用图片评分硬门槛', True),
+    ('不要禁用图片评分硬门槛', True),
+    ('图片门槛只做参考', False),
+    ('新闻关键词：图片产业', False),
+])
+def test_local_score_policy_can_override_advisory_default(tmp_path, workbench_factory, monkeypatch, instruction, want):
+    monkeypatch.setenv('AUTO_VLM_SCORE_REQUIRED', '0')
+    service = workbench_factory(tmp_path)
+    plan = service.append_agent_message(
+        service.create_agent_conversation()['id'], '生成1条每日新闻，' + instruction,
+    )['plan']
+    assert plan['image_score_required'] is want
+
+
+@pytest.mark.parametrize('instruction', ['图片门槛只做参考', '不需要对图片进行评分硬门槛', '启用图片评分硬门槛'])
+def test_score_instruction_is_not_a_news_search_keyword(tmp_path, workbench_factory, instruction):
+    service = workbench_factory(tmp_path)
+    plan = service.append_agent_message(
+        service.create_agent_conversation()['id'], '生成1条每日新闻，关键词：伊朗、关税，' + instruction,
+    )['plan']
+    assert plan['jobs'][0]['keywords'] == ['伊朗', '关税']
+
+
 def test_invalid_score_policy_is_not_coerced_from_string(tmp_path, workbench_factory):
     service = workbench_factory(tmp_path)
     with pytest.raises(ValueError, match='image_score_required'):

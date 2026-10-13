@@ -52,9 +52,10 @@ export function RolePicker({ label, value, choices, onChange, disabled = false }
   </div>;
 }
 
-export function ModelPlatforms({ call, legacyModels, onChanged }: {
+export function ModelPlatforms({ call, legacyModels, defaultRoles, onChanged }: {
   call: Call; legacyModels: { id: string; model: string; provider: string; provider_name?: string; kind: string;
     selectable: boolean; disabled_reason?: string; role_reasons?: Record<string, string> }[];
+  defaultRoles: Record<string, string>;
   onChanged: () => Promise<void> | void;
 }) {
   const [catalog, setCatalog] = useState<Catalog>({ revision: 0, connections: [], models: [], roles: {} });
@@ -63,16 +64,20 @@ export function ModelPlatforms({ call, legacyModels, onChanged }: {
   const [dialog, setDialog] = useState<"connection" | "model" | "authorization" | "credential" | null>(null);
   const [editingModel, setEditingModel] = useState("");
   const [form, setForm] = useState<Record<string, string>>({});
-  const [roles, setRoles] = useState<Record<string, string>>({});
+  const [roles, setRoles] = useState<Record<string, string>>(defaultRoles);
   const [rolesReady, setRolesReady] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(""), [notice, setNotice] = useState(""), [busy, setBusy] = useState(false);
   const [operation, setOperation] = useState<any>(null), [search, setSearch] = useState("");
   const modal = useRef<HTMLElement>(null), opener = useRef<HTMLElement | null>(null);
   const sequence = useRef(0);
   async function refresh() {
-    const [state, bindings] = await Promise.all([call("/api/model-platforms/models"), call("/api/model-platforms/roles")]);
-    setCatalog(state); setRoles(bindings.roles); setRolesReady(true);
-    setSelected(previous => state.connections.some((c: Connection) => c.connection_id === previous) ? previous : state.connections[0]?.connection_id || "");
+    setRefreshing(true); setRolesReady(false);
+    try {
+      const [state, bindings] = await Promise.all([call("/api/model-platforms/models"), call("/api/model-platforms/roles")]);
+      setCatalog(state); setRoles(bindings.roles); setRolesReady(true);
+      setSelected(previous => state.connections.some((c: Connection) => c.connection_id === previous) ? previous : state.connections[0]?.connection_id || "");
+    } finally { setRefreshing(false); }
   }
   useEffect(() => { Promise.all([refresh(), call("/api/model-platforms/presets").then(value => setPresets(value.presets))]).catch(e => setError(String(e))); }, []);
   useEffect(() => {
@@ -135,8 +140,9 @@ export function ModelPlatforms({ call, legacyModels, onChanged }: {
     if (preset) setForm({ ...preset, name: preset.id === "custom" ? "" : preset.name, vendor_preset: preset.id });
   }
   function modelChoices(role: Role): ModelChoice[] {
-    const legacy = legacyModels.filter(m => !m.id.startsWith("m_") && m.kind === (role === "image" ? "image" : "llm"))
-      .map(m => ({ id: m.id, model: m.model, label: `${m.provider_name || m.provider} · ${m.model}`, disabledReason: m.selectable ? "" : m.disabled_reason || "模型不可用" }));
+    const legacy = legacyModels.filter(m => !catalog.models.some(item => item.model_ref === m.id) && m.kind === (role === "image" ? "image" : "llm"))
+      .map(m => ({ id: m.id, model: m.model, label: `${m.provider_name || m.provider} · ${m.model}`,
+        disabledReason: m.role_reasons?.[role] ?? (m.selectable ? "" : m.disabled_reason || "模型不可用") }));
     const custom = role === "image" ? [] : catalog.models.map(m => ({ id: m.model_ref, model: m.upstream_model_id,
       label: `${m.connection_name} · ${m.name}`, disabledReason: m.eligible[role] }));
     return [...custom, ...legacy];
@@ -172,7 +178,11 @@ export function ModelPlatforms({ call, legacyModels, onChanged }: {
         <div className="mp-actions">{[["text", "测试文本"], ["structured", "测试结构化"], ["tools", "测试工具回环"]].map(([purpose, label]) => <button key={purpose} disabled={busy || checking || !m.enabled}
           onClick={() => start("/api/model-platforms/checks", { model_ref: m.model_ref, purpose })}><PlayIcon />{label}</button>)}</div></article>)}
       {!catalog.models.length && <p>暂无自定义模型</p>}</section>}
-    {tab === "roles" && <section className="mp-roles">{(["agent", "writer", "image"] as Role[]).map(role => <div className="mp-field" key={role}><span>{roleLabels[role]}</span>
+    {tab === "roles" && <section className="mp-roles"><div className="mp-actions"><button type="button"
+      title="重新读取默认角色" aria-label="重新读取默认角色" disabled={busy || checking || refreshing}
+      onClick={() => { setError(""); void refresh().catch(e => setError(String(e))); }}>
+      {refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}</button></div>
+      {(["agent", "writer", "image"] as Role[]).map(role => <div className="mp-field" key={role}><span>{roleLabels[role]}</span>
       <RolePicker label={roleLabels[role]} value={roles[role] || ""} choices={modelChoices(role)} disabled={busy || checking || !rolesReady}
         onChange={ref => mutate("/api/model-platforms/roles", "PUT", { [role]: ref }, "默认角色已保存")} /></div>)}</section>}
     {dialog && <div className="mp-backdrop"><section ref={modal} className="mp-dialog" role="dialog" aria-modal="true" aria-label={dialog === "connection" ? "添加供应商" : dialog === "model" ? "添加模型" : dialog === "credential" ? "替换凭据" : "费用授权"}>
