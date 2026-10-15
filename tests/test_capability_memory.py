@@ -114,7 +114,7 @@ def test_forget_during_compaction_rejects_stale_memory_snapshot(pair, monkeypatc
     assert current.conversation_store.active_snapshot(cid) is None
 
 
-def test_new_message_during_compaction_rejects_stale_summary_without_losing_messages(pair, monkeypatch):
+def test_new_message_during_compaction_keeps_prefix_summary_and_untouched_tail(pair, monkeypatch):
     from types import SimpleNamespace
     currents, cid, _ = pair
     current, other = currents
@@ -138,9 +138,9 @@ def test_new_message_during_compaction_rejects_stale_summary_without_losing_mess
 
     monkeypatch.setattr('src.agent.compaction.minimax_summary', summarize)
     result = current.compact_agent_conversation(cid, policy={'soft_threshold': 256, 'keep_recent': 1})
-    assert result['status'] == 'conflict'
+    assert result['status'] == 'compacted'
     assert len(calls) == 1
-    assert current.conversation_store.active_snapshot(cid) is None
+    assert current.conversation_store.active_snapshot(cid)['through_seq'] < len(before)
     after = current.conversation_store.context_messages(cid)
     assert after[:len(before)] == before
     assert after[-1]['id'] == new_id

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import time
-
 from src.agent.compaction import comparison_context, estimate_tokens
 
 from .models import CapabilityError, safe, digest
@@ -22,7 +20,10 @@ class ContextService:
 
     def policy(self, identity):
         row = self.store.get('policy:context:' + identity) or {}
-        return {key: row.get(key, value) for key, value in DEFAULT_POLICY.items()}, row.get('revision', 0)
+        defaults = dict(DEFAULT_POLICY)
+        if not row and self._conversation(identity).get('context_schema_version', 1) >= 2:
+            defaults['mode'] = 'auto'
+        return {key: row.get(key, value) for key, value in defaults.items()}, row.get('revision', 0)
 
     def overview(self, identity):
         conversation = self._conversation(identity)
@@ -51,13 +52,19 @@ class ContextService:
         actual_usage = {'requests': requests, 'history_incomplete': len(calls)>50,
                         'next_call_cursor': calls[49]['id'] if len(calls)>50 else None} if requests else None
         tokens = estimate_tokens(comparison_context(context.get('snapshot'), context.get('recent_messages', [])))
+        from src.agent.context_builder import model_budget
+        limits = {'max_output_tokens': 1024, 'soft_threshold': policy['soft_threshold']}
+        if model_selection.get('context_window'):
+            limits['context_window'] = model_selection['context_window']
+        budget = model_budget(limits)
         through = status.get('through_seq', 0)
         coverage = {'summary_through_seq': through,
                     'retained_sequences': [message['seq'] for message in context.get('recent_messages', [])]}
         return safe({**status, 'model': model_selection['model'], 'model_selection': model_selection, 'tokens_estimate': tokens,
                      'policy': policy, 'policy_revision': revision, 'snapshots': [dict(row) for row in rows],
                      'coverage': coverage, 'context': {**context, 'coverage': coverage},
-                     'actual_usage': actual_usage, 'threshold_exceeded': tokens > policy['soft_threshold']})
+                     'actual_usage': actual_usage, 'model_limits': limits, 'budget': budget,
+                     'usage_kind': 'estimated', 'threshold_exceeded': tokens > budget['trigger_tokens']})
 
     def model_selection(self, selected):
         from src.model_platforms.integration import legacy_controller
@@ -66,6 +73,8 @@ class ContextService:
             row = next((row for row in self.workbench.models().get('rows', []) if row['id']==selected), None)
             if row:
                 result.update(model=row.get('model', ''), provider=row.get('provider', ''), available=bool(row.get('available')))
+                if row.get('context_window'):
+                    result['context_window'] = row['context_window']
             return result
         provider, _, model = selected.partition(':')
         try:
@@ -94,43 +103,52 @@ class ContextService:
         return {'policy': {key: row[key] for key in DEFAULT_POLICY}, 'policy_revision': row['revision'],
                 'effective_scope': '下次明确压缩或确认执行时检查；不改变已冻结任务'}
 
+    def _compact(self, identity, policy):
+        from .context_usage import observe_context_requests
+        with observe_context_requests(self.store, identity, 'compaction'):
+            return self.workbench.compact_agent_conversation(identity, policy=policy)
+
     def compact(self, identity, key=''):
         self._conversation(identity)
         policy, revision = self.policy(identity)
-        return self.capabilities.operations.submit(
-            lambda: self.workbench.compact_agent_conversation(identity, policy=policy),
-            title='压缩对话上下文', key=key,
-            request={'conversation_id':identity,'policy_revision':revision,'policy':policy})
+        return self._submit(identity, policy, key=key, title='压缩对话上下文',
+                            request={'conversation_id':identity,'policy_revision':revision,'policy':policy})
 
-    def prepare(self, identity):
+    def _submit(self, identity, policy, *, key, title, request):
+        try:
+            operation = self.capabilities.operations.submit(
+                lambda: self._compact(identity, policy), title=title, key=key, request=request)
+        except CapabilityError as error:
+            if error.code != 'OPERATION_BUSY' or not key:
+                raise
+            return {'operation_id': digest([self.store.namespace, key]), 'status': 'queued',
+                    'registration_pending': True}
+        if (operation.get('error') or {}).get('code') == 'OPERATION_INTERRUPTED':
+            operation = self.capabilities.operations.submit(
+                lambda: self._compact(identity, policy), title=title,
+                key=key + ':retry:' + digest(operation['updated_at'])[:16], request=request)
+        return operation
+
+    def prepare(self, identity, *, goal_id=None, purpose='controller', model_limits=None, trigger_message_id=None):
         overview = self.overview(identity)
+        built = None
+        if model_limits is not None or 'model_limits' in overview:
+            from src.agent.context_builder import ContextBuilder
+            limits = {**(model_limits or overview.get('model_limits') or {}),
+                      'soft_threshold': overview['policy']['soft_threshold']}
+            built = ContextBuilder(self.workbench.conversation_store,
+                                   getattr(self.workbench, 'goal_store', None)).build(
+                identity, goal_id, purpose, limits, trigger_message_id)
+            overview['threshold_exceeded'] = built['status'] != 'ready'
+            if built['status'] == 'too_large':
+                return built
         if overview['policy']['mode'] != 'auto' or not overview['threshold_exceeded']:
-            return {'status': 'not_needed', 'policy': overview['policy']}
+            return {'status': 'not_needed', 'policy': overview['policy'], **({'context': built} if built else {})}
         request={'conversation_id':identity,'policy':overview['policy'],
                  'policy_revision':overview['policy_revision'],'coverage':overview['coverage']}
+        policy = overview['policy']
+        if built:
+            policy = {**policy, 'model_limits': limits}
+            request.update(model_limits=limits, purpose=purpose, goal_id=goal_id)
         key='auto-context:'+digest(request)
-        deadline=time.monotonic()+600
-        while True:
-            try:
-                operation=self.capabilities.operations.submit(
-                    lambda:self.workbench.compact_agent_conversation(identity,policy=overview['policy']),
-                    title='确认前压缩对话上下文',key=key,request=request)
-                break
-            except CapabilityError as exc:
-                if exc.code!='OPERATION_BUSY' or time.monotonic()>=deadline:raise
-                time.sleep(.05)
-        while operation['status'] in {'queued','running'}:
-            if time.monotonic()>=deadline:
-                raise CapabilityError('CONTEXT_COMPACTION_PENDING','压缩仍在运行，未启动内容任务；请稍后确认',
-                                      status=409,retryable=True)
-            time.sleep(.05)
-            operation=self.capabilities.operations.get(operation['operation_id'])
-        if operation['status']!='succeeded':
-            raise CapabilityError('CONTEXT_COMPACTION_FAILED',
-                                  (operation.get('error') or {}).get('message') or '压缩失败，请查看检测记录',
-                                  status=409,retryable=True)
-        result = operation['results']
-        if result.get('status') in {'blocked', 'conflict'}:
-            raise CapabilityError('CONTEXT_COMPACTION_' + result['status'].upper(),
-                                  result.get('error') or '上下文压缩未完成，请刷新或改用手动策略', status=409)
-        return result
+        return self._submit(identity, policy, key=key, title='确认前压缩对话上下文', request=request)

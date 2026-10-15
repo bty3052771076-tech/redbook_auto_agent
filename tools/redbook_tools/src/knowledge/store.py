@@ -18,7 +18,7 @@ from pgvector.psycopg import register_vector
 from .models import KnowledgeDocument
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _MODEL_ID = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 _CHUNK_VERSION = "char-token-320-overlap-48-v1"
 _POOL_LOCK = threading.Lock()
@@ -175,6 +175,8 @@ class KnowledgeStore:
                   PRIMARY KEY(conversation_id, version)
                 )
             """)
+            from src.agent.goal_store import ensure_goal_schema
+            ensure_goal_schema(conn)
             conn.execute("INSERT INTO knowledge.schema_migrations(version) VALUES (%s) ON CONFLICT DO NOTHING", (_SCHEMA_VERSION,))
             conn.execute("GRANT USAGE ON SCHEMA knowledge, agent TO redbook_app")
             conn.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA knowledge, agent TO redbook_app")

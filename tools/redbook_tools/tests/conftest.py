@@ -16,6 +16,7 @@ if AGENT_TESTS.is_file():
     spec = importlib.util.spec_from_file_location("_agent_test_postgresql", AGENT_TESTS)
     agent_tests = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(agent_tests)
+    pytest_configure = agent_tests.pytest_configure
     pytest_sessionstart = agent_tests.pytest_sessionstart
     pytest_sessionfinish = agent_tests.pytest_sessionfinish
 

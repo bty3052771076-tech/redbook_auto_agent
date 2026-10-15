@@ -2199,6 +2199,7 @@ def _load_agent_job_plan(job_plan_file: Path | str, lookback_days: object, evalu
             prompt=_repair_cli_text(str(item.get("prompt") or ""), field="prompt"),
             evaluation_viewpoint=str(item.get("evaluation_viewpoint") or evaluation_viewpoint),
             lookback_days=item.get("lookback_days", lookback_days),
+            job_id=str(item.get('job_id') or ''),
         ).normalized()
         for item in raw_jobs
         if isinstance(item, dict)
@@ -3752,6 +3753,8 @@ def editorial_agent_command(
     agent_lookback_days = _normalize_agent_lookback(lookback_days)
     agent_upload_enabled = True
     conversation_context: dict[str, object] = {}
+    goal_context: dict[str, object] = {}
+    revision_manifest: dict[str, object] = {}
     selected_skill_names = list(skill_name or [])
     frozen_skills: list[dict[str, str]] | None = None
     if job_plan_file:
@@ -3759,6 +3762,10 @@ def editorial_agent_command(
             jobs = _load_agent_job_plan(job_plan_file, agent_lookback_days, evaluation_viewpoint)
             plan_payload = json.loads(Path(job_plan_file).read_text(encoding="utf-8"))
             generation_pipeline_version = str(plan_payload.get("generation_pipeline_version", "legacy"))
+            goal_context = plan_payload.get('goal_context') or {}
+            revision_manifest = plan_payload.get('revision_manifest') or {}
+            if not isinstance(goal_context, dict) or not isinstance(revision_manifest, dict):
+                raise ValueError('goal context and revision manifest must be objects')
             raw_conversation_context = plan_payload.get("conversation_context") or {}
             if not isinstance(raw_conversation_context, dict):
                 raise ValueError("conversation_context must be an object")
@@ -4031,6 +4038,9 @@ def editorial_agent_command(
             str(context.get("agent_run_id") or run_id),
             str(context.get("agent_job_key") or ""), post, phase=phase,
         )
+        if goal_context and phase == 'generated':
+            from src.agent.conversation_control import ConversationControl
+            ConversationControl(goal_context).check_boundary('post_saved', post.id)
 
     def restore_artifacts(context: dict[str, object]) -> list[Post]:
         posts = artifact_store.load(
@@ -4437,9 +4447,7 @@ def editorial_agent_command(
             {"index": index, "kind": job.kind, "title": job.title, "count": job.count}
             for index, job in enumerate(planned_jobs)
         ]
-        result = generate_json(
-            cfg,
-            system_prompt=(
+        controller_system = (
                 "你是内容工作流的有限主控。只能返回 JSON，不能直接执行工具，不能改 API Key、日期窗口、"
                 "质量门槛、计费策略或上传并发。根据任务类型给出执行顺序和一句简短原因。"
                 "仅能从 preparation_tools 选择至多3个只读工具，由后端校验执行；没有适用工具时返回空数组。"
@@ -4448,19 +4456,43 @@ def editorial_agent_command(
                 "参数须符合工具schema；不得凭名称推断权限或执行脚本。"
                 "JSON 格式：{\"job_order\":[整数索引],\"summary\":\"不超过80字\","
                 "\"tool_calls\":[{\"tool_id\":\"允许的ID\",\"arguments\":{},\"reason\":\"选择原因\"}]}。"
-            ),
-            user_prompt=json.dumps(
-                {"jobs": payload, "preparation_tools":context.get('preparation_tools',[]),
+            )
+        request_payload = {"jobs": payload, "preparation_tools":context.get('preparation_tools',[]),
                  "tool_stage":context.get('tool_stage','preparation'), "artifacts":context.get('artifacts',[]),
                  "conversation_context":{**conversation_context,'skills':[
                      {key:value for key,value in skill.items() if key!='resources'}
                      for skill in conversation_context.get('skills',[])]},
-                 "policy": "已选主控供应商的免费/订阅额度；新闻类别为软偏好；平台上传串行"},
-                ensure_ascii=False,
-            ),
-            max_tokens=800,
-        )
-        return result
+                 "policy": "已选主控供应商的免费/订阅额度；新闻类别为软偏好；平台上传串行"}
+        if goal_context:
+            from src.agent.context_builder import prepare_model_context
+            from src.agent.conversation_store import PostgresConversationStore
+            from src.agent.goal_store import GoalStore
+            from src.agent.compaction import minimax_summary, invoke_with_compaction
+            from src.agent.capabilities.context_usage import model_request_format
+            limits = {'max_output_tokens': 800, 'system_instructions': controller_system,
+                      'provider': cfg.provider, 'model': cfg.model, 'request_format': model_request_format(cfg),
+                      'external_input': {'system_prompt': controller_system,
+                          'payload': {k: v for k, v in request_payload.items() if k != 'conversation_context'}}}
+            window = (getattr(cfg, 'platform_snapshot', None) or {}).get('context_window')
+            if window:
+                limits['context_window'] = window
+            context_store = PostgresConversationStore(namespace=goal_context['namespace'])
+            def prepare(*, emergency=False):
+                built = prepare_model_context(context_store, GoalStore(),
+                    goal_context['conversation_id'], goal_context['goal_id'], 'controller', limits,
+                    summarize=lambda item: minimax_summary(item, config=cfg),
+                    **({'force_compaction': True} if emergency else {}))
+                request_payload['conversation_context'] = built['envelope']
+                if built.get('compaction'):
+                    _emit_progress_event('agent', '整理上下文', built['compaction']['status'],
+                        f"snapshot={built['manifest']['snapshot_version']} tokens_estimate={built['tokens_estimate']}")
+                return {'saved': (built.get('compaction') or {}).get('saved', False),
+                        'can_continue': built['can_send']}
+            prepare()
+        def request():
+            return generate_json(cfg, system_prompt=controller_system,
+                                 user_prompt=json.dumps(request_payload, ensure_ascii=False), max_tokens=800)
+        return invoke_with_compaction(request, lambda: prepare(emergency=True)) if goal_context else request()
 
     def upload(job: AgentJob, post: Post, context: dict[str, object]) -> tuple[bool, str]:
         if job.kind == "daily_global_map":
@@ -4810,6 +4842,8 @@ def editorial_agent_command(
                 conversation_context=conversation_context,
                 capability_management=True,
                 generation_pipeline_version=generation_pipeline_version,
+                goal_context=goal_context,
+                revision_manifest=revision_manifest,
             ),
             progress=progress,
             run_id=run_id or None,

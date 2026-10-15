@@ -53,7 +53,7 @@ def apply_repair(artifact, patch: dict[str, Any], *, request: RepairRequest):
 def repair_scope(issue: str) -> str:
     if issue == "image_scene_unverified":
         return "scene"
-    if issue in {"comment_too_long", "incomplete_comment", "comment_multiple_sentences"}:
+    if issue in {"comment_too_long", "incomplete_comment", "comment_multiple_sentences", "comment_missing", "comment_generic"}:
         return "comment"
     return "text"
 
@@ -89,6 +89,11 @@ def repair_draft(draft: dict[str, Any], issue: str, *, source_prompt: str,
     if not isinstance(patch, dict) or not patch or set(patch)-set(allowed):
         raise ValueError("unauthorized repair fields")
     result = deepcopy(draft)
+    if issue == "comment_missing" and "comment" in patch and _section(result.get("body", ""), "评价") is None:
+        body = result.get("body", "")
+        tail = re.search(r"\n[ \t]*(?:日期|来源)[:：]", body)
+        offset = tail.start() if tail else len(body)
+        result["body"] = body[:offset].rstrip() + "\n\n评价：\n" + body[offset:]
     for key, value in patch.items():
         if not isinstance(value, str) or not value.strip():
             raise ValueError("invalid repair field value")

@@ -1,20 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Activity, Check, CheckCircle2, ChevronRight, CircleAlert, ClipboardList, Database, FileText, Image, LoaderCircle, Menu, MessageSquare, Play, Puzzle, RefreshCw, Send, Settings2, ShieldCheck, X } from "lucide-react";
+import { Activity, Check, CheckCircle2, ChevronRight, CircleAlert, ClipboardList, Database, FileText, Image, LoaderCircle, Menu, MessageSquare, Pause, Play, Puzzle, RefreshCw, Send, Settings2, ShieldCheck, Square, X } from "lucide-react";
 import {
   api, startSession, type Connections, type Conversation, type Draft, type DraftSummary,
-  type Model, type Plan, type Run,
+  type ContextOverview, type GoalSnapshot, type Model, type Plan, type Run, type TurnResponse,
 } from "./api";
-import { RunProgress, TechnicalLog, activeStatuses } from "./RunProgress";
+import { GoalProgress, RunProgress, TechnicalLog, TurnProgress, activeStatuses, pendingTurnStates } from "./RunProgress";
 import { WoolGallery } from "./WoolGallery";
 import { PlanJobs, TaskCalibration } from "./TaskCalibration";
 import { SourceDiagnostics } from "./SourceDiagnostics";
 import { ModelPlatforms } from "./ModelPlatforms";
 import { PlanModels } from "./PlanModels";
-import { PlanEditor } from './PlanEditor';
+import { ContinuationDiff, PlanEditor } from './PlanEditor';
 import { CopyPlan, PlanHistory } from './PlanHistory';
 import { CapabilityCenter } from "./capabilities/CapabilityCenter";
 import { PlanCapabilities, readPlanSelection } from "./capabilities/PlanCapabilities";
 import { guarded } from "./capabilities/shared";
+import { CompactionEvents } from "./capabilities/Memory";
 import "./source-diagnostics.css";
 
 type Page = "chat" | "drafts" | "runs" | "connections" | "wool" | "sources" | "capabilities";
@@ -60,6 +61,17 @@ function App() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [prompt, setPrompt] = useState("");
   const [plan, setPlan] = useState<Plan | null>(null);
+  const [selectedGoalId, setSelectedGoalId] = useState('');
+  const [contextOverview, setContextOverview] = useState<ContextOverview | null>(null);
+  const [continuityError, setContinuityError] = useState('');
+  const [statusBusy, setStatusBusy] = useState(false);
+  const goalSelection = useRef({ conversationId: '', goalId: '' });
+  const dismissedCandidates = useRef(new Set<string>());
+  const conversationRef = useRef(conversation);
+  conversationRef.current = conversation;
+  const messageInFlight = useRef(false), statusInFlight = useRef(false), confirmInFlight = useRef(false);
+  const messageRequest = useRef<{ signature: string; id: string; key: string } | null>(null);
+  const confirmRequest = useRef<{ signature: string; key: string } | null>(null);
   const [calibrationPending, setCalibrationPending] = useState(false);
   const [capabilityPending, setCapabilityPending] = useState(false);
   const [planEditing, setPlanEditing] = useState(false);
@@ -72,6 +84,57 @@ function App() {
   const [connections, setConnections] = useState<Connections | null>(null);
   const [roles, setRoles] = useState<Record<string, string>>({ agent: "", writer: "", image: "" });
   const selectionVersion = useRef(0);
+  const [selectionEpoch, setSelectionEpoch] = useState(0);
+  const goals = conversation?.goals || [];
+  const selectedGoal = goals.find(goal => goal.goal_id === selectedGoalId);
+  const hasContinuity = conversation?.goals !== undefined || conversation?.turns !== undefined;
+  const goalPending = (conversation?.turns || []).some(turn => turn.goal_id === selectedGoalId && pendingTurnStates.has(turn.state) && turn.kind !== 'status');
+
+  function receiveConversation(loaded: Conversation, explicitGoalId?: string) {
+    const sameConversation = conversationRef.current?.id === loaded.id;
+    const requested = explicitGoalId ?? (goalSelection.current.conversationId === loaded.id ? goalSelection.current.goalId : '');
+    const goalId = loaded.goals?.some(goal => goal.goal_id === requested) ? requested : loaded.goals?.length === 1 ? loaded.goals[0].goal_id : '';
+    goalSelection.current = { conversationId: loaded.id, goalId };
+    setSelectedGoalId(goalId);
+    const goal = loaded.goals?.find(item => item.goal_id === goalId);
+    const turn = loaded.turns?.filter(item => item.goal_id === goalId && item.proposal_plan_id
+      && ['awaiting_confirmation', 'accepted', 'queued', 'applying'].includes(item.state) && !dismissedCandidates.current.has(item.turn_id)).at(-1);
+    const candidate = turn && (loaded.plans.filter(item => item.continuation?.turn_id === turn.turn_id
+      && item.continuation.goal_id === goalId && item.status !== 'discarded').at(-1)
+      || loaded.plans.find(item => item.id === turn.proposal_plan_id));
+    const editable = loaded.plans.filter(item => {
+      if (item.continuation || item.job_id || item.execution_request_id || item.status === 'discarded') return false;
+      if (!goal) return true;
+      let parent: string | undefined = item.id;
+      const seen = new Set<string>();
+      while (parent && !seen.has(parent)) {
+        if (parent === goal.active_plan_id) return true;
+        seen.add(parent);
+        parent = loaded.plans.find(p => p.id === parent)?.parent_plan_id;
+      }
+      return false;
+    }).at(-1);
+    const current = candidate || editable || loaded.plans.find(item => item.id === goal?.active_plan_id) || goal?.plan || loaded.plans.filter(item => !item.continuation).at(-1);
+    setPlan(previous => current || (sameConversation ? previous : null));
+    if (!sameConversation) { setContextOverview(null); setContinuityError(''); }
+    conversationRef.current = loaded;
+    setConversation(loaded);
+  }
+
+  function receiveTurnResponse(cid: string, response: TurnResponse) {
+    const previous = conversationRef.current;
+    if (!previous || previous.id !== cid) return;
+    const messages = [...previous.messages];
+    for (const message of [response.message, response.assistant]) if (message && !messages.some(item => item.id === message.id)) messages.push(message);
+    const updated = { ...previous, messages, plans: [...previous.plans], runs: [...previous.runs] };
+    if (response.plan) updated.plans = [...updated.plans.filter(item => item.id !== response.plan!.id), response.plan];
+    if (response.goal) updated.goals = [...(updated.goals || []).filter(item => item.goal_id !== response.goal!.goal_id), response.goal];
+    if (response.turn) updated.turns = [...(updated.turns || []).filter(item => item.turn_id !== response.turn!.turn_id), response.turn];
+    if (response.run) { if (!updated.runs.includes(response.run.id)) updated.runs.push(response.run.id); setActiveRun(response.run); }
+    receiveConversation(updated, response.action === 'new_goal' ? response.goal?.goal_id : undefined);
+    // Nullable status/continue responses must not clear the plan already on screen.
+    if (response.plan) setPlan(response.plan);
+  }
   useEffect(() => {
     const listener = () => { if (location.hash.startsWith("#capabilities")) setPage("capabilities"); else if (location.hash === "#chat") setPage("chat"); };
     window.addEventListener("hashchange", listener);
@@ -116,33 +179,49 @@ function App() {
     }).catch(fail);
   }, [load]);
   useEffect(() => {
-    if (!activeRun || !activeStatuses.has(activeRun.status)) return;
-    const runId = activeRun.id;
+    if ((!activeRun || !activeStatuses.has(activeRun.status)) && !(hasContinuity && page === 'chat')) return;
+    const runId = activeRun?.id;
     const conversationId = conversation?.id;
+    const version = selectionVersion.current;
     let disposed = false;
     let timer: number;
     const poll = async () => {
       try {
-        const current = await api<Run>(`/api/runs/${runId}`);
+        const current = runId ? await api<Run>(`/api/runs/${runId}`) : null;
         if (disposed) return;
-        setActiveRun(current); setRunConnectionError("");
-        if (!activeStatuses.has(current.status)) {
+        if (version !== selectionVersion.current) return;
+        if (current) setActiveRun(current);
+        setRunConnectionError("");
+        if (hasContinuity && conversationId && page === 'chat') {
+          const updated = await api<Conversation>(`/api/conversations/${conversationId}`);
+          const goalRows = await api<{ rows: GoalSnapshot[] }>(`/api/conversations/${conversationId}/goals`);
+          if (disposed || version !== selectionVersion.current) return;
+          receiveConversation({ ...updated, goals: goalRows.rows }); setContinuityError('');
+          try {
+            const context = await api<ContextOverview>(`/api/conversations/${conversationId}/context`);
+            if (!disposed && version === selectionVersion.current) setContextOverview(context);
+          } catch (cause) { if (!disposed) setContinuityError(cause instanceof Error ? cause.message : String(cause)); }
+        }
+        if (current && !activeStatuses.has(current.status) && !hasContinuity) {
           await load();
           if (disposed) return;
           if (conversationId) {
             const updated = await api<Conversation>(`/api/conversations/${conversationId}`);
-            if (!disposed) setConversation(updated);
+            if (!disposed && version === selectionVersion.current) receiveConversation(updated);
           }
           return;
         }
       } catch (cause) {
-        if (!disposed) setRunConnectionError(cause instanceof Error ? cause.message : String(cause));
+        if (!disposed && version === selectionVersion.current) {
+          const message = cause instanceof Error ? cause.message : String(cause);
+          if (hasContinuity) setContinuityError(message); else setRunConnectionError(message);
+        }
       }
       if (!disposed) timer = window.setTimeout(poll, 2000);
     };
     timer = window.setTimeout(poll, 2000);
     return () => { disposed = true; window.clearTimeout(timer); };
-  }, [activeRun?.id, activeRun?.status, conversation?.id, load]);
+  }, [activeRun?.id, activeRun?.status, conversation?.id, hasContinuity, page, selectionEpoch, load]);
 
   async function refreshRun() {
     if (!activeRun) return;
@@ -157,24 +236,34 @@ function App() {
 
   async function createConversation() {
     selectionVersion.current++;
+    setSelectionEpoch(value => value + 1);
     setBusy(true); setError("");
     try {
       const created = await api<Conversation>("/api/conversations", "POST", { title: "新对话" });
-      setConversation(created); setPlan(null); setActiveRun(null); setRunConnectionError("");
+      receiveConversation(created); setPlan(null); setActiveRun(null); setRunConnectionError("");
       localStorage.setItem("agent-conversation", created.id); await load();
     } catch (cause) { fail(cause); } finally { setBusy(false); }
   }
 
   async function openConversation(id: string) {
     const version = ++selectionVersion.current;
+    setSelectionEpoch(value => value + 1);
     setError("");
     try {
-      const loaded = await api<Conversation>(`/api/conversations/${id}`);
+      let loaded = await api<Conversation>(`/api/conversations/${id}`);
       if (version !== selectionVersion.current) return;
-      const latest = loaded.runs.at(-1);
+      if (loaded.goals !== undefined || loaded.turns !== undefined) {
+        try {
+          const goalRows = await api<{ rows: GoalSnapshot[] }>(`/api/conversations/${id}/goals`);
+          loaded = { ...loaded, goals: goalRows.rows };
+        } catch (cause) { if (version === selectionVersion.current) setContinuityError(cause instanceof Error ? cause.message : String(cause)); }
+      }
+      const goalId = goalSelection.current.conversationId === id ? goalSelection.current.goalId : loaded.goals?.length === 1 ? loaded.goals[0].goal_id : '';
+      const goal = loaded.goals?.find(item => item.goal_id === goalId);
+      const latest = goal?.active_attempt_id || loaded.runs.at(-1);
       const run = latest ? await api<Run>(`/api/runs/${latest}`) : null;
       if (version !== selectionVersion.current) return;
-      setConversation(loaded); setPlan(loaded.plans.at(-1) || null);
+      receiveConversation(loaded);
       localStorage.setItem("agent-conversation", loaded.id); setRunConnectionError("");
       setActiveRun(run);
     } catch (cause) { if (version === selectionVersion.current) fail(cause); }
@@ -183,29 +272,64 @@ function App() {
   async function sendMessage(text?: string) {
     const content = (text ?? prompt).trim();
     if (!content) return;
-    if (activeRun && !activeRun.activity && content.length <= 160
+    const statusOnly = text === '查看当前任务进度';
+    if (statusOnly ? statusInFlight.current : messageInFlight.current) return;
+    if (!hasContinuity && activeRun && !activeRun.activity && content.length <= 160
       && !/生成|重做|重新|上传|发布|删除|停止|取消|恢复|执行|添加|修改/.test(content)
       && /进度|状态|到哪|哪一步|卡在|还要多久|用了多久|完成了|完成没|成功了|结束了|怎么样了/.test(content)) {
       await refreshRun(); if (!text) setPrompt(""); return;
     }
-    setBusy(true); setError("");
+    if (statusOnly) { statusInFlight.current = true; setStatusBusy(true); }
+    else { messageInFlight.current = true; setBusy(true); }
+    setError("");
+    const version = selectionVersion.current;
     try {
       let current = conversation;
       if (!current) current = await api<Conversation>("/api/conversations", "POST", { title: content.slice(0, 50) });
-      await api<{ plan: Plan | null }>(`/api/conversations/${current.id}/messages`, "POST", { content });
-      if (!text) setPrompt(""); await openConversation(current.id); await load();
-    } catch (cause) { fail(cause); } finally { setBusy(false); }
+      if (version !== selectionVersion.current) return;
+      if (!conversationRef.current) { receiveConversation(current); localStorage.setItem('agent-conversation', current.id); }
+      const goal = current.goals?.find(item => item.goal_id === goalSelection.current.goalId);
+      const payload = { content, goal_id: goal?.goal_id ?? null, expected_goal_revision: goal?.revision,
+        expected_attempt_id: goal?.active_attempt_id || undefined };
+      const signature = JSON.stringify({ cid: current.id, ...payload });
+      if (!statusOnly && (!messageRequest.current || messageRequest.current.signature !== signature)) messageRequest.current = { signature, id: crypto.randomUUID(), key: crypto.randomUUID() };
+      const request = statusOnly ? { id: crypto.randomUUID(), key: crypto.randomUUID() } : messageRequest.current!;
+      const result = await api<TurnResponse>(`/api/conversations/${current.id}/messages`, "POST", { ...payload, client_message_id: request.id }, request.key);
+      if (version !== selectionVersion.current) return;
+      receiveTurnResponse(current.id, result);
+      if (!statusOnly) messageRequest.current = null;
+      if (!text) setPrompt(previous => previous.trim() === content ? '' : previous);
+      // Refresh only reads server state; it never resubmits accepted commands.
+      if (!hasContinuity && !result.turn && !result.goal) await openConversation(current.id);
+      await load();
+    } catch (cause) { if (version === selectionVersion.current) fail(cause); }
+    finally { if (statusOnly) { statusInFlight.current = false; setStatusBusy(false); } else { messageInFlight.current = false; setBusy(false); } }
   }
 
   async function askProgress() {
-    if (activeRun && !activeRun.activity) { await refreshRun(); return; }
+    if (!hasContinuity && activeRun && !activeRun.activity) { await refreshRun(); return; }
     await sendMessage("查看当前任务进度");
   }
 
   async function confirmPlan() {
-    if (!conversation || !plan || !plan.executable || calibrationPending || capabilityPending || planEditing) return;
+    if (!conversation || !plan || !plan.executable || calibrationPending || capabilityPending || planEditing || confirmInFlight.current) return;
+    const continuation = plan.continuation;
+    const turn = conversation.turns?.find(item => item.turn_id === continuation?.turn_id);
+    if (continuation && (turn?.state !== 'awaiting_confirmation' || !plan.semantic_hash)) return;
+    confirmInFlight.current = true;
+    const version = selectionVersion.current;
     setBusy(true); setError("");
     try {
+      if (continuation) {
+        const body = { expected_goal_revision: continuation.expected_goal_revision, proposal_hash: plan.semantic_hash };
+        const signature = JSON.stringify({ cid: conversation.id, tid: continuation.turn_id, ...body });
+        if (confirmRequest.current?.signature !== signature) confirmRequest.current = { signature, key: crypto.randomUUID() };
+        const response = await api<TurnResponse>(`/api/conversations/${conversation.id}/turns/${continuation.turn_id}/confirm`, 'POST', body, confirmRequest.current.key);
+        if (version !== selectionVersion.current) return;
+        receiveTurnResponse(conversation.id, response);
+        setNotice(response.turn?.state === 'applied' ? '修改已应用。' : '修改已接收，等待当前操作结束后生效。');
+        return;
+      }
       const selection = await readPlanSelection(conversation.id, plan.id);
       const result = await api<Run>(`/api/plans/${plan.id}/confirm`, "POST", {
         conversation_id: conversation.id, version: plan.version, semantic_hash: plan.semantic_hash,
@@ -213,7 +337,22 @@ function App() {
       });
       setActiveRun(result); setNotice("任务已提交，当前进度将在对话中持续更新。");
       await load(); await openConversation(conversation.id);
-    } catch (cause) { fail(cause); } finally { setBusy(false); }
+    } catch (cause) { if (version === selectionVersion.current) fail(cause); }
+    finally { confirmInFlight.current = false; setBusy(false); }
+  }
+
+  async function discardCandidate() {
+    if (!conversation || !continuation) return;
+    const version = selectionVersion.current;
+    setBusy(true); setError('');
+    try {
+      const response = await api<TurnResponse>(`/api/conversations/${conversation.id}/turns/${continuation.turn_id}/discard`, 'POST', {});
+      if (version !== selectionVersion.current) return;
+      dismissedCandidates.current.add(continuation.turn_id);
+      receiveTurnResponse(conversation.id, response);
+      setNotice('已放弃候选，原计划和已有产物已保留。');
+    } catch (cause) { if (version === selectionVersion.current) fail(cause); }
+    finally { setBusy(false); }
   }
 
   async function openDraft(id: string) {
@@ -258,6 +397,9 @@ function App() {
   }
 
   const currentPlan = plan && conversation?.plans.find((item) => item.id === plan.id);
+  const continuation = plan?.continuation;
+  const candidateTurn = conversation?.turns?.find(turn => turn.turn_id === continuation?.turn_id);
+  const candidateLocked = Boolean(continuation && candidateTurn?.state !== 'awaiting_confirmation');
   const planSubmitted = Boolean(currentPlan?.job_id || currentPlan?.execution_request_id);
   const planRunning = Boolean(planSubmitted && activeRun &&
     [currentPlan?.job_id, currentPlan?.resume_job_id].includes(activeRun.id) && activeStatuses.has(activeRun.status));
@@ -292,39 +434,66 @@ function App() {
           <section className="chat-main">
             <div className="page-heading"><div><h1>任务对话</h1><p>说明栏目和数量，确认计划后执行。</p></div><button className="quiet-button" onClick={createConversation} disabled={busy}><MessageSquare size={16} />新对话</button></div>
             <div className="context-line"><span className="status-dot good" />已发布数据和知识库状态：{connections?.database.status === "ready" ? "数据库可用" : "待检查"}</div>
-            <div className="conversation-selector"><label htmlFor="conversation-select">当前对话</label><select id="conversation-select" value={conversation?.id || ""} onChange={(event) => { if (event.target.value) openConversation(event.target.value); else { setConversation(null); setPlan(null); setActiveRun(null); localStorage.removeItem("agent-conversation"); } }}><option value="">新任务</option>{conversations.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></div>
+            <div className="conversation-selector"><label htmlFor="conversation-select">当前对话</label><select id="conversation-select" value={conversation?.id || ""} onChange={(event) => { if (event.target.value) openConversation(event.target.value); else { selectionVersion.current++; setSelectionEpoch(v => v + 1); conversationRef.current = null; setConversation(null); setSelectedGoalId(''); setContextOverview(null); setPlan(null); setActiveRun(null); localStorage.removeItem("agent-conversation"); } }}><option value="">新任务</option>{conversations.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></div>
+            {hasContinuity && <section className="conversation-goals" aria-label="对话目标">
+              <div className="conversation-selector"><label htmlFor="goal-select">当前目标</label><select id="goal-select" value={selectedGoalId} disabled={planEditing} onChange={async event => {
+                if (!conversation) return;
+                const goalId = event.target.value, version = ++selectionVersion.current;
+                setSelectionEpoch(v => v + 1); receiveConversation(conversation, goalId); setActiveRun(null);
+                const goal = goals.find(row => row.goal_id === goalId);
+                if (goal?.active_attempt_id) try {
+                  const run = await api<Run>(`/api/runs/${goal.active_attempt_id}`);
+                  if (version === selectionVersion.current) setActiveRun(run);
+                } catch (cause) { if (version === selectionVersion.current) fail(cause); }
+              }}><option value="">{goals.length > 1 ? '请选择要继续的目标' : '未选择目标'}</option>{goals.map(goal => <option key={goal.goal_id} value={goal.goal_id}>{goal.jobs.map(job => job.title).join('、')} · {goal.target_date || goal.plan?.target_date || goal.goal_id.slice(0, 8)} · 修订 {goal.revision}</option>)}</select></div>
+              {selectedGoal && <><GoalProgress goal={selectedGoal} /><div className="goal-actions" role="group" aria-label="目标操作">
+                <button className="icon-button" title="继续目标" aria-label="继续目标" disabled={busy || goalPending || Boolean(continuation) || ['completed', 'cancelled'].includes(selectedGoal.state)} onClick={() => sendMessage('继续')}><Play size={17} /></button>
+                <button className="icon-button" title="暂停目标" aria-label="暂停目标" disabled={busy || goalPending || ['paused', 'completed', 'cancelled'].includes(selectedGoal.state)} onClick={() => sendMessage('暂停当前目标')}><Pause size={17} /></button>
+                <button className="icon-button" title="取消目标" aria-label="取消目标" disabled={busy || goalPending || ['completed', 'cancelled'].includes(selectedGoal.state)} onClick={() => sendMessage('取消当前目标')}><Square size={16} /></button>
+              </div></>}
+              {continuityError && <p className="calibration-error" role="status">状态连接中断，保留上次记录：{continuityError}</p>}
+            </section>}
             <div className="messages">{conversation?.messages.length ? conversation.messages.map((message) => <div key={message.id} className={`message ${message.role}`}><small>{message.role === "user" ? "你" : "智能体"} · {niceDate(message.created_at)}</small><p>{message.content}</p></div>) : <div className="empty-chat"><MessageSquare size={22} /><strong>开始一项采编任务</strong><span>输入自然语言要求，智能体先展示可确认的执行计划。</span></div>}
+              <TurnProgress turns={(conversation?.turns || []).filter(turn => !selectedGoalId || !turn.goal_id || turn.goal_id === selectedGoalId)} />
+              {conversation && <CompactionEvents overview={contextOverview} conversationId={conversation.id} compact />}
               {activeRun && conversation?.runs.includes(activeRun.id) && <div className="message assistant live-message"><small>智能体 · 运行播报</small><RunProgress run={activeRun} connectionError={runConnectionError} onRefresh={refreshRun} /><TechnicalLog run={activeRun} /></div>}
             </div>
-            <div className="composer"><label htmlFor="prompt">任务要求</label><textarea id="prompt" rows={3} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="例如：生成5条每日新闻，关键词：伊朗、关税、芯片；保存到小红书草稿箱" onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); sendMessage(); } }} /><div className="composer-actions">{activeRun ? <button className="text-button" disabled={busy} onClick={askProgress}><RefreshCw size={14} />询问进度</button> : <span>新任务生成前确认计划</span>}<button className="primary-button" disabled={busy || !prompt.trim()} onClick={() => sendMessage()}><Send size={16} />发送</button></div></div>
+            <div className="composer"><label htmlFor="prompt">任务要求</label><textarea id="prompt" rows={3} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="例如：生成5条每日新闻，关键词：伊朗、关税、芯片；保存到小红书草稿箱" onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); sendMessage(); } }} /><div className="composer-actions">{activeRun || hasContinuity ? <button className="text-button" title="询问进度" disabled={statusBusy} onClick={askProgress}><RefreshCw size={14} />询问进度</button> : <span>新任务生成前确认计划</span>}<button className="primary-button" disabled={busy || !prompt.trim()} onClick={() => sendMessage()}><Send size={16} />发送</button></div></div>
           </section>
           <aside className="plan-pane">
-            <div className="pane-heading"><h2>本次计划</h2><span className="status-amber">{plan ? planRunning ? "执行中" : planSubmitted ? "已执行" : plan.executable ? "待确认" : "需补充" : "等待输入"}</span></div>
+            <div className="pane-heading"><h2>本次计划</h2><span className="status-amber">{continuation ? candidateLocked ? '待生效' : '修改待确认' : plan ? planRunning ? "执行中" : planSubmitted ? "已执行" : plan.executable ? "待确认" : "需补充" : "等待输入"}</span></div>
             {plan ? <>
-              {conversation && <PlanEditor conversation={conversation} plan={plan} models={modelRows}
+              {continuation && conversation && <section className="continuation-proposal" aria-label="剩余任务修改">
+                <ContinuationDiff plan={plan} />
+                <div className="calibration-actions"><PlanEditor conversation={conversation} plan={plan} models={modelRows} disabled={busy || candidateLocked} onSaved={() => openConversation(conversation.id)} onPending={setPlanEditing} />
+                  <button className="quiet-button" disabled={busy || candidateLocked || planEditing} onClick={() => void discardCandidate()}><X size={15} />放弃候选</button>
+                  <button className="primary-button" disabled={busy || calibrationPending || planEditing || !plan.executable || !plan.semantic_hash || candidateLocked} onClick={confirmPlan}><Check size={16} />确认修改并继续</button>
+                </div>
+              </section>}
+              {conversation && !continuation && <PlanEditor conversation={conversation} plan={plan} models={modelRows}
                 disabled={busy || planSubmitted} onSaved={() => openConversation(conversation.id)} onPending={setPlanEditing} />}
-              {conversation && <PlanHistory conversation={conversation} plan={plan}
+              {conversation && !continuation && <PlanHistory conversation={conversation} plan={plan}
                 disabled={busy || planSubmitted || planEditing || capabilityPending} onSaved={() => openConversation(conversation.id)} />}
-              {conversation && planSubmitted && <CopyPlan key={plan.id} conversation={conversation} plan={plan}
+              {conversation && !continuation && planSubmitted && <CopyPlan key={plan.id} conversation={conversation} plan={plan}
                 disabled={busy || planEditing || capabilityPending} onSaved={()=>openConversation(conversation.id)} />}
               {conversation && <PlanModels conversationId={conversation.id} plan={plan} models={modelRows}
                 defaultRoles={roles} onDefaultsChanged={refreshModelConfiguration}
-                disabled={busy || planSubmitted || calibrationPending || planEditing} onChanged={updated => {
+                disabled={busy || Boolean(continuation) || planSubmitted || calibrationPending || planEditing} onChanged={updated => {
                   setPlan(updated); void openConversation(conversation.id);
                 }} />}
               {conversation && <TaskCalibration key={`calibration:${conversation.id}:${plan.id}`} conversation={conversation} plan={plan} models={modelRows}
-                disabled={busy || planSubmitted || Boolean(activeRun && activeStatuses.has(activeRun.status))}
+                disabled={busy || candidateLocked || planSubmitted || (!continuation && Boolean(activeRun && activeStatuses.has(activeRun.status)))}
                 onPendingChange={setCalibrationPending} onEditing={setPlanEditing} onAdopt={() => openConversation(conversation.id)} />}
               <h3 className="current-plan-heading">当前计划</h3>
               <PlanJobs jobs={plan.jobs} />
               {conversation && <PlanCapabilities key={`capabilities:${conversation.id}:${plan.id}`} conversationId={conversation.id} plan={plan}
                 runId={planSubmitted ? currentPlan?.resume_job_id || currentPlan?.job_id : undefined}
-                disabled={busy || planSubmitted || calibrationPending} onPending={setCapabilityPending} onChanged={updated => {
+                disabled={busy || Boolean(continuation) || planSubmitted || calibrationPending} onPending={setCapabilityPending} onChanged={updated => {
                   setPlan(updated); void openConversation(conversation.id);
                 }} />}
               {!!plan.unresolved_requirements?.length && <ul className="calibration-issues">{plan.unresolved_requirements.map((item, index) => <li key={index}>{item}</li>)}</ul>}
               <div className="plan-boundary"><h3>执行边界</h3><p>交付：{plan.delivery === "generate_only" ? "仅生成本地稿" : "保存至草稿箱"}</p><p>平台：{plan.platform === "xhs" ? "小红书" : plan.platform}</p><p>运行模式：{plan.performance_mode === "speed" ? "速度优先" : "速度与稳定平衡"}</p><p>公开发布：本次不执行</p></div>
-              <button className="primary-button full" disabled={busy || calibrationPending || capabilityPending || planEditing || !plan.executable || planSubmitted} onClick={confirmPlan}><Play size={16} />{planRunning ? "正在执行" : planSubmitted ? "计划已执行" : "确认并执行"}</button>
+              {!continuation && <button className="primary-button full" disabled={busy || calibrationPending || capabilityPending || planEditing || !plan.executable || planSubmitted} onClick={confirmPlan}><Play size={16} />{planRunning ? "正在执行" : planSubmitted ? "计划已执行" : "确认并执行"}</button>}
             </> : <p className="muted">输入任务后，这里会显示栏目、数量和交付方式。</p>}
             {activeRun && <div className="run-inline"><strong>最近一次运行</strong><RunProgress run={activeRun} compact connectionError={runConnectionError} /><button className="text-button" onClick={() => setPage("runs")}>查看运行记录 <ChevronRight size={14} /></button></div>}
           </aside>

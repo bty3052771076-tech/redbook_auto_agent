@@ -169,12 +169,13 @@ class PlatformStore:
             raise PlatformError('CREDENTIAL_CHANGED', '凭据值已变化，请在连接管理替换凭据后重新授权和测试；不复用旧账户授权')
 
     def add_model(self, data, revision):
-        if set(data) - {'connection_id', 'upstream_model_id', 'name', 'enabled', 'parameters', 'origin'}:
+        if set(data) - {'connection_id', 'upstream_model_id', 'name', 'enabled', 'parameters', 'origin', 'context_window'}:
             raise PlatformError('INVALID_MODEL', '模型字段无效')
         identity = data.get('upstream_model_id')
         if not isinstance(identity, str) or not identity or len(identity) > 512 or any(ord(c) < 33 for c in identity):
             raise PlatformError('INVALID_MODEL', '请输入原生模型 ID，不能包含空白或控制字符')
         params = self._parameters(data.get('parameters') or {})
+        context_window = self._context_window(data.get('context_window'))
         def add(state):
             self._find(state, 'connections', data['connection_id'])
             if any(row['connection_id'] == data['connection_id'] and row['upstream_model_id'] == identity for row in state['models']):
@@ -182,10 +183,17 @@ class PlatformStore:
             row = {'model_ref': 'm_' + uuid4().hex, 'connection_id': data['connection_id'], 'upstream_model_id': identity,
                    'name': str(data.get('name') or identity)[:120], 'enabled': data.get('enabled') is True,
                    'origin': data.get('origin', 'manual'), 'revision': 1, 'parameters': params,
+                   'context_window': context_window,
                    'capabilities': {}, 'catalog_missing': False, 'favorite': False}
             state['models'].append(row)
             return row
         return self._mutate(revision, add)
+
+    @staticmethod
+    def _context_window(value):
+        if value is not None and (type(value) is not int or not 4096 <= value <= 4000000):
+            raise PlatformError('INVALID_CONTEXT_WINDOW', '上下文窗口必须为4096至4000000的整数或null（未知）')
+        return value
 
     @staticmethod
     def _parameters(params):
@@ -203,8 +211,10 @@ class PlatformStore:
         return params
 
     def edit_model(self, identity, data, revision):
-        if set(data) - {'enabled', 'favorite', 'name', 'parameters'}:
-            raise PlatformError('INVALID_MODEL', '只支持修改启用、收藏、展示名和参数')
+        if set(data) - {'enabled', 'favorite', 'name', 'parameters', 'context_window'}:
+            raise PlatformError('INVALID_MODEL', '只支持修改启用、收藏、展示名、参数和上下文窗口')
+        if 'context_window' in data:
+            self._context_window(data['context_window'])
         def update(state):
             row = self._find(state, 'models', identity)
             if any(key in data and type(data[key]) is not bool for key in ('enabled', 'favorite')):
@@ -261,7 +271,8 @@ class PlatformStore:
                 'base_url': connection['base_url'], 'paths': connection['paths'], 'network': connection['network'],
                 'auth_mode': connection['auth_mode'], 'credential_ref': connection['credential_ref'],
                 'credential_revision': connection['credential_revision'], 'authorization': connection['authorization'],
-                'billing': connection['billing'], 'parameters': model['parameters'], 'concurrency': connection['concurrency'],
+                'billing': connection['billing'], 'parameters': model['parameters'], 'context_window': model.get('context_window'),
+                'concurrency': connection['concurrency'],
                 'rate_limit_group': connection['rate_limit_group'], 'proxy_mode': connection['proxy_mode'], 'fallbacks': []}
 
     @staticmethod
@@ -401,5 +412,6 @@ class PlatformStore:
                     reasons[role] = ''
                 except PlatformError as exc:
                     reasons[role] = str(exc)
-            rows.append(dict(model, connection_name=conn['name'], billing=conn['billing'], eligible=reasons))
+            rows.append(dict(model, context_window=model.get('context_window'),
+                             connection_name=conn['name'], billing=conn['billing'], eligible=reasons))
         return {'revision': state['revision'], 'connections': state['connections'], 'models': rows, 'roles': state['roles'], 'namespace': self.namespace}

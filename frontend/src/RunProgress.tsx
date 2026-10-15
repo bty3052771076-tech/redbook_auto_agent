@@ -1,8 +1,37 @@
 import { useEffect, useState } from "react";
 import { CheckCircle2, CircleAlert, Clock3, LoaderCircle, RefreshCw } from "lucide-react";
-import type { Run } from "./api";
+import type { ConversationTurn, GoalSnapshot, Run } from "./api";
 
 export const activeStatuses = new Set(["queued", "running", "waiting_user", "stopping"]);
+export const pendingTurnStates = new Set(["accepted", "queued", "applying"]);
+const turnLabels = { accepted: '已接收', awaiting_confirmation: '待确认', queued: '待生效', applying: '正在应用', applied: '已应用', needs_input: '需补充', interrupted: '已中断' };
+const actionLabels = { continue_goal: '继续目标', status: '查询进度', pause_goal: '暂停目标', cancel_goal: '取消目标', clarify: '选择目标或补充要求', new_goal: '新目标', amend_goal: '修改剩余任务' };
+
+export function GoalProgress({ goal }: { goal: GoalSnapshot }) {
+  const local = goal.plan?.delivery === 'generate_only';
+  return <section className="goal-progress" aria-label="目标实际进度">
+    <div className="goal-heading"><strong>{goal.target_date || goal.plan?.target_date || '当前目标'}</strong><span>修订 {goal.revision} · 账本 {goal.ledger_revision}</span></div>
+    <ul>{goal.jobs.map(job => <li key={job.job_id}><strong>{job.title}</strong><span>{local ? '已完成' : '已交付'} {local ? job.approved_current : job.delivered_verified} / {job.requested}</span>
+      <p>已审查 {job.approved_current} · {local ? '保留可复用' : '待上传'} {job.retained_ready} · 剩余 {job.remaining} · 需新生成 {job.new_generation_needed} · 结果待核验 {job.uncertain}</p></li>)}</ul>
+  </section>;
+}
+
+export function TurnProgress({ turns }: { turns: ConversationTurn[] }) {
+  if (!turns.length) return null;
+  return <section className="turn-progress" aria-label="对话指令状态" aria-live="polite">{turns.map(turn => {
+    const Icon = turn.state === 'applied' ? CheckCircle2 : ['needs_input', 'interrupted'].includes(turn.state) ? CircleAlert : Clock3;
+    const revision = turn.result?.revision ?? turn.result?.goal_revision;
+    const at = turn.result?.applied_at;
+    return <div key={turn.turn_id} data-state={turn.state}><Icon size={15} /><div><strong>{actionLabels[turn.kind] || turn.kind} · {turnLabels[turn.state] || turn.state}</strong>
+      {turn.state === 'accepted' && <p>请求已收到，尚未生效</p>}
+      {turn.state === 'queued' && <p>等待当前操作结束，尚未生效</p>}
+      {turn.state === 'applying' && <p>正在安全边界应用，尚未确认完成</p>}
+      {turn.state === 'needs_input' && <p>请选择目标或补充要求</p>}
+      {turn.state === 'interrupted' && <p>未确认生效，请核对当前目标状态</p>}
+      {turn.state === 'applied' && <p>{revision !== undefined && `生效修订 ${revision}`}{typeof at === 'number' || typeof at === 'string' ? ` · ${new Date(typeof at === 'number' ? at * 1000 : at).toLocaleString('zh-CN', { hour12: false })}` : ''}</p>}
+    </div></div>;
+  })}</section>;
+}
 const jobLabels: Record<string, string> = { pending: "待开始", running: "进行中", completed: "已交付", failed: "未完成", partial: "部分完成", not_completed: "未完成" };
 const statusLabels: Record<string, string> = { queued: "等待启动", running: "执行中", waiting_user: "等待处理", stopping: "正在停止", completed: "执行完成", success: "执行完成", partial_success: "部分完成", failed: "执行失败", interrupted: "运行中断", cancelled: "已取消" };
 const stageLabels: Record<string, string> = { sync_context: "同步账号与知识库", plan: "规划任务", generate: "生成内容与配图", review: "审查内容与配图", upload_batch: "保存平台草稿", upload: "保存平台草稿", recover: "处理异常", finish: "汇总结果" };

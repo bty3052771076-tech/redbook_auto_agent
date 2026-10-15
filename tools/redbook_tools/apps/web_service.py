@@ -215,6 +215,7 @@ class Workbench:
         now = time.time()
         conversation = {
             "id": conversation_id,
+            'context_schema_version': 2 if isinstance(self.conversation_store, PostgresConversationStore) else 1,
             "title": str(title or "新对话").strip()[:120] or "新对话",
             "created_at": now,
             "updated_at": now,
@@ -407,8 +408,16 @@ class Workbench:
             ) if jobs else "请明确要生成的栏目，例如“生成1篇每日AI讯息”或“生成3条每日新闻并保存到小红书草稿”。",
         }, re.sub(score_policy, "", cleaned))
 
-    def append_agent_message(self, conversation_id: str, text: str) -> dict:
+    def append_agent_message(self, conversation_id: str, text: str, *, message_id: str | None = None, plan_id: str | None = None) -> dict:
         conversation = self._read_agent_conversation(valid_conversation_id(conversation_id))
+        if message_id:
+            previous = next((p for p in conversation['plans'] if p.get('source_message_id') == message_id), None)
+            if previous:
+                message = next(m for m in conversation['messages'] if m['id'] == message_id)
+                if message.get('content') != str(text).strip():
+                    raise ValueError('REQUEST_KEY_CONFLICT: 同一消息身份不能用于不同内容')
+                assistant = next(m for m in conversation['messages'] if m.get('plan_id') == previous['id'])
+                return {'message': message, 'assistant': assistant, 'plan': previous}
         if not str(text or "").strip() or len(str(text)) > 10000:
             raise ValueError("请输入不超过10000字的任务要求")
         try:
@@ -420,9 +429,9 @@ class Workbench:
                 "assistant_summary": str(exc), "parse_error": str(exc),
             }
         now = time.time()
-        message_id = uuid.uuid4().hex
+        message_id = message_id or uuid.uuid4().hex
         conversation["messages"].append({"id": message_id, "role": "user", "content": str(text).strip(), "created_at": now})
-        plan_id = uuid.uuid4().hex
+        plan_id = plan_id or uuid.uuid4().hex
         plan = {"id": plan_id, "version": len(conversation["plans"]) + 1, "created_at": now, "source_message_id": message_id, "status": "ready" if plan_data["executable"] else "needs_input", **plan_data}
         if plan.get('plan_kind') != 'draft_management':
             from src.agent.plan_contract import normalize_plan, digest
@@ -735,6 +744,13 @@ class Workbench:
         run_id = valid_id(run_id)
         if run_id not in conversation.get("runs", []):
             raise ValueError("该智能体运行不属于当前会话")
+        reserved = uuid.uuid5(uuid.NAMESPACE_URL, conversation_id + ':' + key).hex
+        cached = next((j for j in self.jobs.values() if j.get('key') == key), None)
+        cached = cached or read_json(self.directory / 'jobs' / (reserved + '.json'), {})
+        if cached:
+            if cached.get('key') != key or cached.get('kind') != 'agent' or cached.get('resume_of') != run_id:
+                raise ValueError('同一幂等标识不能用于不同任务')
+            return self.redact(cached)
         previous = self.jobs.get(run_id) or read_json(self.directory / "jobs" / f"{run_id}.json", {})
         if not previous or previous.get("kind") != "agent":
             raise ValueError("智能体运行记录不存在")
@@ -791,6 +807,33 @@ class Workbench:
         if frozen:
             request.update({key:deepcopy(frozen[key]) for key in ('host_environment','model_runtime','capability_namespace')})
             request['host_environment']['AGENT_REQUIRE_FROZEN_CAPABILITIES'] = '1'
+            if frozen.get('goal_context'):
+                from src.agent.goal_store import GoalStore
+                request['reserved_job_id'] = reserved
+                goal = frozen['goal_context']
+                if goal['namespace'] != self.conversation_store.namespace:
+                    raise ValueError('GOAL_NAMESPACE_CONFLICT')
+                goals = GoalStore(self.conversation_store.knowledge_store)
+                state = goals.snapshot(goal['namespace'], goal['goal_id'])
+                if state['conversation_id'] != conversation_id:
+                    raise ValueError('GOAL_NAMESPACE_CONFLICT')
+                if any(t['goal_id'] == goal['goal_id'] and t['command_payload'].get('kind') == 'amend_goal'
+                       and t['state'] in {'awaiting_confirmation', 'needs_input', 'queued', 'applying', 'interrupted'}
+                       for t in goals.turns(goal['namespace'], conversation_id)):
+                    raise ValueError('GOAL_PENDING_AMENDMENT: 请先处理候选修改，不会恢复旧版')
+                from datetime import datetime, timedelta, timezone
+                today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+                if state.get('target_date') != today:
+                    command = next((t for t in goals.turns(goal['namespace'], conversation_id)
+                                    if key == 'turn-' + t['turn_id'] and t['state'] == 'applying'
+                                    and t['goal_id'] == goal['goal_id']), None)
+                    if not command or command['command_payload'].get('confirmed_target_date') != state.get('target_date'):
+                        raise ValueError('GOAL_DATE_CONFIRMATION_REQUIRED: 请先确认原目标日期和时效影响')
+                if state['state'] == 'cancelled':
+                    raise ValueError('GOAL_CANCELLED')
+                self.assert_idle()
+                goals.bind_attempt(goal['namespace'], goal['goal_id'],
+                    request['reserved_job_id'], expected_attempt_id=run_id, expected_revision=goal['goal_revision'])
         job = self.submit(request, key)
         if previous.get("agent_run_id") != agent_run_id:
             previous["agent_run_id"] = agent_run_id
@@ -1139,7 +1182,8 @@ class Workbench:
                          "model": model["upstream_model_id"], "kind": "llm", "remaining": None, "total": None, "used": None,
                          "unit": "费用已授权，金额未验证", "cost_class": "explicit_authorization", "quota_pool": "",
                          "status": "verified" if not reason else "unverified", "selectable": not reason, "disabled_reason": reason,
-                         "role_reasons": model["eligible"], "snapshot_at": 0, "expires_at": ""})
+                         "role_reasons": model["eligible"], "context_window": model.get('context_window'),
+                         "snapshot_at": 0, "expires_at": ""})
         return {"rows": rows, "snapshots": snapshots, "provider_labels": labels}
 
     def sources(self) -> dict:
@@ -1275,6 +1319,8 @@ class Workbench:
     def plan(self, request: dict, job_id: str) -> tuple[list[str], dict]:
         kind = request.get("kind")
         env = self.environment()
+        if kind == 'agent':
+            env['AGENT_WEB_ATTEMPT_ID'] = job_id
         if kind in {"agent", "auto", "material", "ai-digest", "wool", "daily-wool", "global-map"}:
             if kind == 'agent' and request.get('model_runtime') is not None:
                 from src.model_platforms.integration import resume_model_environment

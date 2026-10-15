@@ -126,7 +126,7 @@ export function TaskCalibration({ conversation, plan, models, disabled, onAdopt,
     warning.code === 'ANNOTATION_UNVERIFIED' ? '来源标注待核对，可展开查看并对照原始指令编辑计划' : warning.message) || [])];
   return <section className="task-calibration" aria-label="任务识别校准">
     <div className="calibration-toolbar"><small>识别来源：{plan.recognition_source === "llm" ? "大模型校准" : "本地规则"}{plan.last_editor === 'user' ? ' · 已人工修改' : ''}</small>
-      <button ref={button} className="quiet-button" disabled={disabled || pending} onClick={calibrate} title={disabled ? "执行中的任务不能校准，请等待完成" : "使用智能体主控模型重新识别这条指令"}>
+      <button ref={button} className="quiet-button" disabled={disabled || pending} onClick={calibrate} title={disabled ? "当前计划暂不可校准" : plan.continuation ? "校准剩余任务要求，不确认执行" : "使用智能体主控模型重新识别这条指令"}>
         {sending || record?.status === "running" ? <LoaderCircle size={15} className="spin" /> : <BrainCircuit size={15} />}
         {sending || record?.status === "running" ? "校准中" : "大模型校准"}
       </button>

@@ -119,3 +119,33 @@ def test_context_api_displays_resolved_compaction_model_without_sending_request(
     assert response.json()['model'] == 'next-model'
     assert response.json()['model_selection']['source'] == 'current_binding'
     assert response.json()['actual_usage'] is None
+
+
+@pytest.mark.parametrize('managed_model', [False, True])
+def test_manual_calibration_records_actual_sent_request_and_input_usage(store, monkeypatch, managed_model):
+    import httpx
+    from backend.task_recognition import call_model
+    from src.agent.capabilities.context_usage import observe_context_requests
+    from src.model_platforms import integration
+
+    response = SimpleNamespace(content='{"summary":"校准结果"}',
+        usage_metadata={'input_tokens': 41, 'output_tokens': 12, 'total_tokens': 53})
+    monkeypatch.setattr(integration, 'invoke', lambda *a, **kw: response)
+    client = httpx.Client
+    monkeypatch.setattr(httpx, 'Client', lambda **kw: client(**kw, transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={
+            'choices': [{'message': {'content': response.content}, 'finish_reason': 'stop'}],
+            'usage': {'prompt_tokens': 41, 'completion_tokens': 12, 'total_tokens': 53}}))))
+    cfg = LLMConfig(provider='minimax', model='calibration-model', api_key='private-calibration-key',
+        base_url='http://127.0.0.1', platform_snapshot={'role': 'agent'} if managed_model else None)
+    with observe_context_requests(store, 'calibration-conversation', 'route_amendment'):
+        assert call_model(cfg, {'user_message': '剩余内容改为科技'}) == response.content
+    calls = store.calls()['rows']
+    assert len(calls) == 1
+    requests = calls[0].get('context_requests') or []
+    assert len(requests) == 1
+    assert requests[0]['actual_tokens'] == {'input_tokens': 41, 'output_tokens': 12, 'total_tokens': 53}
+    assert requests[0]['status'] == 'response_received'
+    assert requests[0]['model_role'] == 'agent'
+    assert 'private-calibration-key' not in json.dumps(calls)
+    assert '剩余内容改为科技' not in json.dumps(calls, ensure_ascii=False)

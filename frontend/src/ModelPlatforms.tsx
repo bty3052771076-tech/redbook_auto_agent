@@ -7,7 +7,7 @@ type Role = "agent" | "writer" | "image";
 type Connection = { connection_id: string; name: string; adapter: string; base_url: string; network: string; auth_mode: string;
   credential_ref: string; billing: string; enabled: boolean; authorization: { expires_at: number; max_requests: number } | null };
 type Entry = { model_ref: string; connection_id: string; connection_name: string; upstream_model_id: string; name: string; parameters: Record<string, string | number>;
-  enabled: boolean; favorite: boolean; origin: string; catalog_missing: boolean; billing: string;
+  enabled: boolean; favorite: boolean; origin: string; catalog_missing: boolean; billing: string; context_window?: number | null;
   capabilities: Record<string, { tested_at: number }>; eligible: Record<string, string> };
 type Catalog = { revision: number; connections: Connection[]; models: Entry[]; roles: Record<string, string> };
 type Preset = { id: string; name: string; adapter: string; base_url: string; network: string; auth_mode: string };
@@ -170,7 +170,9 @@ export function ModelPlatforms({ call, legacyModels, defaultRoles, onChanged }: 
         <div className="mp-heading"><div><h3>{m.name}</h3><p>{m.connection_name} · {m.origin === "manual" ? "手动录入" : "接口发现"}</p><code>{m.upstream_model_id}</code></div>
           <div className="mp-icon-actions"><button aria-label={`复制 ${m.upstream_model_id}`} title="复制模型 ID" onClick={() => navigator.clipboard.writeText(m.upstream_model_id).catch(e => setError(String(e)))}><Copy size={16} /></button>
             <button aria-label={`编辑 ${m.name} 参数`} title="编辑模型参数后需重新验证" onClick={() => {
-              open("model"); setEditingModel(m.model_ref); setForm({ name: m.name, ...Object.fromEntries(Object.entries(m.parameters).map(([k, v]) => [k, String(v)])) });
+              open("model"); setEditingModel(m.model_ref); setForm({ name: m.name,
+                ...Object.fromEntries(Object.entries(m.parameters).map(([k, v]) => [k, String(v)])),
+                context_window: m.context_window == null ? "" : String(m.context_window) });
             }}><Settings2 size={16} /></button>
             <button aria-label={`收藏 ${m.name}`} title="收藏" aria-pressed={m.favorite} disabled={busy} onClick={() => mutate(`/api/model-platforms/models/${m.model_ref}`, "PATCH", { favorite: !m.favorite })}><Star size={16} fill={m.favorite ? "currentColor" : "none"} /></button></div></div>
         <label className="mp-checkbox"><input type="checkbox" checked={m.enabled} disabled={busy} onChange={e => mutate(`/api/model-platforms/models/${m.model_ref}`, "PATCH", { enabled: e.target.checked })} />启用模型</label>
@@ -207,18 +209,23 @@ export function ModelPlatforms({ call, legacyModels, defaultRoles, onChanged }: 
           paths: { ...(form.generate_path ? { generate: form.generate_path } : {}), ...(form.models_path ? { models: form.models_path } : {}) },
         })}><Save size={16} />保存连接</button></footer></>}
       {dialog === "model" && <>{editingModel ? <code>{catalog.models.find(m => m.model_ref === editingModel)?.upstream_model_id}</code> : field("upstream_model_id", "原生模型 ID")}{field("name", "模型展示名（可选）")}
+        <label className="mp-field"><span>上下文窗口（token，可选）</span><input name="context_window" type="number" min={4096} max={4000000} step={1}
+          placeholder="未知" value={form.context_window ?? ""} onChange={e => setForm(previous => ({ ...previous, context_window: e.target.value }))} /></label>
         <details><summary>生成参数</summary>{field("max_output_tokens", "输出 token 上限", "number")}{field("temperature", "temperature（可选）", "number")}{field("top_p", "top_p（可选）", "number")}
           <label className="mp-field"><span>token 参数</span><select aria-label="token 参数" value={form.token_parameter || "max_tokens"} onChange={e => setForm({ ...form, token_parameter: e.target.value })}><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></select></label>
           <label className="mp-field"><span>推理强度</span><select aria-label="推理强度" value={form.reasoning_effort || ""} onChange={e => setForm({ ...form, reasoning_effort: e.target.value })}><option value="">不发送</option>{["none", "minimal", "low", "medium", "high", "xhigh"].map(v => <option value={v} key={v}>{v}</option>)}</select></label>
         </details>
         <footer className="mp-actions"><button onClick={close} disabled={busy}>取消</button><button disabled={busy} onClick={() => {
+          const contextInput = modal.current?.querySelector<HTMLInputElement>('input[name="context_window"]');
+          if (contextInput && !contextInput.reportValidity()) return;
+          const context_window = form.context_window ? Number(form.context_window) : null;
           const parameters = { token_parameter: form.token_parameter || "max_tokens",
             ...Object.fromEntries(["max_output_tokens", "temperature", "top_p"].filter(k => form[k] !== undefined && form[k] !== "").map(k => [k, Number(form[k])])),
             ...(form.reasoning_effort ? { reasoning_effort: form.reasoning_effort } : {}),
           };
           mutate(editingModel ? `/api/model-platforms/models/${editingModel}` : "/api/model-platforms/models", editingModel ? "PATCH" : "POST", editingModel ? {
-            name: form.name || catalog.models.find(m => m.model_ref === editingModel)?.name, parameters,
-          } : { connection_id: selected, upstream_model_id: form.upstream_model_id || "", name: form.name || "", enabled: true, parameters });
+            name: form.name || catalog.models.find(m => m.model_ref === editingModel)?.name, parameters, context_window,
+          } : { connection_id: selected, upstream_model_id: form.upstream_model_id || "", name: form.name || "", enabled: true, parameters, context_window });
         }}><Save size={16} />保存模型</button></footer></>}
       {dialog === "credential" && <>{field("api_key", "替换 API Key", "password")}{field("credential_env", "或使用环境变量名称")}
         <footer className="mp-actions"><button disabled={busy} onClick={() => { if (window.confirm("清除凭据会使模型停止执行，确认清除？")) mutate(`/api/model-platforms/connections/${selected}/credential`, "DELETE", {}); }}>清除凭据</button>

@@ -15,7 +15,7 @@ _SNAPSHOT_FIELDS = {
     'schema_version', 'namespace', 'role', 'purpose', 'model_ref', 'model_revision', 'upstream_model_id',
     'model_name', 'connection_revision', 'connection_id', 'connection_name', 'adapter_version', 'adapter',
     'base_url', 'paths', 'network', 'auth_mode', 'credential_ref', 'credential_revision', 'authorization',
-    'billing', 'parameters', 'concurrency', 'rate_limit_group', 'proxy_mode', 'fallbacks',
+    'billing', 'parameters', 'concurrency', 'rate_limit_group', 'proxy_mode', 'fallbacks', 'context_window',
 }
 
 

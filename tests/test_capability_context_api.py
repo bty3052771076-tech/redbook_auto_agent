@@ -23,7 +23,7 @@ def test_context_read_reports_actual_range_without_model_calls(context_client,mo
     response=client.get('/api/conversations/'+cid+'/context')
     assert response.status_code==200,response.text
     data=response.json()
-    assert data['policy']=={'mode':'manual','soft_threshold':12000,'keep_recent':16}
+    assert data['policy']=={'mode':'auto','soft_threshold':12000,'keep_recent':16}
     assert data['context']['recent_messages'][0]['content']=='生成10条每日新闻，不上传'
     assert data['tokens_estimate']>0 and data['snapshots']==[]
 
@@ -75,7 +75,9 @@ def test_auto_policy_compacts_only_during_valid_new_confirmation(context_client,
     assert not invoked
     service.confirm(cid,plan['id'],request,'auto-confirm')
     service.confirm(cid,plan['id'],request,'auto-confirm')
-    assert invoked==[{'mode':'auto','soft_threshold':256,'keep_recent':1}]
+    assert len(invoked) == 1
+    assert {key: invoked[0][key] for key in ('mode', 'soft_threshold', 'keep_recent')} == {
+        'mode':'auto','soft_threshold':256,'keep_recent':1}
 
 
 def test_invalid_confirmation_does_not_trigger_auto_model(context_client,monkeypatch):
@@ -145,7 +147,16 @@ def test_concurrent_auto_compaction_uses_one_persistent_operation(pair,monkeypat
             results=[future.result(timeout=10) for future in futures]
         finally:release.set()
     assert called==[cid]
-    assert all(result['status']=='not_needed' for result in results)
+    assert len({result['operation_id'] for result in results}) == 1
+    operation_id = results[0]['operation_id']
+    import time
+    for _ in range(200):
+        operation = services[0].capabilities.operations.get(operation_id)
+        if operation['status'] not in {'queued', 'running'}:
+            break
+        time.sleep(.01)
+    assert operation['status'] == 'succeeded'
+    assert operation['results']['status'] == 'not_needed'
     with services[0].store.knowledge_store.connection() as conn:
         rows=conn.execute('SELECT id,status FROM agent.capability_operations WHERE namespace=%s',
                          (services[0].store.namespace,)).fetchall()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from contextlib import nullcontext
+import hashlib
+import json
 from typing import Any
 
 from psycopg.types.json import Jsonb
@@ -11,6 +13,11 @@ from src.knowledge.store import KnowledgeStore
 
 class ConversationConflict(RuntimeError):
     """Raised when another process changed a conversation since it was read."""
+
+
+def _hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str,
+                                     separators=(',', ':')).encode('utf-8')).hexdigest()
 
 
 class PostgresConversationStore:
@@ -67,13 +74,65 @@ class PostgresConversationStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def save_snapshot(self, conversation_id: str, *, expected_revision: int, snapshot: dict[str, Any]) -> dict[str, Any]:
+    def _snapshot_guard(self, conn, conversation_id, through_seq, *, lock=False):
+        row = conn.execute('''SELECT active_snapshot_version,revision,payload FROM agent.conversations
+            WHERE conversation_id=%s AND account_namespace=%s''' + (' FOR UPDATE' if lock else ''),
+                           (conversation_id, self.namespace)).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        messages = conn.execute('SELECT seq,content FROM agent.messages WHERE conversation_id=%s AND seq<=%s ORDER BY seq',
+                                (conversation_id, through_seq)).fetchall()
+        payload = row['payload'] or {}
+        business = {key: payload.get(key) for key in (
+            'plans', 'goal_id', 'goal_revision', 'confirmed_requirements', 'superseded_requirements', 'control_state')}
+        if conn.execute("SELECT to_regclass('agent.conversation_goals') AS name").fetchone()['name']:
+            business['goals'] = [dict(goal) for goal in conn.execute('''SELECT goal_id,revision,active_plan_id,state
+                FROM agent.conversation_goals WHERE namespace=%s AND conversation_id=%s ORDER BY goal_id''' +
+                (' FOR SHARE' if lock else ''), (self.namespace, conversation_id)).fetchall()]
+        policies = {}
+        if conn.execute("SELECT to_regclass('agent.capability_settings') AS name").fetchone()['name']:
+            policies = {policy['resource_id']: policy['revision'] for policy in conn.execute('''
+                SELECT resource_id,revision FROM agent.capability_settings WHERE namespace=%s AND kind='memory'
+                ORDER BY resource_id''', (self.namespace,)).fetchall()}
+        return {'expected_snapshot_version': int(row['active_snapshot_version']),
+                'prefix_hash': _hash([{'seq': int(m['seq']), **dict(m['content'])} for m in messages]),
+                'expected_state_hash': _hash(business), 'memory_policy_revisions': policies,
+                'revision': int(row['revision'])}
+
+    def snapshot_guard(self, conversation_id, through_seq):
+        with self.knowledge_store.connection() as conn, conn.transaction():
+            return self._snapshot_guard(conn, conversation_id, through_seq)
+
+    def save_context_artifact(self, conversation_id, message):
+        from src.knowledge.models import KnowledgeDocument
+        self.get(conversation_id)
+        content = message.get('content', '')
+        text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str)
+        identity = 'context-tool-' + _hash([conversation_id, message.get('id'), text])
+        self.knowledge_store.upsert_document(KnowledgeDocument(
+            record_id=identity, record_type='context_artifact', account_namespace=self.namespace,
+            title='Conversation tool output', body=text, allowed_purposes=['context_reference']))
+        return identity
+
+    def read_context_artifact(self, identity):
+        with self.knowledge_store.connection() as conn:
+            row = conn.execute('''SELECT body FROM knowledge.documents
+                WHERE account_namespace=%s AND record_id=%s AND record_type='context_artifact' ''',
+                               (self.namespace, identity)).fetchone()
+        if not row:
+            raise KeyError(identity)
+        return row['body']
+
+    def save_snapshot(self, conversation_id: str, *, expected_revision: int | None = None,
+                      snapshot: dict[str, Any], expected_snapshot_version: int | None = None,
+                      prefix_hash: str | None = None, expected_state_hash: str | None = None) -> dict[str, Any]:
         with self.knowledge_store.connection() as conn, conn.transaction():
             task_state = snapshot.get('task_state') or {}
             if 'memory_policy_revisions' in task_state:
                 conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (self.namespace + ':memory-context',))
                 policies = conn.execute('''SELECT resource_id,revision FROM agent.capability_settings
-                    WHERE namespace=%s AND kind='memory' ''', (self.namespace,)).fetchall()
+                    WHERE namespace=%s AND kind='memory' ''', (self.namespace,)).fetchall() if conn.execute(
+                        "SELECT to_regclass('agent.capability_settings') AS name").fetchone()['name'] else []
                 observed = {policy['resource_id']: policy['revision'] for policy in policies}
                 if observed != task_state['memory_policy_revisions']:
                     raise ConversationConflict('memory policy changed while compacting; reload before retrying')
@@ -84,7 +143,15 @@ class PostgresConversationStore:
             ).fetchone()
             if row is None:
                 raise KeyError(conversation_id)
-            if int(row["revision"]) != int(expected_revision):
+            if prefix_hash is not None:
+                guard = self._snapshot_guard(conn, conversation_id, int(snapshot['through_seq']), lock=True)
+                if expected_snapshot_version is None or guard['expected_snapshot_version'] != expected_snapshot_version:
+                    raise ConversationConflict('conversation changed: active snapshot version changed')
+                if guard['prefix_hash'] != prefix_hash:
+                    raise ConversationConflict('conversation changed: compacted prefix changed')
+                if expected_state_hash is None or guard['expected_state_hash'] != expected_state_hash:
+                    raise ConversationConflict('conversation changed: confirmed goal or control state changed')
+            elif expected_revision is None or int(row["revision"]) != int(expected_revision):
                 raise ConversationConflict("conversation changed while compacting; reload before retrying")
             version = int(row["active_snapshot_version"]) + 1
             conn.execute(
@@ -106,7 +173,7 @@ class PostgresConversationStore:
                 """UPDATE agent.conversations
                    SET active_snapshot_version=%s,revision=revision+1,updated_at=now()
                    WHERE conversation_id=%s AND revision=%s""",
-                (version, conversation_id, expected_revision),
+                (version, conversation_id, int(row['revision'])),
             )
         return self.active_snapshot(conversation_id) or {}
 
@@ -141,6 +208,8 @@ class PostgresConversationStore:
         value = deepcopy(conversation)
         conversation_id = str(value["id"])
         expected_revision = int(value.pop("_revision", 0))
+        if expected_revision == 0:
+            value.setdefault('context_schema_version', 2)
         last_message_seq = int(value.pop("_last_message_seq", 0))
         messages = list(value.pop("messages", []) or [])
         title = str(value.get("title") or "新对话")[:120]
@@ -205,6 +274,7 @@ class PostgresConversationStore:
     def import_legacy(self, conversation: dict[str, Any]) -> dict[str, Any]:
         """Import an old JSON conversation once; the source file remains untouched."""
         candidate = deepcopy(conversation)
+        candidate.setdefault('context_schema_version', 1)
         candidate["_revision"] = 0
         try:
             return self.save(candidate)

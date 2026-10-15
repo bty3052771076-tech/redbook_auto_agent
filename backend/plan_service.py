@@ -309,6 +309,13 @@ class PlanService:
             context.update(confirmed_requirements=deepcopy(frozen['jobs']), preferences=deepcopy(preview['memory']))
             frozen.update(conversation_context=context, selected_skills=deepcopy(preview['skills']))
             identity = uuid4().hex
+            from backend.conversation_service import ConversationService, continuity_enabled
+            if continuity_enabled(self.current):
+                goal = ConversationService(self.current).goal_for_plan(cid, plan)
+                frozen['goal_context'] = {'goal_id': goal['goal_id'], 'namespace': goal['namespace'],
+                    'conversation_id': cid, 'goal_revision': goal['revision'], 'platform': frozen['platform']}
+                if plan.get('revision_manifest'):
+                    frozen['revision_manifest'] = deepcopy(plan['revision_manifest'])
             saved.setdefault('confirmation_requests', {})[key] = {'request_hash': request_hash, 'plan_id': pid,
                                                                    'execution_request_id': identity}
             saved['updated_at'] = time.time()
@@ -437,6 +444,10 @@ class PlanService:
                 'budget_minutes': 0.0, 'agent_jobs_file': str(path), 'image_score_required': frozen['image_score_required'],
                 'agent_id': roles['agent'], 'llm_id': roles['writer'], 'image_id': roles['image'], 'delivery': frozen['delivery']}
             request.update({key:deepcopy(frozen[key]) for key in ('model_runtime','host_environment','capability_namespace') if key in frozen})
+            if frozen.get('goal_context'):
+                from src.agent.goal_store import GoalStore
+                goal = frozen['goal_context']
+                GoalStore(self.current.conversation_store.knowledge_store).bind_attempt(goal['namespace'], goal['goal_id'], identity)
             run = self.current.submit(request, identity)
             if run['id'] != identity:
                 raise PlanContractError('RUN_ID_MISMATCH', '提交结果身份不符，停止后续操作', status=409)

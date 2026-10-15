@@ -1,9 +1,27 @@
 import { useEffect, useState } from "react";
-import { FileSearch, Plus, RefreshCw, Save, Search, Settings2, Trash2 } from "lucide-react";
-import { api } from "../api";
+import { CheckCircle2, CircleAlert, Clock3, FileSearch, Plus, RefreshCw, Save, Search, Settings2, Trash2 } from "lucide-react";
+import { api, type ContextOverview } from "../api";
 import { CopyId, Drawer, Empty, ErrorLine, Fields, Json, Modes, Operation, Pager, ReadState, SourceLink, Status, Switch, encoded, filter, navigate, query, text, useOperation, useRead, when, type Item, type Listing } from "./shared";
 
 const views = [["preferences", "长期偏好"], ["documents", "资料库"], ["context", "对话上下文"], ["checkpoints", "任务断点"]];
+
+export function CompactionEvents({ overview, conversationId, compact = false }: { overview: ContextOverview | null; conversationId: string; compact?: boolean }) {
+  const events = overview?.compaction_events || overview?.snapshots || [];
+  if (!events.length) return null;
+  return <section className={`compaction-events ${compact ? 'compact' : ''}`} aria-label="上下文压缩事件" aria-live="polite">
+    {events.slice(compact ? -3 : -20).map((event, index) => {
+      const completed = ['succeeded', 'completed'].includes(event.status);
+      const failed = ['failed', 'interrupted', 'conflict', 'blocked'].includes(event.status);
+      const Icon = completed ? CheckCircle2 : failed ? CircleAlert : Clock3;
+      const label = completed ? '压缩完成' : failed ? '压缩失败' : ['running', 'queued', 'pending'].includes(event.status) ? '压缩中' : '摘要已保存';
+      return <div key={event.operation_id || event.version || index}><Icon size={15} /><div><strong>{label}</strong>{event.created_at && <time>{when(event.created_at)}</time>}
+        {!compact && <><p>覆盖至消息 {event.through_seq ?? '未记录'} · {event.estimated === false ? '实际' : '估算'}输入 token {event.input_tokens ?? '未记录'} · 摘要 token {event.output_tokens ?? '未记录'}</p>
+          {event.error && <p className="calibration-error">{typeof event.error === 'string' ? event.error : event.error.message}</p>}</>}
+      </div></div>;
+    })}
+    {compact && <a href={`#capabilities/memory?memory.view=context&memory.conversation=${encoded(conversationId)}`}>查看上下文</a>}
+  </section>;
+}
 export function Memory({ id, refresh, conversations, runs, onRun }: { id: string; refresh: number; conversations: Item[]; runs: Item[]; onRun: (id: string) => void }) {
   const view = filter("view", "preferences");
   return <><div className="cap-tabs cap-subtabs" role="tablist" aria-label="记忆分类">{views.map(([value, label]) => <button role="tab" key={value} aria-selected={view === value} onClick={() => navigate("memory", "", { view: value })}>{label}</button>)}</div>
@@ -61,10 +79,16 @@ function DocumentDetail({ id, namespace, refresh, onChanged }: { id: string; nam
 
 function Context({ refresh, conversations }: { refresh: number; conversations: Item[] }) {
   const cid = filter("conversation"), [revision, setRevision] = useState(0), [policyOpen, setPolicyOpen] = useState(false);
-  const detail = useRead<Item>(cid ? `/api/conversations/${encoded(cid)}/context` : "", refresh + revision);
+  const detail = useRead<Item & ContextOverview>(cid ? `/api/conversations/${encoded(cid)}/context` : "", refresh + revision);
   const operation = useOperation(() => setRevision(v => v + 1));
+  const compacting = detail.data?.compaction_events?.some((event: Item) => ['running', 'queued', 'pending'].includes(event.status));
+  useEffect(() => {
+    if (!compacting) return;
+    const timer = window.setTimeout(() => setRevision(value => value + 1), 2000);
+    return () => window.clearTimeout(timer);
+  }, [compacting, revision]);
   return <><div className="cap-toolbar"><select aria-label="上下文对话" value={cid} onChange={e => navigate("memory", "", { conversation: e.target.value, correction: "" })}><option value="">选择对话</option>{conversations.map(row => <option key={row.id} value={row.id}>{row.title || row.id}</option>)}</select><button className="quiet-button" disabled={!detail.data} onClick={() => setPolicyOpen(true)}><Settings2 size={16} />上下文策略</button><button className="quiet-button" disabled={!detail.data || ["running", "pending"].includes(operation.operation?.status)} onClick={() => operation.start(`/api/conversations/${encoded(cid)}/compact`, {})}><FileSearch size={16} />生成压缩摘要</button><button className="quiet-button" disabled={!cid} onClick={() => navigate("memory", "", { correction: "1" })}><Plus size={16} />记录纠正</button></div><ReadState {...detail} /><Operation state={operation} />
-    {!cid && <Empty>选择一个对话查看上下文</Empty>}{detail.data && <><Status value={detail.data.status} /><Fields values={[["压缩主控模型", detail.data.model], ["原始消息数", detail.data.raw_message_count], ["token 估算", detail.data.tokens_estimate], ["当前策略", detail.data.policy]]} /><div className="cap-context-columns"><section><h3>摘要与约束来源</h3><Json value={detail.data.context} /></section><section><h3>覆盖范围与保留消息</h3><Json value={detail.data.context?.coverage || detail.data.context?.retained_messages || detail.data.coverage} /></section></div><details><summary>查看本次实际上下文</summary>{detail.data.actual_usage ? <Json value={detail.data.actual_usage} /> : <Empty>尚未用于生成 / 未记录实际发送范围</Empty>}</details><h3>历史压缩版本</h3><Json value={detail.data.snapshots} /></>}
+    {!cid && <Empty>选择一个对话查看上下文</Empty>}{detail.data && <><Status value={detail.data.status} /><Fields values={[["压缩主控模型", detail.data.model], ["原始消息数", detail.data.raw_message_count], ["token 估算", detail.data.tokens_estimate], ["当前策略", detail.data.policy]]} /><CompactionEvents overview={detail.data} conversationId={cid} /><div className="cap-context-columns"><section><h3>摘要与约束来源</h3><Json value={detail.data.context} /></section><section><h3>覆盖范围与保留消息</h3><Json value={detail.data.context?.coverage || detail.data.context?.retained_messages || detail.data.coverage} /></section></div><details><summary>查看本次实际上下文</summary>{detail.data.actual_usage ? <><Json value={detail.data.actual_usage} />{detail.data.actual_usage.requests?.map((request: Item, index: number) => <Fields key={request.request_id || index} values={[["请求引用", request.request_id || request.call_id || '未记录'], [request.estimated === false || request.usage ? '实际输入 token' : '估算输入 token', request.usage?.input_tokens ?? request.input_tokens ?? request.tokens_estimate ?? '未记录']]} />)}</> : <Empty>尚未用于生成 / 未记录实际发送范围</Empty>}</details><h3>历史压缩版本</h3><Json value={detail.data.snapshots} /></>}
     {policyOpen && detail.data && <ContextPolicy key={cid} cid={cid} row={detail.data} onClose={() => setPolicyOpen(false)} onChanged={() => { setRevision(v => v + 1); setPolicyOpen(false); }} />}
     {filter("correction") && cid && <PreferenceForm conversationId={cid} onChanged={() => { setRevision(v => v + 1); navigate("memory", "", { correction: "" }, false, true); }} />}
   </>;

@@ -24,6 +24,18 @@ function displayValue(value: unknown): string {
   return valueLabels[String(value)] || String(value);
 }
 
+export function ContinuationDiff({ plan }: { plan: Plan }) {
+  if (!plan.continuation) return null;
+  return <div className="continuation-diff"><h3>仅剩余任务</h3><p>基于目标修订 {plan.continuation.expected_goal_revision} · 已交付稿件保持不变</p>
+    <table className="calibration-options"><caption>本次修改</caption><thead><tr><th>字段</th><th>原要求</th><th>候选要求</th></tr></thead><tbody>{plan.continuation.diff.map((change, index) => {
+      const parts = change.field.split('.');
+      const job = parts[0] === 'jobs' ? plan.jobs.find(item => item.job_id === parts[1]) : null;
+      const field = parts.at(-1) || change.field;
+      return <tr key={`${change.field}-${index}`}><th>{job && `${job.title} · `}{fieldLabels[field] || change.field}</th><td>{displayValue(change.before)}</td><td className="calibration-changed">{displayValue(change.after)}</td></tr>;
+    })}</tbody></table>
+  </div>;
+}
+
 function materialize(plan: Plan): Plan {
   return { ...structuredClone(plan), jobs: plan.jobs.map((j, index) => ({ ...structuredClone(j), job_id: j.job_id || `legacy-${index}`,
     search_keywords: j.search_keywords || (j.keyword_mode !== 'preference' ? j.keywords || [] : []),
@@ -80,7 +92,8 @@ export function PlanEditor({ conversation, plan, models, candidate, recognitionI
   const returnToEditor = useRef<HTMLButtonElement>(null);
   const request = useRef<{ hash: string; key: string } | null>(null);
   const changed = !same(initial, draft) || accepted.length > 0 || decisions.length > 0;
-  const title = candidate ? '编辑校准候选' : '编辑本次计划';
+  const continuation = (candidate || plan).continuation;
+  const title = continuation ? '编辑剩余任务候选' : candidate ? '编辑校准候选' : '编辑本次计划';
   const dismiss = () => { if (saving) return; if (changed) setDiscard(true); else close(); };
   function close() { setOpen(false); setDiscard(false); setCalibrationChoice(false); trigger.current?.focus(); }
   const calibrationPending = conversation.task_recognitions?.some(record => record.base_plan_id === plan.id
@@ -153,7 +166,7 @@ export function PlanEditor({ conversation, plan, models, candidate, recognitionI
   return <>
     <button ref={trigger} className="quiet-button" disabled={disabled} onClick={() => {
       const value = materialize(candidate || plan); setInitial(value); setDraft(value); setAccepted([]); setDecisions([]); setError(''); setCalibrationChoice(false); setOpen(true);
-    }}><Pencil size={15} />{candidate ? '编辑候选' : '编辑计划'}</button>
+    }} title={continuation ? '编辑剩余任务候选' : title}><Pencil size={15} />{candidate || continuation ? '编辑候选' : '编辑计划'}</button>
     {open && <div className="pe-overlay" onMouseDown={e => { if (e.target === e.currentTarget) dismiss(); }}>
       <div ref={dialog} className="pe-drawer" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1} onKeyDown={e => {
         if (e.key === 'Escape' && !e.nativeEvent.isComposing) { e.preventDefault(); dismiss(); }
@@ -168,6 +181,7 @@ export function PlanEditor({ conversation, plan, models, candidate, recognitionI
           <button className="icon-button" title="关闭编辑器" aria-label="关闭编辑器" disabled={saving} onClick={dismiss}><X size={19} /></button></header>
         <fieldset className="pe-body" disabled={saving}>
           <details className="pe-source"><summary>原始指令</summary><p>{conversation.messages.find(m => m.id === plan.source_message_id)?.content || '原始指令未关联，请核对计划字段'}</p></details>
+          {continuation && <ContinuationDiff plan={candidate || plan} />}
           {draft.jobs.map((job, index) => <section className="pe-column" key={job.job_id}>
             <div className="pe-column-heading"><h3>{columns[job.kind] || job.title}</h3><button className="icon-button" title={`移除${job.title}`} aria-label={`移除${job.title}`} onClick={() => setDraft(p => ({ ...p, jobs: p.jobs.filter(j => j.job_id !== job.job_id) }))}><Trash2 size={16} /></button></div>
             <div className="pe-field"><label htmlFor={`pe-count-${index}`}>篇数<small className="pe-origin">{origin(job, 'count')}</small></label><div className="pe-stepper">
@@ -217,7 +231,7 @@ export function PlanEditor({ conversation, plan, models, candidate, recognitionI
           <button ref={returnToEditor} className="quiet-button" onClick={() => setCalibrationChoice(false)}>返回编辑</button>
           <button className="quiet-button" onClick={() => void calibrate()}>放弃修改后校准</button>
           <button className="primary-button" onClick={() => void save(true)}><Save size={15} />保存后校准</button>
-        </> : discard ? <><span>有尚未保存的修改</span><button className="quiet-button" onClick={() => setDiscard(false)}>继续编辑</button><button className="quiet-button" onClick={close}>放弃修改</button></> : <><button className="quiet-button" disabled={saving} onClick={dismiss}>取消</button><button className="primary-button" disabled={saving || !changed && !candidate} onClick={() => void save()}><Save size={15} />{saving ? '处理中' : candidate ? '保存并采用' : '保存计划'}</button></>}</footer>
+        </> : discard ? <><span>有尚未保存的修改</span><button className="quiet-button" onClick={() => setDiscard(false)}>继续编辑</button><button className="quiet-button" onClick={close}>放弃修改</button></> : <><button className="quiet-button" disabled={saving} onClick={dismiss}>取消</button><button className="primary-button" disabled={saving || !changed && !candidate} onClick={() => void save()}><Save size={15} />{saving ? '处理中' : continuation ? '保存候选' : candidate ? '保存并采用' : '保存计划'}</button></>}</footer>
       </div>
     </div>}
   </>;

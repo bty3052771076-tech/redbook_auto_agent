@@ -77,6 +77,7 @@ class AgentJob:
     prompt: str = ""
     evaluation_viewpoint: str = "无视角评价"
     lookback_days: object = None
+    job_id: str = ''
 
     def normalized(self) -> "AgentJob":
         kind = str(self.kind or "daily_news").strip().lower()
@@ -89,6 +90,7 @@ class AgentJob:
             prompt=str(self.prompt or "").strip(),
             evaluation_viewpoint=str(self.evaluation_viewpoint or "无视角评价").strip(),
             lookback_days=self.lookback_days,
+            job_id=str(self.job_id or ''),
         )
 
 
@@ -111,6 +113,8 @@ class EditorialAgentConfig:
     capability_management: bool = False
     conversation_context: dict[str, Any] = field(default_factory=dict)
     generation_pipeline_version: str = "legacy"
+    goal_context: dict[str, Any] = field(default_factory=dict)
+    revision_manifest: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> "EditorialAgentConfig":
         provider = str(self.provider or "").strip().lower().replace("-", "_")
@@ -153,6 +157,8 @@ class EditorialAgentConfig:
             capability_management=bool(self.capability_management),
             conversation_context=conversation_context,
             generation_pipeline_version=self.generation_pipeline_version,
+            goal_context=dict(self.goal_context),
+            revision_manifest=dict(self.revision_manifest),
         )
 
 
@@ -220,6 +226,7 @@ class AgentState(TypedDict, total=False):
     review_complete: bool
     job_blocked: bool
     sync_failed: bool
+    control_paused: bool
 
 
 def _job_from_dict(value: dict[str, Any]) -> AgentJob:
@@ -322,7 +329,15 @@ def _save_checkpoint(state: AgentState, directory: Path) -> Path:
         json.dumps(_checkpoint_payload(state), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    temporary.replace(path)
+    # Windows readers can briefly deny replacement even though the write is atomic.
+    for attempt in range(6):
+        try:
+            temporary.replace(path)
+            break
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in {5, 32, 33} or attempt == 5:
+                raise
+            time.sleep(0.01 * (2 ** attempt))
     return path
 
 
@@ -443,6 +458,8 @@ def _build_graph(
     progress: AgentProgress | None,
     checkpointer: Any = None,
 ):
+    from src.agent.conversation_control import ConversationControl, ConversationPaused
+    control = ConversationControl(config.goal_context) if config.goal_context else None
     retained_fields = (
         "posts", "post_ids", "reviewed_posts", "reviewed_post_ids", "approved_versions",
         "context", "last_failure", "retryable", "review_complete", "job_blocked",
@@ -462,8 +479,19 @@ def _build_graph(
         # days of retry telemetry into every PostgreSQL graph checkpoint.
         state["events"] = list(state.get("events") or [])[-200:]
         state["errors"] = list(state.get("errors") or [])[-200:]
+        # Deserialized graph channels contain separate Post instances. Carry
+        # receipts back to the retained copy only for identical content.
+        delivered = {_post_id(post): post for post in state.get('uploaded_posts') or []}
+        if delivered:
+            from src.agent.conversation_control import artifact_version
+            for post in state.get('posts') or []:
+                saved = delivered.get(_post_id(post))
+                if saved is not None and hasattr(post, 'platform') and artifact_version(post) == artifact_version(saved):
+                    post.platform.update({k: v for k, v in saved.platform.items() if k.endswith(('_draft', '_publication'))})
         stash_job(state)
         _save_checkpoint(state, config.checkpoint_dir)
+        if control:
+            control.record_state(state)
         return state
 
     def tool_context(state: AgentState) -> dict[str, Any]:
@@ -652,6 +680,7 @@ def _build_graph(
                 "OPENCODEX_CACHE_ARTIFACT_INVALID", "OPENCODEX_REFERENCE_TOO_LARGE",
                 "OPENCODEX_REFERENCE_FORMAT_INVALID", "OPENCODEX_TWO_REFERENCES_REQUIRED",
                 "STAGE_PENDING_OR_UNKNOWN", "STAGE_LEASE_LOST", "MODEL_CAPACITY_UNCERTAIN", "IMAGE_CACHE_INVALID",
+                'CONTEXT_REQUIRED_INPUT_TOO_LARGE', 'CONTEXT_COMPACTION_REQUIRED',
             ))
             material_exhausted = job.kind == "daily_ai_digest" and repeated >= 3 and any(
                 marker in state["last_failure"] for marker in (
@@ -785,7 +814,7 @@ def _build_graph(
                 continue
             pending_posts.append(post)
 
-        if tools.upload_batch is not None and pending_posts:
+        if tools.upload_batch is not None and pending_posts and control is None:
             _emit(state, progress, "upload_batch", "in_progress", f"{job.kind} posts={len(pending_posts)}")
             outcomes: dict[str, tuple[bool, str]] = {}
             try:
@@ -846,6 +875,8 @@ def _build_graph(
         # opted into the batch contract. Platform locks and idempotency remain
         # owned by the adapter.
         for post in pending_posts:
+            if control:
+                control.check_boundary('before_upload', _post_id(post))
             post_id = _post_id(post)
             item_key = f"{state.get('job_index', 0)}:{post_id}:{_content_version(post)}"
             try:
@@ -867,6 +898,9 @@ def _build_graph(
                 if any(code in str(detail) for code in TERMINAL_PLATFORM_FAILURE_CODES):
                     state["platform_paused"] = True
                     break
+            if control:
+                state.update(uploaded_posts=uploaded, uploaded_post_ids=list(dict.fromkeys(uploaded_ids)), item_status=item_status)
+                persist(state, 'upload')
         state["uploaded_posts"] = uploaded
         state["uploaded_post_ids"] = list(dict.fromkeys(uploaded_ids))
         state["item_status"] = item_status
@@ -1014,15 +1048,23 @@ def _build_graph(
     def after_next(state: AgentState) -> str:
         return "finish" if int(state.get("job_index", 0)) >= len(state.get("jobs", [])) else "sync_context"
 
+    def guarded(name, function):
+        def invoke(state):
+            try:
+                if control:
+                    control.check_boundary(name)
+                return function(state)
+            except ConversationPaused as exc:
+                exc.state = state
+                exc.node = name
+                raise
+        return invoke
+
     graph = StateGraph(AgentState)
-    graph.add_node("plan", plan)
-    graph.add_node("sync_context", sync_context)
-    graph.add_node("generate", generate)
-    graph.add_node("review", review)
-    graph.add_node("upload", upload)
-    graph.add_node("recover", recover)
-    graph.add_node("next_job", next_job)
-    graph.add_node("finish", finish)
+    for name, function in [('plan', plan), ('sync_context', sync_context), ('generate', generate),
+                           ('review', review), ('upload', upload), ('recover', recover),
+                           ('next_job', next_job), ('finish', finish)]:
+        graph.add_node(name, guarded(name, function))
     graph.add_edge(START, "sync_context")
     graph.add_edge("plan", "sync_context")
     graph.add_conditional_edges("sync_context", after_sync_context)
@@ -1077,6 +1119,10 @@ def run_editorial_agent(
         run_lease = nullcontext(lambda: None)
     with run_lease as assert_lease_alive:
         assert_lease_alive()
+        goal_epoch = None
+        if cfg.goal_context:
+            from src.agent.goal_store import GoalStore
+            goal_epoch = GoalStore().snapshot(cfg.goal_context['namespace'], cfg.goal_context['goal_id'])['lease_epoch']
         run_directory = Path(cfg.checkpoint_dir) / identifier
         cfg = replace(cfg, checkpoint_dir=run_directory)
         run_directory.mkdir(parents=True, exist_ok=True)
@@ -1165,7 +1211,7 @@ def run_editorial_agent(
         def reopen_retained(state: dict[str, Any]) -> dict[str, Any]:
             state = dict(state)
             state.update({"status": "running", "budget_exceeded": False, "provider_paused": False,
-                          "retryable": True, "job_blocked": False})
+                          "retryable": True, "job_blocked": False, 'control_paused': False})
             records = {key: dict(record) for key, record in (state.get("job_states") or {}).items()}
             for record in records.values():
                 if record.get("status") == "blocked":
@@ -1194,6 +1240,25 @@ def run_editorial_agent(
 
         if resume_checkpoint and not postgres_resume and initial.get("status") != "completed":
             initial = reopen_retained(initial)
+        if cfg.revision_manifest and not cfg.resume_from:
+            from src.agent.conversation_control import import_revision
+            if not cfg.goal_context:
+                raise ValueError('GOAL_MANIFEST_INVALID: revision import requires a goal context')
+            from src.agent.goal_store import GoalStore
+            current_goal = GoalStore().snapshot(cfg.goal_context['namespace'], cfg.goal_context['goal_id'])
+            if current_goal['revision'] != cfg.goal_context['goal_revision']:
+                raise ValueError('GOAL_LEASE_LOST: revision context is no longer current')
+            initial.update(import_revision(cfg.revision_manifest, identifier,
+                context=current_goal, confirmed_jobs=initial['jobs']))
+            by_id = {row['job_id']: row for row in cfg.revision_manifest['jobs']}
+            for job in initial['jobs']:
+                row = by_id.get(job.get('job_id'))
+                if row:
+                    job['count'] = max(1, int(row['execute_count']))
+            index = initial['job_index']
+            if index < len(initial['jobs']):
+                initial.update({key: value for key, value in initial['job_states'][str(index)].items()
+                                if key != 'status'})
         graph_config = {
             "recursion_limit": cfg.max_steps + 4,
             "configurable": {"thread_id": identifier},
@@ -1202,12 +1267,26 @@ def run_editorial_agent(
         def drive(graph: Any, value: Any) -> dict[str, Any]:
             def invoke(next_value: Any) -> dict[str, Any]:
                 assert_lease_alive()
-                result = graph.invoke(next_value, graph_config)
+                from src.agent.conversation_control import ConversationPaused
+                try:
+                    result = graph.invoke(next_value, graph_config)
+                except ConversationPaused as exc:
+                    result = dict(exc.state)
+                    result.update(status='cancelled' if exc.kind == 'cancel_goal' else 'paused', control_paused=True,
+                                  last_failure=str(exc))
+                    if graph.checkpointer is not None:
+                        predecessor = {'plan': 'sync_context', 'sync_context': 'plan', 'generate': 'sync_context',
+                            'review': 'generate', 'upload': 'review', 'recover': 'upload',
+                            'next_job': 'recover', 'finish': 'next_job'}[exc.node]
+                        graph.update_state(graph_config, result, as_node=predecessor)
+                    _save_checkpoint(result, cfg.checkpoint_dir)
                 assert_lease_alive()
                 return result
 
             final = invoke(value)
             while True:
+                if final.get('control_paused'):
+                    return final
                 # A resumed pending finish node must run as checkpointed. If the
                 # completed-job audit queued work, schedule it after that boundary.
                 if (final.get("last_node") == "finish" and final.get("status") != "blocked"
@@ -1255,6 +1334,7 @@ def run_editorial_agent(
                                 "steps": 0,
                                 "status": "running",
                                 "provider_paused": bool(previous.get("provider_paused")),
+                                'control_paused': False,
                             })
                             graph.update_state(graph_config, update)
                             final = drive(graph, None)
@@ -1291,6 +1371,21 @@ def run_editorial_agent(
             if tools.capability_cleanup is not None:
                 tools.capability_cleanup()
         assert_lease_alive()
+        if cfg.goal_context and not final.get('control_paused'):
+            from src.agent.goal_store import GoalStore
+            goal_store = GoalStore()
+            goal = goal_store.snapshot(cfg.goal_context['namespace'], cfg.goal_context['goal_id'])
+            complete = all(row['remaining'] == 0 for row in goal['jobs'])
+            goal_state = 'completed' if complete else 'blocked_external' if any(row['uncertain'] for row in goal['jobs']) else 'interrupted'
+            goal_store.set_state(cfg.goal_context['namespace'], cfg.goal_context['goal_id'], goal_state, expected_epoch=goal_epoch)
+            if final.get('status') == 'completed' and not complete:
+                final.update(status='partial', platform_paused=True,
+                             last_failure='XHS_WRITE_UNCERTAIN: goal delivery lacks a current verified receipt')
+                if cfg.checkpoint_backend == 'postgres':
+                    with postgres_checkpointer() as saver:
+                        _build_graph(config=cfg, tools=tools, progress=progress, checkpointer=saver).update_state(
+                            graph_config, final, as_node='finish')
+                _save_checkpoint(final, cfg.checkpoint_dir)
         processed_jobs = min(int(final.get("job_index", 0)), len(final.get("jobs") or []))
         failed_jobs = {
             int(index) for index in (final.get("failed_jobs") or [])

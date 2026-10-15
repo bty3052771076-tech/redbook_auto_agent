@@ -102,7 +102,7 @@ def test_candidate_rewrites_thin_copy_once_without_relaxing_review(monkeypatch):
     )
     generated = [
         {"title": "市政府调整周末公交班次", "body": "内容：\n市政府公布公交调整方案。\n\n评价：\n仍待落实。", "topics": ["每日新闻"]},
-        {"title": "市政府公布周末公交调整方案", "body": f"内容：\n{facts}\n\n评价：\n末班车安排仍需观察。", "topics": ["每日新闻"]},
+        {"title": "市政府公布周末公交调整方案", "body": f"内容：\n{facts}\n\n评价：\n夜间公交的便利不能以牺牲候车安全和司机休息为代价。", "topics": ["每日新闻"]},
     ]
     prompts = []
 

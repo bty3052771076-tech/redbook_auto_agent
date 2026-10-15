@@ -28,7 +28,7 @@ def absence_proven(evidence, action):
 
 def reconcile_uncertain_draft(post, action, store, *, collect=None, verify=None, evidence_dir=None):
     from .playwright_steps import (
-        _draft_title_matches_expected, run_collect_platform_drafts_sync, run_update_draft_sync,
+        _matching_draft_items, run_collect_platform_drafts_sync, run_update_draft_sync,
     )
     if action.status not in {'submitting', 'uncertain'} or action.action != 'save_draft':
         return action
@@ -48,8 +48,9 @@ def reconcile_uncertain_draft(post, action, store, *, collect=None, verify=None,
             if (not scan.get('complete') or scan.get('errors')
                     or Path(scan.get('profile_dir') or '').resolve() != Path(action.profile_key).resolve()):
                 return action
-            matches = [item for item in scan.get('items', [])
-                       if _draft_title_matches_expected(str(item.get('title') or ''), post.title)]
+            matches = _matching_draft_items(scan.get('items', []), (post.title,))
+            evidence['match_count'] = len(matches)
+            path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding='utf-8')
             if matches:
                 if len(matches) != 1:
                     return action

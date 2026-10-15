@@ -20,7 +20,7 @@ def test_calibration_can_edit_and_save_without_reloading_after_model_reply(monke
         'AGENT_LLM_PROVIDER': 'minimax', 'LLM_PROVIDER': 'minimax', 'IMAGE_PROVIDER': 'minimax',
     }
     original = gui.load_env_file
-    runtime = Path('E:/AI/codex/redbook_runtime')
+    runtime = Path(os.environ['REDBOOK_RUNTIME_ROOT'])
     monkeypatch.setattr(gui, 'load_env_file', lambda path: dict(env) if Path(path).resolve() == (runtime / '.env.gui').resolve() else original(path))
     calls = []
 

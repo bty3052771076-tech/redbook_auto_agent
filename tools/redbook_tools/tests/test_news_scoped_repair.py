@@ -57,7 +57,7 @@ def test_content_resummary_is_complete_not_sliced():
     assert fixed["body"] == "内容：\n完整的新总结。\n\n评价：\n评价。"
 
 
-@pytest.mark.parametrize("repair", ["scene", "comment", "generic_comment"])
+@pytest.mark.parametrize("repair", ["scene", "comment", "generic_comment", "waiting_comment", "missing_comment"])
 def test_candidate_staged_mode_repairs_scene_without_second_writer(monkeypatch, repair):
     from src.workflow import create_post as w
     from src.news.daily_news import NewsItem
@@ -71,8 +71,12 @@ def test_candidate_staged_mode_repairs_scene_without_second_writer(monkeypatch, 
     calls=[]
     def writer(*a, **kw):
         calls.append("writer")
-        comment = "夜间班次仍待正式确认，乘客应以交通部门公布的时刻表为准。"
-        if repair != "scene":
+        comment = "夜间公交的便利不能以牺牲候车安全和司机休息为代价。"
+        if repair == "waiting_comment":
+            comment = "后续影响有待进一步观察，实际效果仍需后续信息明确。"
+        elif repair == "missing_comment":
+            comment = ""
+        elif repair != "scene":
             comment *= 3
         return {"title":picked.title,"body":f"内容：\n{facts}\n\n评价：\n{comment}", "image_event":"bad" if repair == "scene" else "accepted", "topics":[]}
     def patch(*a, **kw):
@@ -80,7 +84,7 @@ def test_candidate_staged_mode_repairs_scene_without_second_writer(monkeypatch, 
         if repair == "scene":
             return {"image_event":"accepted"}
         return {"comment": "公交班次仍在研究，不是已经定论的结果，乘客暂需留意后续公告。" if repair == "generic_comment"
-                else "夜间班次仍待正式确认，乘客应以交通部门公布的时刻表为准。"}
+                else "夜间公交的便利不能以牺牲候车安全和司机休息为代价。"}
     def scene(value, **kw):
         kw["audit"].update(accepted=value=="accepted",reason="test")
         return value if value=="accepted" else ""

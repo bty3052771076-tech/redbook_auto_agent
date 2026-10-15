@@ -166,7 +166,7 @@ def test_actual_vlm_rejection_persists_failed_diagnostics_and_revision(monkeypat
     picked = NewsItem(title=SHIPPING["source"], url="https://example.test/frozen-oil-source",
                       description=SHIPPING["description"], content=SHIPPING["facts"],
                       source="guardian", domain="theguardian.com", seendate="2026-10-01 12:00:00")
-    raw = dict(title=SHIPPING["title"], body=f"内容：\n{SHIPPING['facts']}\n\n评价：\n全面恢复仍待观察。\n\n日期：2026-10-01\n\n来源：guardian",
+    raw = dict(title=SHIPPING["title"], body=f"内容：\n{SHIPPING['facts']}\n\n评价：\n原油运输恢复不等于燃料流通正常，成品油受阻仍是供应短板。\n\n日期：2026-10-01\n\n来源：guardian",
                topics=["每日新闻"])
     image = tmp_path / "provided.png"
     image.write_bytes(b"offline provided image fixture")

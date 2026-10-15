@@ -32,6 +32,38 @@ export type Plan = {
   requirements?: Record<string, unknown>[];
   field_suggestions?: { field_path: string; value: unknown; reason: string; base_value_hash: string }[];
   clarifications?: unknown[];
+  target_date?: string;
+  continuation?: {
+    goal_id: string; turn_id: string; expected_goal_revision: number; base_plan_id: string;
+    scope: 'remaining'; diff: { field: string; before: unknown; after: unknown }[];
+  };
+};
+export type GoalSnapshot = {
+  goal_id: string; revision: number; ledger_revision: number; active_plan_id: string;
+  active_attempt_id: string | null; state: string; plan: Plan; target_date?: string;
+  jobs: { job_id: string; title: string; requested: number; delivered_verified: number;
+    approved_current: number; retained_ready: number; uncertain: number; remaining: number; new_generation_needed: number }[];
+};
+export type TurnAction = 'continue_goal' | 'status' | 'pause_goal' | 'cancel_goal' | 'clarify' | 'new_goal' | 'amend_goal';
+export type ConversationTurn = {
+  turn_id: string; state: 'accepted' | 'awaiting_confirmation' | 'queued' | 'applying' | 'applied' | 'needs_input' | 'interrupted';
+  kind: TurnAction; goal_id: string | null; proposal_plan_id: string | null;
+  command_payload: Record<string, unknown>; result: Record<string, unknown> | null;
+};
+export type TurnResponse = {
+  message?: Message; assistant?: Message | null; plan: Plan | null; run?: Run | null;
+  turn?: ConversationTurn | null; action?: TurnAction; goal?: GoalSnapshot | null;
+};
+export type CompactionEvent = {
+  operation_id?: string; version?: number; status: string; through_seq?: number;
+  input_tokens?: number | null; output_tokens?: number | null; estimated?: boolean;
+  created_at?: number | string; error?: string | { message?: string };
+};
+export type ContextOverview = {
+  status?: string; tokens_estimate?: number; coverage?: unknown;
+  snapshots?: CompactionEvent[]; compaction_events?: CompactionEvent[];
+  actual_usage?: { requests?: { request_id?: string; call_id?: string; estimated?: boolean;
+    usage?: { input_tokens?: number }; input_tokens?: number; tokens_estimate?: number; [key: string]: unknown }[]; [key: string]: unknown } | null;
 };
 export type Message = { id: string; role: string; content: string; created_at: number };
 export type TaskRecognition = {
@@ -41,7 +73,7 @@ export type TaskRecognition = {
   error: string; candidate?: Plan | null;
   changes: { label: string; before: unknown; after: unknown }[];
 };
-export type Conversation = { id: string; title: string; messages: Message[]; plans: Plan[]; runs: string[]; status: string; conversation_revision?: number; task_recognitions?: TaskRecognition[] };
+export type Conversation = { id: string; title: string; messages: Message[]; plans: Plan[]; runs: string[]; status: string; conversation_revision?: number; task_recognitions?: TaskRecognition[]; goals?: GoalSnapshot[]; turns?: ConversationTurn[] };
 export type Activity = {
   pipeline?: { text_approved: number; image_ready: number; repairing: number; rejected: number } | null;
   status: string; status_label: string; active: boolean; headline: string; summary: string;
@@ -112,5 +144,7 @@ export function requestTaskCalibration(conversation: Conversation, plan: Plan) {
   if (!source) return Promise.reject(new Error('没有找到该计划的原始消息，请核对任务指令。'));
   return api<TaskRecognition>(`/api/conversations/${conversation.id}/task-recognitions`, 'POST', {
     source_message_id: source, base_plan_id: plan.id, base_plan_version: plan.version,
+    ...(plan.continuation ? { goal_id: plan.continuation.goal_id, turn_id: plan.continuation.turn_id,
+      expected_goal_revision: plan.continuation.expected_goal_revision } : {}),
   }, crypto.randomUUID());
 }

@@ -9,6 +9,14 @@ import psycopg
 from psycopg import sql
 
 
+def pytest_configure(config):
+    if not config.option.basetemp:
+        runtime = Path(os.getenv('REDBOOK_RUNTIME_ROOT') or 'E:/AI/codex/redbook_runtime')
+        scratch = runtime / 'data/tmp'
+        scratch.mkdir(parents=True, exist_ok=True)
+        config.option.basetemp = str(scratch / ('pytest-cases-' + uuid4().hex))
+
+
 def pytest_sessionstart(session):
     if getattr(session.config, "_agent_test_database", None) is not None:
         return

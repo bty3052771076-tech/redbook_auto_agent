@@ -33,7 +33,7 @@ def replay(mode: str, *, count: int=10):
         for index in range(count):
             item=NewsItem(title="市政府公布夜间公交计划",url=f"https://fixture.invalid/{index}",description=facts,
                 content=facts*3,seendate="2026-10-10 08:00:00",source="fixture",domain="fixture.invalid",language="zh")
-            body=f"内容：\n{facts}\n\n评价：\n夜间班次仍待正式确认，乘客应以交通部门公布的时刻表为准。\n\n日期：{w._format_news_seendate(item.seendate)}"
+            body=f"内容：\n{facts}\n\n评价：\n夜间公交的便利不能以牺牲候车安全和司机休息为代价。\n\n日期：{w._format_news_seendate(item.seendate)}"
             local_calls=[]
             def writer(*a,**kw):
                 calls["writer"]+=1

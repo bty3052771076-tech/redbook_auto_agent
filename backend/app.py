@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Any
 from typing import Literal
 from uuid import uuid4
@@ -46,6 +46,10 @@ class ConversationCreate(BaseModel):
 
 class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=12000)
+    client_message_id: str | None = Field(default=None, pattern=r'^[A-Za-z0-9_-]{16,80}$')
+    goal_id: str | None = Field(default=None, pattern=r'^[a-f0-9]{32}$')
+    expected_goal_revision: int | None = Field(default=None, ge=1, strict=True)
+    expected_attempt_id: str | None = Field(default=None, pattern=r'^[a-f0-9]{32}$')
 
 
 class SourceCheckCreate(BaseModel):
@@ -99,6 +103,12 @@ class PlanCopy(BaseModel):
     model_config = {'extra':'forbid'}
     base_plan_version: int = Field(ge=1,strict=True)
     conversation_revision: int = Field(ge=0,strict=True)
+
+
+class TurnConfirm(BaseModel):
+    model_config = {'extra': 'forbid'}
+    expected_goal_revision: int = Field(ge=1, strict=True)
+    proposal_hash: str = Field(min_length=1, max_length=64)
 
 
 class PlanModels(BaseModel):
@@ -159,6 +169,9 @@ def ensure_review_schema() -> None:
                 reviewed_at timestamptz NOT NULL DEFAULT now()
             )
         """)
+        from src.agent.goal_store import ensure_goal_schema
+        ensure_goal_schema(conn)
+        conn.execute('GRANT SELECT, INSERT, UPDATE, DELETE ON agent.conversation_goals, agent.conversation_turns, agent.goal_artifact_links TO redbook_app')
         conn.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON agent.draft_reviews TO redbook_app")
 
 
@@ -268,13 +281,24 @@ def conversation(conversation_id: str):
         result['plans'] = [plans.describe(plan, catalog=catalog, fingerprint=fingerprint)
                           if plan.get('plan_kind') != 'draft_management' else plan
                           for plan in result['plans']]
+    from .conversation_service import ConversationService, continuity_enabled
+    if continuity_enabled(current):
+        coordinator = ConversationService(current)
+        result['goals'] = current.redact(coordinator.goals.list(coordinator.namespace, conversation_id))
+        result['turns'] = current.redact(coordinator.goals.turns(coordinator.namespace, conversation_id))
     return result
 
 
 @app.post("/api/conversations/{conversation_id}/messages", dependencies=[Depends(authenticated)])
-def add_message(conversation_id: str, body: MessageCreate):
+def add_message(conversation_id: str, body: MessageCreate, idempotency_key: str = Header(default='')):
     current = service()
     conversation_id = valid_conversation_id(conversation_id)
+    from .conversation_service import ConversationService, continuity_enabled
+    if continuity_enabled(current):
+        with current.lock:
+            result = ConversationService(current).handle_message(conversation_id, body.model_dump(exclude_none=True),
+                idempotency_key or body.client_message_id or uuid4().hex)
+        return JSONResponse(result, status_code=202 if result.get('action') == 'continue_goal' and result.get('run') else 200)
     if is_status_question(body.content):
         with current.lock:
             saved = current._read_agent_conversation(conversation_id)
@@ -294,6 +318,31 @@ def add_message(conversation_id: str, body: MessageCreate):
     if parsed.get("plan_kind") == "draft_management" and (parsed.get("management") or {}).get("mode") == "publish":
         raise ValueError("独立界面暂不执行公开发布；请先生成、审查并上传草稿，发布请在平台人工确认")
     return current.append_agent_message(valid_conversation_id(conversation_id), body.content)
+
+
+@app.get('/api/conversations/{conversation_id}/goals', dependencies=[Depends(authenticated)])
+def conversation_goals(conversation_id: str):
+    from .conversation_service import ConversationService, continuity_enabled
+    current = service()
+    cid = valid_conversation_id(conversation_id)
+    current._read_agent_conversation(cid)
+    return {'rows': ConversationService(current).goals.list(current.conversation_store.namespace, cid) if continuity_enabled(current) else []}
+
+
+@app.post('/api/conversations/{conversation_id}/turns/{turn_id}/confirm', dependencies=[Depends(authenticated)])
+def confirm_conversation_turn(conversation_id: str, turn_id: str, body: TurnConfirm, idempotency_key: str = Header(default='')):
+    from .conversation_service import ConversationService
+    with service().lock:
+        result = ConversationService(service()).confirm_turn(valid_conversation_id(conversation_id), valid_id(turn_id),
+            body.expected_goal_revision, body.proposal_hash, idempotency_key or uuid4().hex)
+    return JSONResponse(result, status_code=202 if not result.get('run') else 200)
+
+
+@app.post('/api/conversations/{conversation_id}/turns/{turn_id}/discard', dependencies=[Depends(authenticated)])
+def discard_conversation_turn(conversation_id: str, turn_id: str):
+    from .conversation_service import ConversationService
+    with service().lock:
+        return ConversationService(service()).discard_turn(valid_conversation_id(conversation_id), valid_id(turn_id))
 
 
 @app.put("/api/conversations/{conversation_id}/plans/{plan_id}/models", dependencies=[Depends(authenticated)])
@@ -326,6 +375,13 @@ def confirm_plan(plan_id: str, body: PlanConfirm, idempotency_key: str = Header(
     current = service()
     conversation = current.get_agent_conversation(valid_conversation_id(body.conversation_id))
     plan = next((item for item in conversation.get("plans", []) if item.get("id") == valid_id(plan_id)), None)
+    if plan and plan.get('continuation'):
+        from .conversation_service import ConversationService
+        continuation = plan['continuation']
+        with current.lock:
+            result = ConversationService(current).confirm_turn(body.conversation_id, continuation['turn_id'],
+                continuation['expected_goal_revision'], body.semantic_hash or plan['semantic_hash'], idempotency_key or uuid4().hex)
+        return JSONResponse(result, status_code=202 if not result.get('run') else 200)
     if plan and plan.get("plan_kind") == "draft_management" and (plan.get("management") or {}).get("mode") == "publish":
         raise ValueError("独立界面暂不执行公开发布；请在平台人工确认")
     with current.lock:
@@ -564,3 +620,34 @@ def startup():
         if exc.code != 'POSTGRES_UNAVAILABLE':
             raise
         app.state.review_schema_ready = False
+
+    previous = getattr(app.state, 'goal_control_stop', None)
+    if previous is not None:
+        previous.set()
+    stop = Event()
+    app.state.goal_control_stop = stop
+    def drain():
+        from .conversation_service import ConversationService, continuity_enabled
+        while not stop.wait(0.5):
+            current = app.state.service
+            if current is None or not continuity_enabled(current):
+                continue
+            try:
+                with current.lock:
+                    ConversationService(current).process_pending()
+                app.state.goal_control_error = ''
+            except Exception as exc:
+                app.state.goal_control_error = current.redact(str(exc))
+    worker = Thread(target=drain, name='conversation-control', daemon=True)
+    app.state.goal_control_thread = worker
+    worker.start()
+
+
+@app.on_event('shutdown')
+def shutdown_goal_control():
+    stop = getattr(app.state, 'goal_control_stop', None)
+    if stop is not None:
+        stop.set()
+    worker = getattr(app.state, 'goal_control_thread', None)
+    if worker is not None:
+        worker.join(timeout=2)
