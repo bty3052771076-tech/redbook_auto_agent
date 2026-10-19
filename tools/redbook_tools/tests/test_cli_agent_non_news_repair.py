@@ -56,8 +56,10 @@ def adapter(monkeypatch, tmp_path):
     return captured["tools"], ledger, context
 
 
-def digest(post_id, *, official=True):
+def digest(post_id, *, official=True, expired=False):
     day = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).date().isoformat()
+    if expired:
+        day = "2025-09-03"
     return Post(id=post_id, title=f"Digest {post_id}", body=f"Concrete event {post_id}", platform={
         "ai_digest": {"items": [{"source_name": "Vendor", "source_type": "official",
                                   "title": "OpenAI新增Responses API语音接口",
@@ -69,7 +71,7 @@ def digest(post_id, *, official=True):
 
 def test_failed_digest_is_replaced_and_not_resurrected_from_ledger(adapter, monkeypatch):
     tools, ledger, context = adapter
-    old = digest("old", official=False)
+    old = digest("old", official=False, expired=True)
     fresh = digest("fresh")
     good_elsewhere = Post(id="news-good", title="Other completed column", body="Untouched")
     ledger.save("test-run", "0:daily_news", good_elsewhere, phase="approved")
@@ -126,7 +128,7 @@ def test_actual_controller_receives_stage_and_artifacts_not_only_ordering_hint(a
 
 def test_replacement_preserves_existing_platform_target_without_false_receipt(adapter, monkeypatch):
     tools, _, context = adapter
-    old, fresh = digest("saved", official=False), digest("revision")
+    old, fresh = digest("saved", official=False, expired=True), digest("revision")
     old.uploaded = True
     old.platform["xhs_draft"] = {"title": "Original platform title", "execution_id": "readback-proof"}
     monkeypatch.setattr(cli, "create_daily_ai_digest_posts", lambda **kw: [fresh])
@@ -142,7 +144,7 @@ def test_replacement_preserves_existing_platform_target_without_false_receipt(ad
 
 def test_digest_repair_passes_its_ancestor_to_history_filter(adapter, monkeypatch):
     tools, _, context = adapter
-    old, fresh = digest("old", official=False), digest("fresh")
+    old, fresh = digest("old", official=False, expired=True), digest("fresh")
     old.uploaded = True
     received = []
     monkeypatch.setattr(cli, "create_daily_ai_digest_posts", lambda **kw: received.append(kw) or [fresh])
@@ -237,8 +239,8 @@ def test_selected_skill_version_is_identifiable_in_actual_generation_input(adapt
 
 def test_still_failed_replacement_stays_rejected_and_next_retry_uses_leaf(adapter, monkeypatch):
     tools, ledger, context = adapter
-    old = digest("old", official=False)
-    candidates = [digest("bad-new", official=False), digest("good-new")]
+    old = digest("old", official=False, expired=True)
+    candidates = [digest("bad-new", official=False, expired=True), digest("good-new")]
     generated = []
     checked = []
     original = cli._agent_ai_digest_review_issues
@@ -269,7 +271,7 @@ def test_still_failed_replacement_stays_rejected_and_next_retry_uses_leaf(adapte
 
 def test_interruption_after_replacement_commit_does_not_revive_old(adapter, monkeypatch):
     tools, ledger, context = adapter
-    old, fresh = digest("old", official=False), digest("fresh")
+    old, fresh = digest("old", official=False, expired=True), digest("fresh")
     calls = []
     monkeypatch.setattr(cli, "create_daily_ai_digest_posts", lambda **kw: calls.append(kw) or [fresh])
     monkeypatch.setattr(cli, "_run_auto_quality_gate", lambda *a, **kw: [])
@@ -314,12 +316,12 @@ def test_replacement_keeps_date_dedupe_and_score_failures(adapter, monkeypatch, 
 
 def test_real_quality_gate_still_checks_delivered_history(adapter, monkeypatch):
     tools, ledger, context = adapter
-    old, fresh = digest("old", official=False), digest("fresh")
+    old, fresh = digest("old", official=False, expired=True), digest("fresh")
     history = fresh.model_copy(deep=True)
     history.id = "previously-uploaded"
     history.uploaded = True
     monkeypatch.setenv("AI_DIGEST_HISTORY_SKIP_TODAY", "0")
-    monkeypatch.setattr(cli, "list_posts", lambda: [history, old])
+    monkeypatch.setattr(cli, "iter_posts", lambda: iter([history, old]))
     monkeypatch.setattr(cli, "configured_vision_review_model", lambda: False)
     monkeypatch.setattr(cli, "create_daily_ai_digest_posts", lambda **kw: [fresh])
     result = tools.review(AgentJob("daily_ai_digest", "AI"), [old], context)
@@ -392,7 +394,7 @@ def test_map_failed_quality_is_replaced_without_touching_passing_item(adapter, m
 
 def test_generator_cannot_relabel_old_failed_input_as_new(adapter, monkeypatch):
     tools, ledger, context = adapter
-    old = digest("old", official=False)
+    old = digest("old", official=False, expired=True)
     monkeypatch.setattr(cli, "create_daily_ai_digest_posts", lambda **kw: [old])
     result = tools.review(AgentJob("daily_ai_digest", "AI"), [old], context)
     assert not result["approved_post_ids"]
@@ -403,7 +405,7 @@ def test_actual_core_uploads_only_approved_replacement_and_keeps_other_job(adapt
     from src.agent import editorial_agent as agent
 
     tools, ledger, context = adapter
-    old, fresh, wool = digest("old", official=False), digest("fresh"), Post(id="wool", title="Wool", body="Offer")
+    old, fresh, wool = digest("old", official=False, expired=True), digest("fresh"), Post(id="wool", title="Wool", body="Offer")
     candidates = [old, fresh]
     monkeypatch.setattr(cli, "create_daily_ai_digest_posts", lambda **kw: [candidates.pop(0)])
     monkeypatch.setattr(cli, "create_daily_wool_posts", lambda **kw: [wool])

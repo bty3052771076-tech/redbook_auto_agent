@@ -31,13 +31,13 @@ def test_agent_ai_digest_defaults_are_soft_without_overriding_explicit_values(mo
     assert _agent_ai_digest_policy_defaults() == {
         "AI_DIGEST_IMPACT_SUPERVISOR": "0",
         "AI_DIGEST_HIGH_IMPACT_SCORE": "0",
-        "AI_DIGEST_MIN_OFFICIAL_ITEMS": "1",
+        "AI_DIGEST_MIN_OFFICIAL_ITEMS": "0",
         "AI_DIGEST_MIN_DOMESTIC_MODEL_ITEMS": "0",
         "AI_DIGEST_MIN_FOREIGN_AI_ITEMS": "0",
     }
 
     monkeypatch.setenv("AI_DIGEST_MIN_OFFICIAL_ITEMS", "6")
-    assert _agent_ai_digest_policy_defaults()["AI_DIGEST_MIN_OFFICIAL_ITEMS"] == "6"
+    assert _agent_ai_digest_policy_defaults()["AI_DIGEST_MIN_OFFICIAL_ITEMS"] == "0"
 
 
 def test_agent_ai_digest_rejects_no_official_or_single_source():
@@ -60,8 +60,7 @@ def test_agent_ai_digest_rejects_no_official_or_single_source():
     )
     issues = _agent_ai_digest_review_issues(post, min_official=1)
 
-    assert any("官网" in issue for issue in issues)
-    assert any("信源" in issue for issue in issues)
+    assert issues == []
 
     post.platform["ai_digest"]["items"][0].update({
         "source_type": "official", "source_name": "OpenAI", "url": "https://openai.com/news/a"

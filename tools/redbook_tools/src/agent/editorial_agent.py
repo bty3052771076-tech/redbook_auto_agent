@@ -685,6 +685,7 @@ def _build_graph(
             material_exhausted = job.kind == "daily_ai_digest" and repeated >= 3 and any(
                 marker in state["last_failure"] for marker in (
                     "daily ai digest material insufficient", "daily ai digest official material insufficient",
+                    "daily ai digest high-impact material insufficient", "SOURCE_DIVERSITY_REQUIRED",
                     "AI讯息材料不足"))
             verification_incomplete = "WOOL_VERIFICATION_INCOMPLETE" in state["last_failure"]
             if verification_incomplete:
@@ -929,12 +930,24 @@ def _build_graph(
         record["progress_fingerprint"] = list(fingerprint)
         record["no_progress_count"] = stalls
         stall_limit_reached = config.no_progress_limit > 0 and stalls >= config.no_progress_limit
-        if not state.get("retryable", True) or state.get("job_blocked") or stall_limit_reached:
+        source_failed = job.kind == "daily_ai_digest" and any(
+            marker in error for error in record.get("review_errors") or []
+            for marker in ("SOURCE_DIVERSITY_REQUIRED", "信源过于集中")
+        )
+        source_stalls = (
+            int(record.get("source_no_progress_count") or 0) + 1
+            if source_failed and fingerprint <= previous else 0
+        )
+        record["source_no_progress_count"] = source_stalls
+        source_stalled = stalls >= 3 and source_stalls >= 3
+        if not state.get("retryable", True) or state.get("job_blocked") or stall_limit_reached or source_stalled:
             state["job_blocked"] = True
             record["status"] = "blocked"
             reason = state.get("last_failure") or "tool returned no actionable result"
             if stall_limit_reached:
                 reason = f"NO_PROGRESS: {job.kind} repeated {stalls} rounds without an accepted artifact; {reason}"
+            if source_stalled:
+                reason = f"SOURCE_REFRESH_REQUIRED: 连续 {source_stalls} 轮来源审核无进展，已保留稿件；请补充独立信源后续跑；{reason}"
             state["last_failure"] = reason
             state.setdefault("errors", []).append(reason)
             _emit(state, progress, "recover", "blocked", reason)

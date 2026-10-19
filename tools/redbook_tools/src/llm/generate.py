@@ -533,7 +533,7 @@ def _summary_provider_kwargs(cfg: LLMConfig, *, disable_thinking: bool = True) -
     if cfg.provider.strip().lower() != "minimax":
         return {}
     model = cfg.model.strip().lower()
-    if model not in {"minimax-m3", "minimax-m3.1-flash-preview"}:
+    if model not in {"minimax-m3", "minimax-m3.1-flash", "minimax-m3.1-flash-preview"}:
         return {}
     body: dict[str, Any] = {"reasoning_split": True}
     if model == "minimax-m3" and disable_thinking:

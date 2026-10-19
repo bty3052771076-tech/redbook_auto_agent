@@ -20,7 +20,7 @@ from src.agent.plan_contract import EDITABLE_OPTIONS, JOB_EDIT_FIELDS, OPTION_FI
 from src.config import LLMConfig, DEFAULT_MINIMAX_LLM_MODEL
 
 
-PROMPT_VERSION = "task-recognition.v3-editable.4"
+PROMPT_VERSION = "task-recognition.v3-editable.5"
 KINDS = {"daily_news": "每日新闻", "daily_ai_digest": "每日AI讯息", "daily_wool": "每日羊毛",
          "daily_wow": "每日我去", "daily_global_map": "今日全球事件关注图"}
 JobKind = Literal["daily_news", "daily_ai_digest", "daily_wool", "daily_wow", "daily_global_map"]
@@ -30,7 +30,8 @@ user_overrides优先；明确清空、移除栏目、删除偏向都是有效修
 其余字段根据user_message理解。host_defaults只补未指定字段，不是用户原话；本地规则不是答案。
 每日新闻count是独立稿件篇数；其他栏目count为1，集合稿内部条目不是篇数。
 search_keywords保存检索主题，topic_preferences保存软偏好。比例、来源、读者和叙事要求放topic_brief。
-topic_brief_strength只使用preference（选题偏好）、requirement（必须满足）或null（待用户选择），不要创造soft_preference等值。
+topic_brief_strength未明确指定时默认preference（选题偏好）；仅用户明确指定必须满足时用requirement，不要创造soft_preference等值。null也由宿主按选题偏好处理。
+每日羊毛支持检索词、选题偏向和补充要求，用于福利检索与优先排序；不设新闻评价，evaluation_viewpoint用null，不添加独立评价视角。
 查重、时效性、事实核验、标题、配图、选题分布等文字说明保留在topic_brief，不另建dedup、freshness、title等约束类型。
 content_constraints只支持篇数绑定{"type":"count","value":该栏目count}，没有篇数硬绑定时返回[]；无法保证的分类硬配额仍需用户修正。
 不要重复把标签写入topic_brief。合理归纳的主题属于模型建议，不能声称是逐字用户要求。
@@ -135,7 +136,7 @@ class EditableRecognizedJob(StrictModel):
     search_keywords: list[str] = Field(default_factory=list)
     topic_preferences: list[str] = Field(default_factory=list)
     topic_brief: str = ''
-    topic_brief_strength: str | None = Field(default=None,
+    topic_brief_strength: str | None = Field(default='preference',
         json_schema_extra={'enum': ['preference', 'requirement', None]})
     content_constraints: list[dict] = Field(default_factory=list, json_schema_extra={'items': {
         'type': 'object', 'properties': {'type': {'const': 'count'}, 'value': {'type': 'integer', 'minimum': 1, 'maximum': 20}},

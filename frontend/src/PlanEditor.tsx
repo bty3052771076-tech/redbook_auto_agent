@@ -5,7 +5,7 @@ import { RolePicker } from './ModelPlatforms';
 import './plan-editor.css';
 
 const columns: Record<string, string> = { daily_news: '每日新闻', daily_ai_digest: '每日AI讯息', daily_wool: 'AI鸡蛋', daily_wow: '每日我去', daily_global_map: '今日全球事件关注图' };
-const topicKinds = new Set(['daily_news', 'daily_ai_digest', 'daily_wow']);
+const topicKinds = new Set(['daily_news', 'daily_ai_digest', 'daily_wow', 'daily_wool']);
 const jobFields = ['count', 'search_keywords', 'topic_preferences', 'topic_brief', 'topic_brief_strength', 'content_constraints', 'evaluation_viewpoint', 'legacy_extra_requirements'] as const;
 const optionFields = ['delivery', 'platform', 'performance_mode', 'image_score_required', 'model_roles', 'generation_pipeline_version'] as const;
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -40,7 +40,8 @@ function materialize(plan: Plan): Plan {
   return { ...structuredClone(plan), jobs: plan.jobs.map((j, index) => ({ ...structuredClone(j), job_id: j.job_id || `legacy-${index}`,
     search_keywords: j.search_keywords || (j.keyword_mode !== 'preference' ? j.keywords || [] : []),
     topic_preferences: j.topic_preferences || (j.keyword_mode === 'preference' ? j.keywords || [] : []),
-    topic_brief: j.topic_brief || '', evaluation_viewpoint: j.evaluation_viewpoint || '无视角评价', legacy_extra_requirements: j.legacy_extra_requirements || '' })) };
+    topic_brief: j.topic_brief || '', topic_brief_strength: j.topic_brief_strength || 'preference',
+    evaluation_viewpoint: j.evaluation_viewpoint || '无视角评价', legacy_extra_requirements: j.legacy_extra_requirements || '' })) };
 }
 
 function changes(base: Plan, draft: Plan) {
@@ -50,6 +51,7 @@ function changes(base: Plan, draft: Plan) {
     const before = base.jobs.find(j => j.job_id === job.job_id);
     const result: Record<string, unknown> = before ? { target_job_id: job.job_id } : { kind: job.kind };
     for (const key of jobFields) if (!before || !same(before[key], job[key])) result[key] = job[key];
+    if ('topic_brief' in result) result.topic_brief_strength = job.topic_brief_strength || 'preference';
     return result;
   });
   return fields;
@@ -192,9 +194,9 @@ export function PlanEditor({ conversation, plan, models, candidate, recognitionI
             {topicKinds.has(job.kind) ? <>
               <Tags label={`${job.title}选题偏向`} source={origin(job, 'topic_preferences')} values={job.topic_preferences || []} onChange={v => updateJob(job.job_id!, { topic_preferences: v })} />
               <Tags label={`${job.title}检索词`} source={origin(job, 'search_keywords')} values={job.search_keywords || []} onChange={v => updateJob(job.job_id!, { search_keywords: v })} />
-              <div className="pe-field"><label htmlFor={`pe-brief-${index}`}>补充要求<small className="pe-origin">{origin(job, 'topic_brief')}</small></label><textarea id={`pe-brief-${index}`} aria-label={`${job.title}补充要求`} rows={3} maxLength={2000} value={job.topic_brief || ''} onChange={e => updateJob(job.job_id!, { topic_brief: e.target.value, topic_brief_strength: null })} /></div>
+              <div className="pe-field"><label htmlFor={`pe-brief-${index}`}>补充要求<small className="pe-origin">{origin(job, 'topic_brief')}</small></label><textarea id={`pe-brief-${index}`} aria-label={`${job.title}补充要求`} rows={3} maxLength={2000} value={job.topic_brief || ''} onChange={e => updateJob(job.job_id!, { topic_brief: e.target.value, topic_brief_strength: job.topic_brief_strength || 'preference' })} /></div>
               {!!job.topic_brief && <fieldset className="pe-segments"><legend>要求强度</legend>{[['preference', '选题偏好'], ['requirement', '必须满足']].map(([value, label]) => <label key={value}><input type="radio" name={`strength-${job.job_id}`} checked={job.topic_brief_strength === value} onChange={() => updateJob(job.job_id!, { topic_brief_strength: value as 'preference' | 'requirement' })} />{label}</label>)}</fieldset>}
-              <div className="pe-field"><label htmlFor={`pe-view-${index}`}>评价视角</label><input id={`pe-view-${index}`} maxLength={500} value={job.evaluation_viewpoint || ''} onChange={e => updateJob(job.job_id!, { evaluation_viewpoint: e.target.value })} /></div>
+              {job.kind !== 'daily_wool' && <div className="pe-field"><label htmlFor={`pe-view-${index}`}>评价视角</label><input id={`pe-view-${index}`} maxLength={500} value={job.evaluation_viewpoint || ''} onChange={e => updateJob(job.job_id!, { evaluation_viewpoint: e.target.value })} /></div>}
             </> : <div className="pe-unsupported">{(['search_keywords', 'topic_preferences', 'topic_brief', 'legacy_extra_requirements', 'evaluation_viewpoint'] as const).map(key => {
               const value = job[key];
               if (!value || Array.isArray(value) && !value.length || key === 'evaluation_viewpoint' && value === '无视角评价') return null;

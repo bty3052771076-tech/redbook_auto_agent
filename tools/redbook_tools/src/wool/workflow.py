@@ -146,6 +146,7 @@ def _llm_copy(offers: list[WoolOffer], fallback: tuple[str, str]) -> tuple[str, 
 
 def create_daily_wool_posts(
     *,
+    prompt_hint: str = '',
     asset_paths: list[Path] | None = None,
     copy_assets: bool = True,
     count: int = 1,
@@ -164,6 +165,7 @@ def create_daily_wool_posts(
     if progress:
         progress("collect", f"in_progress window={max_age_days}d")
     offers, collect_meta = collect_daily_wool_offers(
+        prompt_hint=prompt_hint,
         now=now,
         max_age_days=max_age_days,
         progress=progress,
@@ -197,6 +199,7 @@ def create_daily_wool_posts(
         platform={
             "daily_wool": {
                 "mode": "daily_wool",
+                "editorial_preferences": prompt_hint,
                 "has_wool": bool(offers),
                 "availability_status": availability,
                 "user_notice": notice,

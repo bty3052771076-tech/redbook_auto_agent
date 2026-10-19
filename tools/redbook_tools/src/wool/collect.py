@@ -361,6 +361,7 @@ WoolProgress = Callable[[str, str], None]
 @governed('builtin:wool.search', 'preparation')
 def collect_daily_wool_offers(
     *,
+    prompt_hint: str = '',
     now: datetime | date | None = None,
     max_age_days: int = 3,
     sources=None,
@@ -370,6 +371,10 @@ def collect_daily_wool_offers(
 ) -> tuple[list[WoolOffer], dict[str, Any]]:
     if progress:
         progress("collect", f"in_progress window={max_age_days}d")
+    preferences = ' '.join(str(prompt_hint or '').split())
+    queries = list(WOOL_SEARCH_QUERIES)
+    if preferences:
+        queries.insert(0, f'AI 免费额度 领取 {preferences}')
     updates, meta = collect_ai_digest_updates(
         sources=sources or resolve_wool_sources(),
         fetch_source=fetch_source,
@@ -383,15 +388,20 @@ def collect_daily_wool_offers(
         # Wool signals are often short-lived announcements on official social
         # accounts. A full generic candidate pool must not suppress this tier.
         force_social_backfill=True,
-        search_backfill_queries=WOOL_SEARCH_QUERIES,
+        search_backfill_queries=queries,
         performance_mode=performance_mode,
         progress=(lambda stage, detail: progress(stage, detail)) if progress else None,
     )
     offers = extract_wool_offers(updates, now=now, max_age_days=max_age_days)
+    preferred_providers = [name.casefold() for name in _PROVIDER_MARKERS if name.casefold() in preferences.casefold()]
+    if preferred_providers:
+        offers.sort(key=lambda offer: not any(name in f'{offer.provider} {offer.title}'.casefold()
+                                              for name in preferred_providers))
     result_meta = {
         "candidate_updates": len(updates),
         "offers": len(offers),
         "max_age_days": max_age_days,
+        "editorial_preferences": prompt_hint,
         "source_meta": meta,
     }
     if progress:

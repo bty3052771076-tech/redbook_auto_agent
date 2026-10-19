@@ -12,7 +12,7 @@ PLAN_SCHEMA = 'editorial-plan.v3'
 COMPILER_VERSION = 'editorial-prompt.v1'
 KINDS = {'daily_news':'每日新闻','daily_ai_digest':'每日AI讯息','daily_wool':'每日羊毛',
          'daily_wow':'每日我去','daily_global_map':'今日全球事件关注图'}
-TOPIC_KINDS = {'daily_news','daily_ai_digest','daily_wow'}
+TOPIC_KINDS = {'daily_news','daily_ai_digest','daily_wow','daily_wool'}
 DEFAULT_PROMPTS = {
     'daily_news':'近期有具体进展、来源可核验的新闻',
     'daily_ai_digest':'模型发布 AI厂商产品更新 具体且可核验的AI动态',
@@ -232,10 +232,13 @@ def normalize_plan(value: dict) -> dict:
         if legacy and job['topic_brief']:
             required=any(r.get('strength')=='requirement' and r.get('scope') in ('plan','job:'+kind)
                          and r.get('target')=='job.topic_brief' for r in plan.get('requirements',[]) if isinstance(r,dict))
-            job.setdefault('topic_brief_strength','requirement' if required else 'preference')
+            if job.get('topic_brief_strength') in (None, ''):
+                job['topic_brief_strength']='requirement' if required else 'preference'
             job.setdefault('topic_brief_strength_hash',digest(job['topic_brief']))
         _normalize_requirement_format(job)
         job.setdefault('topic_brief_strength',None)
+        if kind in TOPIC_KINDS and job['topic_brief'] and job['topic_brief_strength'] in (None, ''):
+            job.update(topic_brief_strength='preference', topic_brief_strength_hash=digest(job['topic_brief']))
         if job['topic_brief'] and (job['topic_brief_strength'] not in ('preference','requirement')
                                   or job.get('topic_brief_strength_hash')!=digest(job['topic_brief'])):
             errors.append(_issue('REQUIREMENT_STRENGTH_NEEDED',path('topic_brief_strength'),'请为当前补充要求选择偏好或必须满足',job['topic_brief']))
@@ -250,8 +253,10 @@ def normalize_plan(value: dict) -> dict:
                 errors.append(_issue('UNSUPPORTED_HARD_REQUIREMENT',path('topic_brief'),'必须满足的文字要求尚未绑定可保证的执行字段；请修改、改为偏好或删除',job['topic_brief']))
         if any(not isinstance(c,dict) or c.get('type') not in ('count',) for c in constraints):
             errors.append(_issue('CONSTRAINT_UNSUPPORTED',path('content_constraints'),'当前不能保证分类硬配额或任意文字硬约束',constraints))
-        if kind not in TOPIC_KINDS:
-            for name in ('search_keywords','topic_preferences','topic_brief','legacy_extra_requirements','evaluation_viewpoint'):
+        unsupported_fields = (('search_keywords','topic_preferences','topic_brief','legacy_extra_requirements','evaluation_viewpoint')
+                              if kind not in TOPIC_KINDS else ('evaluation_viewpoint',) if kind == 'daily_wool' else ())
+        if unsupported_fields:
+            for name in unsupported_fields:
                 if job[name] and not (name=='evaluation_viewpoint' and job[name]=='无视角评价'):
                     errors.append(_issue('FIELD_NOT_CONSUMED',path(name),'此栏目未接入该字段；可清除已有要求',job[name]))
         if job['legacy_extra_requirements']:

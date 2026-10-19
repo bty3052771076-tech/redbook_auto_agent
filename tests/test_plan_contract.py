@@ -110,7 +110,7 @@ def test_new_free_text_strength_requires_user_choice_and_is_bound_to_text():
     c=contract()
     plan=c.normalize_plan(legacy())
     job=editable_job(plan)
-    job.update(target_job_id=plan['jobs'][0]['job_id'],topic_brief='优先关注女性权益',topic_brief_strength=None)
+    job.update(target_job_id=plan['jobs'][0]['job_id'],topic_brief='优先关注女性权益',topic_brief_strength='unknown')
     pending=c.apply_edits(plan,{'jobs':[job]})
     assert not pending['executable']
     job['topic_brief_strength']='preference'
@@ -135,7 +135,7 @@ def test_hard_text_without_supported_constraint_is_not_softened():
 def test_legacy_unsupported_fields_can_be_cleared_without_deleting_column():
     c=contract()
     old=legacy()
-    old['jobs'][0].update(kind='daily_wool',count=1)
+    old['jobs'][0].update(kind='daily_wool',count=1,evaluation_viewpoint='产业政策视角')
     plan=c.normalize_plan(old)
     assert not plan['executable']
     job=editable_job(plan)
