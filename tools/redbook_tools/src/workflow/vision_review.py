@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
+from src.llm.request_policy import minimax_output_tokens, minimax_reasoning_options
 
 from src.config import (
     DEFAULT_ALIYUN_LLM_BASE_URL,
@@ -223,8 +224,9 @@ def _invoke_vision_review_request(
         base_url=config.base_url,
         api_key=config.api_key,
         temperature=0,
-        max_tokens=1200,
+        max_tokens=minimax_output_tokens(config.model, 1200),
         timeout=120,
+        **minimax_reasoning_options(config.model),
     )
     message = HumanMessage(
         content=[

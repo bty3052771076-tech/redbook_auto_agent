@@ -103,3 +103,10 @@ Thumbs.db
 /tools/opencodex/
 /tools/postgresql/
 /tools/*.local.json
+
+# Publish only the reviewed screenshots used by README.
+!docs/images/readme-chat.png
+!docs/images/readme-plan-editor.png
+!docs/images/readme-models.png
+!docs/images/readme-capabilities.png
+!docs/images/readme-progress.png

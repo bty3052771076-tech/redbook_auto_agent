@@ -1,3 +1,33 @@
+### 2026-10-24 README 与发布前检查
+
+- DONE: 重写两仓 README，按功能表、局限/待修正、部署与使用组织；加入 7 张已检查的真实本机截图、操作框和目录/流程框。截图不包含凭据，演示计划未执行，真实生成/上传未重复运行。
+- VERIFIED: 本地规则六组解析检查确认明确关键词、关于/围绕与图片仅参考可识别；自然口语与排除条件存在未提取情况，已如实写入文档。
+- EFFICIENCY: 最新运行 556f329146694396a56f0c73975f665a，2026-10-24 11:45:04–12:24:52，39:47；主控/写稿 MiniMax-M3.1-Flash，生图 opencodex/gpt-image-2，resume_count=0；10 新闻 + 1 AI 集合稿，11 个唯一平台草稿均回读 verified。复用新鲜平台数据快照，图片硬评分关闭；不与昨夜补齐案例混算。
+- VERIFIED: 工作流 1758 passed / 8 skipped；智能体主程序 783 / 1；内置工具包 1439 / 36；两前端构建通过。智能体与工具包分别执行，避免同名测试收集冲突；未使用新依赖。
+- SECURITY: .gitignore 仅逐文件放行 README 的 7 张截图，本地文档/素材/记录保留；发布前对暂存内容做真实本地凭据比对和常见 token 检查。正式推送时先备份两仓远端原 main，使用正常快进推送。
+
+### 2026-10-24 00:39 GMT+8 原任务续跑完成
+
+- DONE: 原任务 `5652fe3b58a04804afb386f0480b6b86` completed，2/2 栏目完成；8 条原新闻保留，新补 2 条新闻及 1 条 AI 讯息。11 个唯一稿件均 saved_as_draft / readback verified，无公开发布，使用 runtime/data/browser/chrome-profile、headless=True。
+- DONE: 两套 AI 工具在自适应模式、最终有限修复耗尽后可保留合格子集，审计被剔除项；不放宽固定数量、证据身份、事实、日期、指定主题及 800 字校验。
+- VERIFIED: 独立工具 AI 模块 225 通过；工作流 AI 模块 431 通过；最后审计字段调整后两套定向回归各 36 通过。未跑本轮全仓测试，未安装依赖。
+- RUNS: `5cceeecff282589b97faf633516aedf9` 23:21:22 至 00:18:04，安全暂停；`c05c57a6edda52548dbf5c1f556505f5` 00:19:02 至 00:39:35，正常完成。恢复总墙钟 01:18:12，实际两个进程累计 01:17:14，包含同步与维护，并非从零生成 11 条的纯生成时间。
+- OUTPUT: 新新闻 `5c4d920ca7d84aa8995947f8fa7c578b`、`557aa79926e54a778f8f6336cfd4efd9`；AI `75ae7f51733740f68b0eb386700299f1`。AI 只有一项 10 月 23 日的词元服务性能报告，出刊日 10 月 24 日，无模型首发；保持原 10 月 23 日目标身份，不另开一批。
+- LIMITATIONS: 旧日志 uploaded=29 是累计列表计数，唯一实际草稿为 11。AI 平台标题压缩仍有不自然措辞，未声称已消除全部质量问题。上条 BLOCKED 状态已被本记录取代。
+- VERIFIED: 健康接口 ready，后台继续可用。两仓 diff --check 通过，图分析 critical，无 partial/truncated；未提交或推送。
+
+### 2026-10-23 18:41 GMT+8
+
+**Task:** 修复原任务 5652fe3b58a04804afb386f0480b6b86 的数字/场景误判、补位池缩小及 AI 整篇重试。
+
+- DONE: tools/redbook_tools/src/workflow/create_post.py 修复数量翻译与年度/年代、保留正文的概念场景定向修复、具体数字反馈、补位池最小宽度及 AI 最终条目修复。
+- DONE: tools/redbook_tools/src/ai_digest/generate.py 保留合格条目，exact-URL 绑定有限重试；异常携带部分成稿，修复后仍执行事实/日期及 800 字检查。
+- DONE: 新增数值/场景、补位、AI 单条与工作流集成、启动状态恢复回归；设计记录见 docs/plans/2026-10-23-generation-stall-repair.md。
+- VERIFIED: 新闻 327 通过，AI 模块 217 通过；保留/检查点 37 通过、3 跳过；启动恢复 12 通过。工作流对应 AI 模块 423 通过，补位 8 通过。各测试组有重叠，本轮未运行全仓全套。
+- VERIFIED: 两仓 diff --check 通过；图分析包含之前未提交修改，critical，无 partial/truncated。保留已有工作，未提交、未推送、未安装依赖。
+- BLOCKED: 后台服务启动被执行策略拒绝，已请用户手动启动 Start-Agent.cmd；8786 未可用，尚未恢复真实生成/上传。原 8 条草稿保留，缺 2 条新闻和 1 条 AI 讯息，不宣称完成。
+- BACKUP: redbook_runtime/data/tmp/oct23-stall-backup-20261023-181227 保存原状态、日志、检查点。PostgreSQL 已启动，子智能体已关闭；本轮测试进程均结束。
+
 ### 2026-10-16 08:46 GMT+8
 
 **Task:** 默认补充要求为选题偏好，并接通AI羊毛的实际偏好消费。
@@ -138,3 +168,96 @@
 - Risks/Assumptions: 两库GitNexus detect_changes(scope=all)均无partial/truncated；核心链路风险为CRITICAL，已核对模型、审核、计划和恢复消费者。新增测试未入旧索引的UNKNOWN已核对实际pytest函数；本轮仅清理末尾空行。
 - Security: 智能体484个、工作流355个候选文件扫描未命中密钥规则或已知本地密钥；忽略规则保留API Key、浏览器资料、数据库、生成数据和本地部署，不改默认模型、不重启正式服务。
 - Next steps: 提交并推送新版后核验两库远端main和备份分支哈希；本地生成记录及项目文档保留。
+
+### 2026-10-22 10:34 GMT+8
+
+**Task:** 主控、写稿与审核统一采用M3.1 Flash默认medium/131072，保留提示词篇幅约束，不恢复正式任务。
+
+**Git:** main；仅本地修改，未提交、未推送。
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| backend/task_recognition.py | DONE | 校准发送medium及max_completion_tokens=131072，截断错误使用实际上限 | 3项真实HTTP边界模拟通过 |
+| tools/redbook_tools/src/llm/request_policy.py | DONE | Flash/Preview统一默认值，显式推理设置仍生效 | 参数回归通过 |
+| tools/redbook_tools/src/llm/generate.py | DONE | 主控/压缩JSON和写稿使用统一额度；保留M3专用分支 | 生成与输出完整性回归通过 |
+| tools/redbook_tools/src/ai_digest/generate.py | DONE | 汇总与影响审核统一参数，不再使用较小Flash额度 | 工具最终全套通过 |
+| tools/redbook_tools/src/workflow/vision_review.py | DONE | Flash使用统一档位与输出上限，M3保留原参数 | 审核请求回归通过 |
+| tools/redbook_tools/src/model_platforms/runtime.py | DONE | 三种协议默认值一致，保留显式输出配置，不修改快照 | 协议回归通过 |
+| tools/redbook_tools/src/model_platforms/store.py | DONE | Flash允许保存131072，不放宽其他模型 | 新增/编辑及工具最终全套通过 |
+| tools/redbook_tools/tests/test_minimax_request_policy.py | DONE | 34项回归覆盖主控/写稿/汇总/审核/协议/HTTP/配置 | 首次新规则23失败8通过，修复后通过 |
+| tests/test_minimax_calibration_policy.py | DONE | Flash与Preview使用新参数，M3仍为4096且保持原思考策略 | 先红后绿，3通过 |
+
+**Notes**
+- Tests/Lint: 智能体全套771通过/1跳过（380.96秒）；内置工具最终全套1273通过/36跳过（81.32秒）；原工作流全套1608通过/8跳过（288.53秒）。合计3652通过/45跳过，无剩余失败；相关校准3项、工具86项及工作流110项也通过。全部日志在runtime/data/tmp，diff --check通过。
+- Diagnostics: 工具首次全套1失败1269通过，暴露旧SimpleNamespace配置没有platform_snapshot；改用兼容读取后全套通过。不掩盖首轮失败记录。自定义配置原64000限制也先以测试复现，再做Flash专用修正。
+- Risks/Assumptions: GitNexus规划/生成/压缩路径最高CRITICAL，动态配置UNKNOWN已核对service/CLI实际调用；两库detect_changes无partial/truncated，新文件额外以实参HTTP测试核对。不更改凭据、默认模型、既有快照或付费回退。
+- Behavior: 默认medium；MINIMAX_REASONING_EFFORT或自定义模型显式档位仍可覆盖。131072为推理加答案总额度，不要求输出同等长度；保留新闻150–220字、复杂新闻最多300字、评价20–40字及重新总结而非截断的提示与校验。
+- Next steps: 三套回归完成，正式服务继续关闭；不恢复生成/上传任务。未调用真实模型，实际生成时延与质量未验证。所有测试临时数据位于E盘且使用隔离数据库，无C盘安装。未提交或推送，正常启动后生效。
+
+### 2026-10-22 10:50 GMT+8
+
+**Task:** 智能体每日新闻评价采用50–100字，同步首次写稿、审核、重写与字段级修复。
+
+**Git:** main；保留已有修改，未提交或推送。
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| tools/redbook_tools/src/news/length_policy.py | DONE | 目标50–100、优选60–80、上限100、低于50仅警告 | 49/50/75/100/101边界回归通过 |
+| tools/redbook_tools/src/workflow/create_post.py | DONE | 通用视角提示移除重复的旧字数，采用栏目篇幅要求 | 生成、评价与每日我去回归通过 |
+| tools/redbook_tools/src/workflow/news_repairs.py | DONE | 定向修复提示改为50–100，保留只修允许字段及不截断约束 | 范围修复相关回归通过 |
+| tools/redbook_tools/tests/test_news_concise_length.py | DONE | 范围内不重写、超100完整重写、前置提示及空白边界 | 工具相关91项通过 |
+| tools/redbook_tools/tests/test_minimax_request_policy.py | DONE | HTTP请求评价提示采用50–100，模型参数不变 | 请求边界回归通过 |
+
+**Notes**
+- Tests/Lint: 本轮相关91项通过，原工作流相关78项通过；内置工具完整1278通过/36跳过（77.00秒），原工作流最终完整1613通过/8跳过（314.30秒），合计2891通过/44跳过，无剩余失败。仅既有依赖弃用警告，diff --check通过。独立智能体后端未改，本轮不重复上一任务已通过的771项后端全套，不将其计入本轮验证数量。
+- Risks/Assumptions: GitNexus篇幅提示影响HIGH，限定只修改评价长度与重复提示，不修改正文150–220字、复杂事件300字、每日我去、事实审查或图片规则。两库detect_changes无partial/truncated，旧模块文本检查未发现残留20–40评价限制。
+- Next steps: 本轮完成，正常启动后后续生成采用新评价目标；不恢复正式服务或新闻任务，不调用真实模型，不修改平台草稿或发布内容。日志与测试数据位于E盘runtime/data/tmp（news-comment-50-100前缀），无C盘安装；未提交或推送。
+
+### 2026-10-22 15:19 GMT+8
+
+**Task:** 智能体每日AI讯息正文硬上限800字符，保留完整资讯并避免确定性超长错误无限重试；暂停旧任务并保留断点。
+
+**Git:** main；保留全部既有修改，未提交或推送。
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| tools/redbook_tools/src/ai_digest/models.py | DONE | AI正文800预算单一来源 | 工具完整回归通过 |
+| tools/redbook_tools/src/ai_digest/generate.py | DONE | 前置说明预算；省略重复展示元数据；不截标题，容量不足显示完整重点索引并明确其余见配图 | brief全量条目、摘要、时间及信源不变 |
+| tools/redbook_tools/src/workflow/create_post.py | DONE | 采集前预估、正文适配及落盘前硬检查统一800，保存实际长度 | 801即使由错误renderer返回也拒绝保存 |
+| tools/redbook_tools/src/validation/rules.py | DONE | AI图文800、普通新闻1000不变；使用元数据识别栏目 | 边界及普通新闻含AI标题测试通过 |
+| tools/redbook_tools/src/agent/editorial_agent.py | DONE | AI_DIGEST_BODY_LIMIT识别为明确排版错误，保留进度并提示修正文，不再重新采集 | 一次生成失败即停止该确定性重试，其他任务/错误策略不变 |
+| tools/redbook_tools/tests/test_ai_digest_body_budget.py | DONE | 13项覆盖800硬界限、完整数据、单轮完成、无效正文拒存与智能体不重复采集 | 先红后绿 |
+
+**Notes**
+- Tests/Lint: 工具新用例12通过；确定性错误先红（旧代码生成两次）后绿，相关40通过；AI来源/增量/完整性/卡片时间相关74通过；工具完整1291通过/36跳过（91.32秒）。工作流完整1625通过/8跳过（341.54秒）；独立界面/续跑/草稿回读接口29通过（7.52秒）。本轮共2945通过/44跳过；后端未重复其余全套，不计入本轮结果。仅既有弃用警告，diff --check通过；日志均位于runtime/data/tmp/ai-body800-*.log。
+- Scope: 800仅约束最终发布正文，包含标题行、日期、来源、标点和换行；不是把结构化JSON或所有配图摘要裁成800。完整资讯保留，正文索引容量不足会明确提示未列出的条数与配图；无额外LLM压缩调用、不切换模型或付费路径。
+- Runtime: 原任务22bb9cda85fa4d34a26358b5e6d7a407先经REST提交pause_goal。耗时检索未响应时，按用户授权备份checkpoint/events，再只终止已核对run-id的48980进程树。通过已有GoalStore接口、校验原active_attempt与lease_epoch后，目标ac87d5943ec34ddc80515a586ce866e3置paused，turn d0213aa7df07476580cc1eccb1090f0f记applied，避免恢复时重复消费旧暂停。最新API和本地检查点核对：目标paused、worker=0、10条上传记录和completed_job_indices=[0]保留。原运行failed/exit=1是本次维护停止，未删除或重跑新闻。
+- Backup: runtime/data/backups/20261022-body800-pause/22bb9cda85fa4d34a26358b5e6d7a407/checkpoint.json及events.jsonl；不含本轮新生成稿件，不修改原业务断点。
+- Risk: GitNexus AI生成/排版最高CRITICAL、通用验证HIGH；动态generate节点UNKNOWN由LangGraph add_node注册、实际源码及回归补证。两库detect_changes均无partial/truncated；没有资料库降级、依赖安装、C盘写入安装或默认浏览器操作。
+- Next steps: 本轮完成。GUI与PostgreSQL保持运行，但任务继续暂停，不自动续跑、不生成或上传新稿；后续新CLI worker会加载修复。未提交或推送。
+
+### 2026-10-23 10:02 GMT+8
+
+**Task:** 修复每日AI讯息版本流水重复、普通新闻同一政策文件过度集中，以及模型拒选与补位审校的回流漏洞。
+
+**Git:** main；保留先前所有未提交变更；本轮不提交、不推送、不生成或上传新稿。
+
+| File | Status | What changed | Remaining / Next action |
+|---|---|---|---|
+| tools/redbook_tools/apps/cli.py | DONE | AI影响力审核默认启用、阈值75；尊重显式覆盖，来源与国内外硬配额仍为0 | 新CLI worker加载 |
+| tools/redbook_tools/src/ai_digest/rank.py | DONE | 区分Codex CLI/Claude Code与基础模型；等价版本流水择新并保留证据；原始摘录优先阻止无事实扩写 | 真实材料与52项新增回归通过 |
+| tools/redbook_tools/src/news/daily_news.py | DONE | 政策发布按文书身份聚类；不同文书/机关/落地执行不误合并；匿名科技快讯只按受限共现证据聚类 | 真实6条变1条；26项新增回归通过 |
+| tools/redbook_tools/src/workflow/create_post.py | DONE | rejected_ids真正排除且部分返回不恢复拒选；补位附已选事件重审；不足时保留合格稿继续补位；非模型发布不绕过明确低影响审核；主动关闭审核不再报配置丢失 | 功能回归通过；浏览器独立重测通过 |
+| tools/redbook_tools/tests/test_editorial_selection_regressions.py | DONE | 11项覆盖拒选/矛盾/部分/全部拒选、平衡与速度模式、公开工作流入口补位、审核开关和来源无硬配额 | 两套工具新用例一致 |
+| tools/redbook_tools/tests/test_ai_digest_release_editorial_dedupe.py | DONE | 52项覆盖多段alpha版本、原始证据、中文维护模板、实质变化、不同项目与模型变体 | W/T一致 |
+| tools/redbook_tools/tests/test_news_policy_event_identity.py | DONE | 26项覆盖真实条款、文书差异、匿名证据不足、不同机关、后续执行及跨时区 | W/T一致 |
+| tools/redbook_tools/tests/test_cli_agent_policy.py | DONE | 对齐恢复的默认影响力审核策略，保留无来源硬配额断言 | 新增集成测试验证实际筛选效果 |
+
+**Notes**
+- Tests/Lint: 最终智能体工具全套1380通过/36跳过（82.69秒）；独立后端全套771通过/1跳过（333.36秒），使用E盘隔离PostgreSQL测试库并按conftest清理。工作流最终全套1713通过/1失败/8跳过（335.79秒），唯一失败为浏览器测试分配到Chrome禁止的临时6000端口，Page.goto报ERR_UNSAFE_PORT；未修改浏览器安全策略或产品代码，同一浏览器测试文件独立重测2通过（11.79秒）。两套CLI --help均exit=0。最终3865个不同用例通过或复测通过、45跳过，但不称一次性全套零失败。diff --check通过，仅既有弃用及CRLF提示。
+- RED/GREEN: 主线先8失败，修复后通过；部分审核返回另有1失败后修正。政策回归两库先14失败/12通过，后26通过；AI版本回归及真实扩写样本均先红后绿，最终52通过。新增共89项/每套。
+- Diagnostics: 首轮相关新闻回归268通过/1失败，旧默认0/0断言在收集时已加载；更新断言后相关17通过。工作流首轮全套1712通过/1失败/8跳过，失败test_collect_ai_digest_updates_uses_search_backfill_for_daily_digest_quotas的Claude Code测试材料仅说更新、无具体事实；更换为具体MCP认证变化夹具，保留原8条和配额断言后相关12项通过，最终完整重跑中。
+- Evidence: 只读回放2026-10-22稿0a45c8541dac4f61a9e67f8232fd50f4：20条中排除7条（6条只有版本号的Codex alpha、1条泛泛Claude维护），保留13条候选；Claude Code有明确不同变化的3条仍可候选，不按厂商硬限额删掉。discovery 7fdb0b0df5a54c0ab01dbb784eaacefe中的6条中办国办政策条款经事件去重保留1条。回放不代表重新生成或通过真实LLM影响力审核；原稿、草稿、检查点均未改写。
+- Risk: 两库GitNexus预编辑影响HIGH/CRITICAL，直接链路为pick_news_items/discovery._review/create_daily_news_posts/CLI与智能体工具。UNKNOWN的测试函数已用源码及pytest收集补证，不作未使用判断。最终detect_changes未标记partial/truncated；新助手与测试未建索引部分由回归和真实材料回放补证。
+- Boundaries: 不恢复来源/厂商/国内外硬配额；匿名政策合并仍为受限推断，同机关同媒体30分钟内两份未具名科技政策可能误聚，证据不足保守保留。新闻正文150–220、复杂最多300、评价50–100、AI正文800、MiniMax medium/131072保持。无新依赖或C盘安装，不调用真实LLM、生图、上传或发布接口，不重启正式服务。
+- Completion: 2026-10-23 10:08 GMT+8验证结束，新增回归每套89项通过。两个子智能体已冻结并关闭；临时HTTP测试服务由finally清理。正式已上传旧稿不自动重写，后续新任务使用修复。未重启正式服务、未提交或推送。随机浏览器测试端口仍有碰到浏览器保留端口的环境风险，原始失败与重测日志均保留。

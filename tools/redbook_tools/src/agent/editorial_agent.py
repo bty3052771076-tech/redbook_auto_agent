@@ -669,6 +669,7 @@ def _build_graph(
             repeated = int(previous.get("count", 0)) + 1 if previous.get("reason") == state["last_failure"] else 1
             record["generation_failure"] = {"reason": state["last_failure"], "count": repeated}
             capability_denied = str(getattr(exc, 'code', '')).startswith('CAPABILITY_')
+            body_budget_failed = job.kind == "daily_ai_digest" and "AI_DIGEST_BODY_LIMIT:" in state["last_failure"]
             requires_resolution = capability_denied or any(code in state["last_failure"] for code in (
                 "OPENCODEX_PREVIOUS_REQUEST_UNCERTAIN", "OPENCODEX_RESULT_UNCERTAIN",
                 "OPENCODEX_PREVIOUS_REQUEST_REJECTED", "OPENCODEX_HTTP_400",
@@ -690,11 +691,13 @@ def _build_graph(
             verification_incomplete = "WOOL_VERIFICATION_INCOMPLETE" in state["last_failure"]
             if verification_incomplete:
                 record["wool_notice"] = state["last_failure"].split("WOOL_VERIFICATION_INCOMPLETE:", 1)[-1].strip()
-            if requires_resolution or material_exhausted or verification_incomplete:
+            if requires_resolution or material_exhausted or verification_incomplete or body_budget_failed:
                 state["retryable"] = False
                 state["job_blocked"] = True
                 action = ("CAPABILITY_RESOLUTION_REQUIRED: 工具策略阻止执行，保留进度；请在能力中心核对；"
                           if capability_denied else
+                          "AI_DIGEST_BODY_RESOLUTION_REQUIRED: 正文无法满足800字符上限，已保留进度；请修正正文排版后续跑，不重采资讯；"
+                          if body_budget_failed else
                           "SOURCE_REFRESH_REQUIRED: 连续三次相同资讯材料错误，需补充或修正可核验材料后续跑；"
                           if material_exhausted else
                           "SOURCE_VERIFICATION_REQUIRED: 请检查福利信源状态，恢复后续跑；"

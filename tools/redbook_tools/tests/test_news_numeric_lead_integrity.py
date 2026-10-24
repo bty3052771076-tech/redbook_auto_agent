@@ -149,6 +149,8 @@ def test_candidate_rewrites_unverified_quantity_once_and_rechecks_it(monkeypatch
         queues.close()
     assert len(calls) == 2
     assert "unsupported_numeric_claim" in calls[1]
+    assert '"9000"' in calls[1]
+    assert "未得到材料支持的数量" in calls[1]
     if repair_valid:
         assert result.status == "success", (result.reason, result.draft)
         assert result.post.body.startswith("内容：\n" + SETTLER_LEAD)

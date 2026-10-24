@@ -950,6 +950,131 @@ _GENERIC_CHANGE_TITLE_RE = re.compile(
 )
 
 
+_CODING_TOOL_REPOSITORIES = {
+    "openai/codex": r"\bcodex[\s_-]+cli\b",
+    "anthropics/claude-code": r"\bclaude[\s_-]+code\b",
+}
+_SOFTWARE_RELEASE_VERSION_RE = re.compile(
+    r"(?<![\w.])(?:rust-)?v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+    r"(?:[-.](?P<stage>alpha|beta|rc|preview|dev)(?:[.-]?(?P<serial>\d+(?:\.\d+)*))?)?(?![\w.])",
+    re.IGNORECASE,
+)
+_RELEASE_BOILERPLATE_WORDS = set(
+    "a an the and or with for from in on of to is are this that now new latest "
+    "release releases released version versions update updates updated changelog "
+    "what s changed full notes maintenance routine minor patch patches alpha beta "
+    "rc preview dev build builds bug bugs bugfix bugfixes fixes improvements "
+    "improvement enhancements enhancement performance stability reliability various general "
+    "misc miscellaneous some several small contains includes including github official "
+    "openai anthropic anthropics 在 的 并".split()
+)
+_RELEASE_ACTION_WORDS = {
+    "add", "adds", "added", "fix", "fixed", "improve", "improved",
+    "support", "supports", "enable", "enabled", "remove", "removed",
+}
+
+
+def _github_release_identity(item: AIUpdateItem) -> tuple[str, str] | None:
+    try:
+        parsed = urlsplit(item.url or "")
+    except ValueError:
+        return None
+    parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
+    if (parsed.hostname or "").lower() not in {"github.com", "www.github.com"}:
+        return None
+    if len(parts) != 5 or parts[2:4] != ["releases", "tag"]:
+        return None
+    return "/".join(parts[:2]).lower(), parts[4]
+
+
+def _coding_tool_product(item: AIUpdateItem) -> str:
+    release = _github_release_identity(item)
+    if release:
+        # Repository evidence wins over an incidental model/product in notes.
+        return release[0] if release[0] in _CODING_TOOL_REPOSITORIES else ""
+    headline = f"{item.title} {item.product}"
+    for product, pattern in _CODING_TOOL_REPOSITORIES.items():
+        if re.search(pattern, headline, re.IGNORECASE):
+            return product
+    return ""
+
+
+def _release_change_signature(item: AIUpdateItem) -> str:
+    """Discard release labels, but retain concrete targets, actions and numbers."""
+    # A writer's expansion cannot supply facts absent from the source evidence.
+    text = ((item.raw_excerpt or "").strip() or " ".join((item.title, item.summary))).lower()
+    text = re.sub(r"\brelease(?=v?\d)", "release ", text)
+    release = _github_release_identity(item)
+    headline = re.sub(r"\brelease(?=v?\d)", "release ", f"{item.title} {item.product}".lower())
+    own_version = _SOFTWARE_RELEASE_VERSION_RE.search(release[1].lower() if release else headline)
+    text = _SOFTWARE_RELEASE_VERSION_RE.sub(
+        lambda match: " " if own_version and match.groups() == own_version.groups() else match[0],
+        text,
+    )
+    text = re.sub(r"\b(?:codex(?:[\s_-]+cli)?|claude[\s_-]+code)\b", " ", text)
+    text = re.sub(
+        r"该版本属于|主要进行|(?:错误)?修复[与和]可靠性改进|"
+        r"错误修复并提升可靠性|官方\s*(?:github\s*)?(?:项目(?:的)?)?",
+        " ",
+        text,
+    )
+    for phrase in (
+        "修复若干问题", "修复了一些问题", "修复一些问题", "修复问题",
+        "错误修复", "缺陷修复", "修复bug", "优化性能和稳定性", "性能和稳定性优化",
+        "优化稳定性",
+        "性能优化", "稳定性改进", "常规维护", "预发布版本", "版本", "发布", "更新", "进行",
+    ):
+        text = text.replace(phrase, " ")
+    words = [
+        word for word in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text)
+        if word not in _RELEASE_BOILERPLATE_WORDS
+    ]
+    if not set(words) - _RELEASE_ACTION_WORDS:
+        return ""
+    # Ignore duplicated summary/excerpt text without erasing action direction.
+    return " ".join(dict.fromkeys(words))
+
+
+def _dedupe_tool_release_stream(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
+    """Collapse equivalent releases only inside the caller's briefing window."""
+    output: list[AIUpdateItem] = []
+    groups: dict[tuple[str, str, str, str], int] = {}
+    latest: dict[tuple[str, str, str, str], tuple[int, datetime, int, int, tuple[int, ...]]] = {}
+    for item in items:
+        product = _coding_tool_product(item)
+        release = _github_release_identity(item)
+        version = _SOFTWARE_RELEASE_VERSION_RE.search(
+            release[1] if release else f"{item.title} {item.product}"
+        )
+        published = _parse_published_datetime(item.published_at)
+        if not product or not version or published is None:
+            output.append(item)
+            continue
+        key = (product, version["major"], version["minor"], _release_change_signature(item))
+        order = (
+            _source_priority(item), published, int(version["patch"]),
+            {"dev": 0, "alpha": 1, "beta": 2, "preview": 3, "rc": 4, "": 5}[
+                (version["stage"] or "").lower()
+            ],
+            tuple(int(part) for part in (version["serial"] or "0").split(".")),
+        )
+        if key not in groups:
+            groups[key] = len(output)
+            latest[key] = order
+            output.append(item)
+            continue
+        index = groups[key]
+        previous = output[index]
+        # Preserve direct sources, then prefer the newest equivalent release
+        # over a shorter headline or an older, more corroborated prerelease.
+        if order > latest[key]:
+            output[index] = _merge_items(item, previous)
+            latest[key] = order
+        else:
+            output[index] = _merge_items(previous, item)
+    return output
+
+
 def ai_update_quality_issues(item: AIUpdateItem) -> tuple[str, ...]:
     """Return deterministic quality issues before an item reaches the LLM.
 
@@ -995,6 +1120,11 @@ def ai_update_quality_issues(item: AIUpdateItem) -> tuple[str, ...]:
         if len(excerpt or summary) < 48 or not has_named_model:
             issues.append("contentless")
 
+    if (
+        _coding_tool_product(item) or (_github_release_identity(item) and not has_named_model)
+    ) and not _release_change_signature(item):
+        issues.append("non_substantive_release")
+
     return tuple(dict.fromkeys(issues))
 
 
@@ -1030,6 +1160,8 @@ def ai_library_release_identity(item: AIUpdateItem) -> tuple[str, str] | None:
 
 def _has_explicit_model_release(item: AIUpdateItem) -> bool:
     """Return whether the headline identifies a model version being released."""
+    if _coding_tool_product(item):
+        return False
     if ai_library_release_identity(item):
         return False
     headline_fields = f"{item.title} {item.product}".strip().lower()
@@ -1082,6 +1214,8 @@ def ai_update_is_non_model_infrastructure_notice(item: AIUpdateItem) -> bool:
 
 
 def ai_update_category(item: AIUpdateItem) -> str:
+    if _coding_tool_product(item):
+        return "technical_tool"
     if ai_library_release_identity(item):
         return "technical_tool"
     blob = _text_blob(item).lower()
@@ -1362,6 +1496,7 @@ def _prefer_item(a: AIUpdateItem, b: AIUpdateItem) -> AIUpdateItem:
 
 
 def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
+    items = _dedupe_tool_release_stream(items)
     by_key: OrderedDict[str, AIUpdateItem] = OrderedDict()
     title_keys: dict[str, str] = {}
     topic_keys: dict[str, str] = {}
@@ -1392,8 +1527,12 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
         stable_event = _stable_cross_source_event_key(item)
         stable_lookup_key = f"event:{stable_event}" if stable_event else ""
         title_key = item.title_key
-        if github_release and title_key:
-            title_key = f"{release_url.path.split('/releases/tag/', 1)[0]}:{title_key}"
+        tool_product = _coding_tool_product(item)
+        tool_release = bool(tool_product and _SOFTWARE_RELEASE_VERSION_RE.search(
+            f"{item.title} {item.product}"
+        ))
+        if (github_release or tool_release) and title_key:
+            title_key = f"{item.normalized_url}:{title_key}"
         semantic_key = _semantic_topic_key(item)
         # Generic categories such as ``topic:benchmark`` are not event
         # identities. Do not merge them at all; URL/title keys still remove
@@ -1411,9 +1550,10 @@ def _dedupe_updates(items: list[AIUpdateItem]) -> list[AIUpdateItem]:
             "topic:updates",
         }
         semantic_lookup_key = "" if semantic_key in generic_topic_keys else semantic_key
-        if github_release:
+        if github_release or tool_release:
             # A coarse topic such as v2 cannot identify a specific release.
             semantic_lookup_key = ""
+            stable_lookup_key = ""
         existing_key = title_keys.get(title_key)
         if not existing_key and semantic_lookup_key:
             existing_key = topic_keys.get(semantic_lookup_key)

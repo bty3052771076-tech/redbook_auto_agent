@@ -235,13 +235,18 @@ def configuration_fingerprint(current, config: LLMConfig) -> str:
 def call_model(config: LLMConfig, payload: dict) -> str:
     from types import SimpleNamespace
     from src.agent.capabilities.context_usage import invoke_observed
+    from src.llm.request_policy import minimax_output_tokens, minimax_reasoning_options
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
     if config.platform_snapshot:
         from src.model_platforms.integration import invoke
         return invoke_observed(config, messages, lambda: invoke(config, messages, max_tokens=4096)).content
-    request = {"model": config.model, "messages": messages, "max_tokens": 4096, "stream": False}
+    reasoning = minimax_reasoning_options(config.model)
+    output_limit = minimax_output_tokens(config.model, 4096)
+    token_parameter = "max_completion_tokens" if reasoning else "max_tokens"
+    request = {"model": config.model, "messages": messages, token_parameter: output_limit, "stream": False}
+    request.update(reasoning)
     if config.provider == "minimax":
         request["reasoning_split"] = True
         if config.model.lower() == "minimax-m3":
@@ -270,7 +275,7 @@ def call_model(config: LLMConfig, payload: dict) -> str:
             result = response.json()
             choice = result["choices"][0]
             if choice.get("finish_reason") == "length":
-                raise ValueError("TASK_LLM_INVALID_OUTPUT：模型输出达到4096 token上限，未完成；请简化任务")
+                raise ValueError(f"TASK_LLM_INVALID_OUTPUT：模型输出达到{output_limit} token上限，未完成；请简化任务")
             content = choice["message"]["content"]
             if not isinstance(content, str) or not content.strip():
                 raise KeyError("content")

@@ -341,3 +341,26 @@ def test_scene_rewrite_must_not_bypass_rewritten_body_fact_failure(monkeypatch, 
     assert result.reason == "unsupported_numeric_claim"
     assert len(calls) == len(checked) == 2
     assert images == []
+
+
+def test_concept_word_order_repair_retains_approved_body_without_second_writer(monkeypatch, tmp_path):
+    sample = dict(
+        title="银行下调积存金手续费",
+        facts="近期，多家银行调整积存金收费情况，部分银行将手续费降至零。",
+        source="Banks lower gold savings fees",
+        description="Several banks lowered gold savings fees, with some charging no fee.",
+    )
+    scene = sample["facts"] + "多家银行下调积存金手续费的概念示意，以非写实金色色面构图。"
+    result, calls, images, checked, saved = prepare(
+        monkeypatch, tmp_path, sample, [scene], auto_image_enabled=False,
+    )
+    assert result.status == "success"
+    assert len(calls) == len(checked) == 1
+    assert images == []
+    assert result.draft["body"] == checked[0]
+    assert sample["facts"] in result.post.platform["news"]["image_event"]
+    audit = result.post.platform["news"]["image_event_audit"]
+    assert audit["accepted"] is True
+    assert audit["repair_strategy"] == "accepted_fact_concept"
+    assert audit["fallback_from"]["reason"] == "missing_source_subject_action"
+    assert audit["attempts"][0]["accepted"] is False
