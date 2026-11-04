@@ -779,7 +779,7 @@ def _prepare_auto_pipeline(
                 "success",
                 "已明确使用 MiniMax 订阅；未同步额度，不将订阅标记为免费额度",
             )
-    if requested_image_provider == "opencodex":
+    if requested_image_provider in {"opencodex", "ccswitch"}:
         # Local subscription images have their own route verification, not a
         # fabricated free-quota record. Do not overwrite the explicit binding.
         plan_records = [record for record in plan_records if record.kind != "image"]
@@ -813,8 +813,8 @@ def _prepare_auto_pipeline(
                 (
                     f"image={model_plan.image.provider}/{model_plan.image.model}"
                     if model_plan.image is not None
-                    else "image=opencodex/gpt-image-2 (订阅路径单独核验)"
-                    if requested_image_provider == "opencodex"
+                    else f"image={requested_image_provider}/gpt-image-2 (订阅路径单独核验)"
+                    if requested_image_provider in {"opencodex", "ccswitch"}
                     else "image=本地渲染"
                 ),
                 (
@@ -1884,7 +1884,7 @@ def _emit_missing_assets_hint(title: str, *, dry_run: bool = False) -> None:
         typer.echo("note: 每日AI讯息会自动渲染本地简报图，无需本地素材或 AI 生图。")
         return
     if _is_daily_wool_title(title):
-        if os.getenv("WOOL_IMAGE_MODE") == "reference_edit" or os.getenv("IMAGE_PROVIDER") == "opencodex":
+        if os.getenv("WOOL_IMAGE_MODE") == "reference_edit" or os.getenv("IMAGE_PROVIDER") in {"opencodex", "ccswitch"}:
             typer.echo("note: AI福利将使用参考构图与厂商人设进行双图编辑；没有核验通过的福利时生成中性插画，不编造活动。")
         else:
             typer.echo("note: 每日羊毛会按核验结果自动选择本地羊图，无需提供素材或调用付费生图。")
@@ -3693,7 +3693,7 @@ def editorial_agent_command(
         ctx,
         {
             "LLM_PROVIDER": "minimax",
-            "IMAGE_PROVIDER": "opencodex" if os.getenv("IMAGE_PROVIDER") == "opencodex" else "minimax",
+            "IMAGE_PROVIDER": os.getenv("IMAGE_PROVIDER") if os.getenv("IMAGE_PROVIDER") in {"opencodex", "ccswitch"} else "minimax",
             "MINIMAX_USE_SUBSCRIPTION": "1",
             "MINIMAX_BILLING_MODE": "subscription_only",
             "ALLOW_PAID_LLM_FALLBACK": "0",
@@ -3724,7 +3724,7 @@ def editorial_agent_command(
                 wait_timeout=wait_timeout,
                 metrics_max_age_hours=24.0,
                 quota_max_age_hours=2.0,
-                require_image=os.getenv("IMAGE_PROVIDER") != "opencodex",
+                require_image=os.getenv("IMAGE_PROVIDER") not in {"opencodex", "ccswitch"},
                 refresh_quotas=refresh_quotas,
             )
             metrics_sync_mode = report.metrics_mode

@@ -4,6 +4,13 @@ import os
 from pathlib import Path
 import tempfile
 from uuid import uuid4
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_memory_policy(monkeypatch):
+    if os.getenv("REDBOOK_TEST_MEMORY_POLICY") != "1":
+        monkeypatch.setenv("REDBOOK_MEMORY_ENABLED", "0")
 
 import psycopg
 from psycopg import sql

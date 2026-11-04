@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { CheckCircle2, CircleAlert, Clock3, LoaderCircle, RefreshCw } from "lucide-react";
-import type { ConversationTurn, GoalSnapshot, Run } from "./api";
+import { CheckCircle2, ChevronLeft, CircleAlert, Clock3, Download, LoaderCircle, RefreshCw } from "lucide-react";
+import { api, type ConversationTurn, type GoalSnapshot, type Run } from "./api";
 
 export const activeStatuses = new Set(["queued", "running", "waiting_user", "stopping"]);
 export const pendingTurnStates = new Set(["accepted", "queued", "applying"]);
@@ -79,6 +79,9 @@ export function RunProgress({ run, compact = false, connectionError = "", onRefr
     </div>
     <p className="progress-current" aria-live="polite">{activity.headline}</p>
     <div className="progress-time"><Clock3 size={13} /><span>已用时 {duration(elapsed)}</span></div>
+    {run.resources && <p className="progress-freshness">可用内存 {run.resources.available === null ? '未知' : `${(run.resources.available / 1073741824).toFixed(1)} GiB`}
+      {' · '}{run.resources.enabled === false ? '内存自动调节已关闭' : ({ normal: '余量正常', tight: '保守并发', critical: '等待释放内存', unknown: '保守并发' } as Record<string, string>)[run.resources.pressure] || run.resources.pressure}
+      {' · 图片在途 '}{run.resources.active.image || 0}</p>}
     {!compact && <>
       {activity.pipeline && <div className="progress-counts" aria-label="候选处理进度">{([
         ["候选正文通过", activity.pipeline.text_approved], ["图片就绪", activity.pipeline.image_ready],
@@ -109,5 +112,24 @@ export function RunProgress({ run, compact = false, connectionError = "", onRefr
 }
 
 export function TechnicalLog({ run }: { run: Run }) {
-  return <details className="technical-log"><summary>技术日志</summary><pre>{JSON.stringify(run.events || [], null, 2)}</pre></details>;
+  const [open, setOpen] = useState(false);
+  const [before, setBefore] = useState<number>();
+  const [error, setError] = useState('');
+  const [result, setResult] = useState<{ rows: NonNullable<Run['events']>; has_more: boolean; truncated: boolean; full_log_url?: string }>();
+  useEffect(() => { setBefore(undefined); setResult(undefined); }, [run.id]);
+  useEffect(() => {
+    if (!open) return;
+    let disposed = false;
+    api<NonNullable<typeof result>>(`/api/runs/${run.id}/log?limit=100${before === undefined ? '' : `&before=${before}`}`)
+      .then(value => { if (!disposed) { setResult(value); setError(''); } })
+      .catch(cause => { if (!disposed) setError(cause instanceof Error ? cause.message : String(cause)); });
+    return () => { disposed = true; };
+  }, [open, run.id, before, before === undefined ? run.events?.at(-1)?.id : undefined]);
+  return <details className="technical-log" open={open} onToggle={event => setOpen(event.currentTarget.open)}><summary>技术日志</summary>
+    {open && <>{error && <p role="status">{error}</p>}<div className="review-actions">
+      <button className="quiet-button" disabled={!result?.has_more} onClick={() => setBefore(result?.rows[0]?.id)}><ChevronLeft size={14} />较早日志</button>
+      <button className="icon-button" title="最新日志" aria-label="最新日志" onClick={() => setBefore(undefined)}><RefreshCw size={14} /></button>
+      {result?.full_log_url && <a className="quiet-button" href={result.full_log_url} download><Download size={14} />完整日志</a>}
+    </div><pre>{result ? JSON.stringify(result.rows, null, 2) : '正在读取日志'}</pre></>}
+  </details>;
 }

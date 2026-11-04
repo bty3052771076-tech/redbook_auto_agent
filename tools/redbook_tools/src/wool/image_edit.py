@@ -29,6 +29,9 @@ def pick_persona(provider: str) -> tuple[str, str] | None:
 
 
 def create_wool_image(*, post_id: str, offers: list, issue_date: str) -> tuple[Path, dict[str, Any]]:
+    generate_image = generate_subscription_image
+    if os.getenv("IMAGE_PROVIDER") == "ccswitch":
+        from src.images.ccswitch_images import generate_subscription_image as generate_image
     runtime_root = Path(os.getenv("REDBOOK_RUNTIME_ROOT") or ".").resolve()
     root = wool_asset_root(runtime_root)
     configured_reference = os.getenv("WOOL_REFERENCE_IMAGE")
@@ -66,7 +69,7 @@ def create_wool_image(*, post_id: str, offers: list, issue_date: str) -> tuple[P
             "No labels, captions, Japanese writing, JSON, watermarks, extra characters, logos, prices, "
             "token amounts, expiry dates or invented promotional claims."
         )
-        result = generate_subscription_image(post_id=post_id, prompt=prompt, dest_dir=dest_dir,
+        result = generate_image(post_id=post_id, prompt=prompt, dest_dir=dest_dir,
                                              reference_paths=[reference, persona],
                                              allow_minimax_fallback=False)
         return result.path, {**result.meta, **reference_meta, "asset_mode": "reference_persona_edit",
@@ -81,7 +84,7 @@ def create_wool_image(*, post_id: str, offers: list, issue_date: str) -> tuple[P
         "This illustrates a factual AI benefits bulletin with no currently verified offers, "
         "not a promise that any promotion exists."
     )
-    result = generate_subscription_image(post_id=post_id, prompt=prompt, dest_dir=dest_dir,
+    result = generate_image(post_id=post_id, prompt=prompt, dest_dir=dest_dir,
                                          allow_minimax_fallback=False)
     return result.path, {**result.meta, "asset_mode": "no_offer_neutral_ai_illustration",
                          "issue_date": issue_date, "cover_provider": None}

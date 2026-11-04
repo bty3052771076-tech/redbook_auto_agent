@@ -5,7 +5,6 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from .ingest import ingest_posts
-from .embeddings import index_pending_documents
 from .store import KnowledgeStore
 
 
@@ -15,6 +14,7 @@ def prepare_local_knowledge_snapshot(
     store: KnowledgeStore | None = None,
     progress_callback: Callable[[dict[str, int]], None] | None = None,
 ) -> dict[str, Any]:
+    from .embeddings import index_pending_documents
     current = store or KnowledgeStore.from_env()
     try:
         readiness = current.status()

@@ -73,7 +73,7 @@ export type TaskRecognition = {
   error: string; candidate?: Plan | null;
   changes: { label: string; before: unknown; after: unknown }[];
 };
-export type Conversation = { id: string; title: string; messages: Message[]; plans: Plan[]; runs: string[]; status: string; conversation_revision?: number; task_recognitions?: TaskRecognition[]; goals?: GoalSnapshot[]; turns?: ConversationTurn[] };
+export type Conversation = { id: string; title: string; messages: Message[]; plans: Plan[]; runs: string[]; status: string; conversation_revision?: number; message_page?: { has_more: boolean; before_seq: number | null; latest: boolean }; task_recognitions?: TaskRecognition[]; goals?: GoalSnapshot[]; turns?: ConversationTurn[] };
 export type Activity = {
   pipeline?: { text_approved: number; image_ready: number; repairing: number; rejected: number } | null;
   status: string; status_label: string; active: boolean; headline: string; summary: string;
@@ -84,7 +84,7 @@ export type Activity = {
   timeline: { id: string; at: number; text: string; status: string; stage: string }[];
   issues: { message: string; action: string }[];
 };
-export type Run = { id: string; model_snapshots?: Record<string, { upstream_model_id: string; connection_name: string; adapter: string }>; agent_run_id?: string; resume_of?: string; title?: string; status: string; status_label?: string; display_message?: string; message?: string; stage?: string; created_at?: number; started_at?: number; ended_at?: number; events?: { id: number; at: number; message: string }[]; post_rows?: { id: string; title?: string; images?: number; status?: string; readback?: string }[]; activity?: Activity; local_post_ids?: string[]; retained_post_ids?: string[] };
+export type Run = { id: string; resources?: { enabled?: boolean; pressure: string; available: number | null; active: Record<string, number> }; model_snapshots?: Record<string, { upstream_model_id: string; connection_name: string; adapter: string }>; agent_run_id?: string; resume_of?: string; title?: string; status: string; status_label?: string; display_message?: string; message?: string; stage?: string; created_at?: number; started_at?: number; ended_at?: number; events?: { id: number; at: number; message: string }[]; post_rows?: { id: string; title?: string; images?: number; status?: string; readback?: string }[]; activity?: Activity; local_post_ids?: string[]; retained_post_ids?: string[] };
 export type DraftSummary = {
   post_id: string;
   title: string;

@@ -76,6 +76,7 @@ function App() {
   const [capabilityPending, setCapabilityPending] = useState(false);
   const [planEditing, setPlanEditing] = useState(false);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [runCursor, setRunCursor] = useState<string | null>(null);
   const [activeRun, setActiveRun] = useState<Run | null>(null);
   const [runConnectionError, setRunConnectionError] = useState("");
   const [drafts, setDrafts] = useState<DraftSummary[]>([]);
@@ -151,15 +152,11 @@ function App() {
   const fail = (reason: unknown) => { setError(reason instanceof Error ? reason.message : String(reason)); setNotice(""); };
   const load = useCallback(async () => {
     try {
-      const [allConversations, allRuns, allDrafts, allConnections] = await Promise.all([
+      const [allConversations, allConnections] = await Promise.all([
         api<{ rows: Conversation[] }>("/api/conversations"),
-        api<{ rows: Run[] }>("/api/runs"),
-        api<{ rows: DraftSummary[] }>("/api/drafts"),
         api<Connections>("/api/connections"),
       ]);
       setConversations(allConversations.rows);
-      setRuns(allRuns.rows);
-      setDrafts(allDrafts.rows);
       setConnections(allConnections);
       setRoles(allConnections.providers.bindings);
       setReady(true);
@@ -178,22 +175,66 @@ function App() {
       if (saved) await openConversation(saved);
     }).catch(fail);
   }, [load]);
+
   useEffect(() => {
-    if ((!activeRun || !activeStatuses.has(activeRun.status)) && !(hasContinuity && page === 'chat')) return;
+    if (!sessionReady) return;
+    let disposed = false;
+    if (page === 'drafts') api<{ rows: DraftSummary[] }>('/api/drafts')
+      .then(value => { if (!disposed) setDrafts(value.rows); }).catch(cause => { if (!disposed) fail(cause); });
+    if (page === 'runs' || page === 'capabilities') api<{ rows: Run[]; next_cursor: string | null }>('/api/runs?limit=50')
+      .then(value => { if (!disposed) { setRuns(value.rows); setRunCursor(value.next_cursor); } }).catch(cause => { if (!disposed) fail(cause); });
+    if (page !== 'drafts') setDraft(null);
+    return () => { disposed = true; };
+  }, [sessionReady, page]);
+
+  async function readConversation(id: string, since?: number) {
+    const path = `/api/conversations/${id}?message_limit=50${since === undefined ? '' : `&since_revision=${since}`}`;
+    const result = await api<Conversation & { not_modified?: boolean }>(path);
+    if (result.not_modified && conversationRef.current?.id === id) return conversationRef.current;
+    return result;
+  }
+
+  async function olderMessages(latest = false) {
+    if (!conversation) return;
+    const id = conversation.id;
+    const before = conversation.message_page?.before_seq;
+    const loaded = await api<Conversation>(`/api/conversations/${id}?message_limit=50${latest || !before ? '' : `&before_seq=${before}`}`);
+    if (conversationRef.current?.id === id) receiveConversation(loaded);
+  }
+
+  async function olderRuns() {
+    if (!runCursor) return;
+    const value = await api<{ rows: Run[]; next_cursor: string | null }>(`/api/runs?limit=50&before=${runCursor}`);
+    setRuns(value.rows); setRunCursor(value.next_cursor);
+  }
+
+  async function refreshRuns() {
+    const value = await api<{ rows: Run[]; next_cursor: string | null }>('/api/runs?limit=50');
+    setRuns(value.rows); setRunCursor(value.next_cursor);
+  }
+
+  useEffect(() => {
+    if ((!activeRun || !activeStatuses.has(activeRun.status)) && !goalPending) return;
     const runId = activeRun?.id;
     const conversationId = conversation?.id;
     const version = selectionVersion.current;
     let disposed = false;
     let timer: number;
+    let lastConversationPoll = 0;
+    let polling = false;
     const poll = async () => {
+      if (polling) return;
+      polling = true;
       try {
-        const current = runId ? await api<Run>(`/api/runs/${runId}`) : null;
+        const current = runId ? await api<Run>(`/api/runs/${runId}?compact=true`) : null;
         if (disposed) return;
         if (version !== selectionVersion.current) return;
-        if (current) setActiveRun(current);
+        if (current && activeStatuses.has(current.status)) setActiveRun(current);
         setRunConnectionError("");
-        if (hasContinuity && conversationId && page === 'chat') {
-          const updated = await api<Conversation>(`/api/conversations/${conversationId}`);
+        const terminal = current && !activeStatuses.has(current.status);
+        if (hasContinuity && conversationId && page === 'chat' && (terminal || Date.now() - lastConversationPoll >= 15000)) {
+          lastConversationPoll = Date.now();
+          const updated = await readConversation(conversationId, conversationRef.current?.conversation_revision);
           const goalRows = await api<{ rows: GoalSnapshot[] }>(`/api/conversations/${conversationId}/goals`);
           if (disposed || version !== selectionVersion.current) return;
           receiveConversation({ ...updated, goals: goalRows.rows }); setContinuityError('');
@@ -206,22 +247,28 @@ function App() {
           await load();
           if (disposed) return;
           if (conversationId) {
-            const updated = await api<Conversation>(`/api/conversations/${conversationId}`);
+            const updated = await readConversation(conversationId);
             if (!disposed && version === selectionVersion.current) receiveConversation(updated);
           }
+          if (!disposed) setActiveRun(current);
           return;
         }
+        if (current && !disposed) setActiveRun(current);
       } catch (cause) {
         if (!disposed && version === selectionVersion.current) {
           const message = cause instanceof Error ? cause.message : String(cause);
           if (hasContinuity) setContinuityError(message); else setRunConnectionError(message);
         }
+      } finally {
+        polling = false;
       }
-      if (!disposed) timer = window.setTimeout(poll, 2000);
+      if (!disposed) timer = window.setTimeout(poll, document.hidden ? 15000 : 2000);
     };
     timer = window.setTimeout(poll, 2000);
-    return () => { disposed = true; window.clearTimeout(timer); };
-  }, [activeRun?.id, activeRun?.status, conversation?.id, hasContinuity, page, selectionEpoch, load]);
+    const visible = () => { if (!document.hidden) { window.clearTimeout(timer); timer = window.setTimeout(poll, 0); } };
+    document.addEventListener('visibilitychange', visible);
+    return () => { disposed = true; window.clearTimeout(timer); document.removeEventListener('visibilitychange', visible); };
+  }, [activeRun?.id, activeRun?.status, conversation?.id, hasContinuity, goalPending, page, selectionEpoch, load]);
 
   async function refreshRun() {
     if (!activeRun) return;
@@ -250,7 +297,7 @@ function App() {
     setSelectionEpoch(value => value + 1);
     setError("");
     try {
-      let loaded = await api<Conversation>(`/api/conversations/${id}`);
+      let loaded = await readConversation(id);
       if (version !== selectionVersion.current) return;
       if (loaded.goals !== undefined || loaded.turns !== undefined) {
         try {
@@ -453,6 +500,7 @@ function App() {
               </div></>}
               {continuityError && <p className="calibration-error" role="status">状态连接中断，保留上次记录：{continuityError}</p>}
             </section>}
+            <div className="review-actions">{conversation?.message_page?.has_more && <button className="quiet-button" onClick={() => olderMessages().catch(fail)}>较早消息</button>}{conversation?.message_page && !conversation.message_page.latest && <button className="quiet-button" onClick={() => olderMessages(true).catch(fail)}>返回最新</button>}</div>
             <div className="messages">{conversation?.messages.length ? conversation.messages.map((message) => <div key={message.id} className={`message ${message.role}`}><small>{message.role === "user" ? "你" : "智能体"} · {niceDate(message.created_at)}</small><p>{message.content}</p></div>) : <div className="empty-chat"><MessageSquare size={22} /><strong>开始一项采编任务</strong><span>输入自然语言要求，智能体先展示可确认的执行计划。</span></div>}
               <TurnProgress turns={(conversation?.turns || []).filter(turn => !selectedGoalId || !turn.goal_id || turn.goal_id === selectedGoalId)} />
               {conversation && <CompactionEvents overview={contextOverview} conversationId={conversation.id} compact />}
@@ -520,7 +568,7 @@ function App() {
             <div className="review-actions"><button className="quiet-button" onClick={() => setDraft(null)}>返回列表</button><button className="primary-button" onClick={approveDraft} disabled={busy || !verified || !draft.assets.length}><ShieldCheck size={16} />{verified ? "记录核验" : "核验未完成"}</button></div>
           </> : <div className="empty-detail"><ClipboardList size={30} /><h2>选择一条草稿</h2><p>查看正文、图片和平台回读状态。</p></div>}</section>
         </div>}
-        {ready && page === "runs" && <main className="standard-page"><div className="page-heading"><div><h1>运行记录</h1><p>查看每项任务的状态、耗时和错误原因。</p></div><button className="quiet-button" onClick={() => load().catch(fail)}><RefreshCw size={16} />刷新</button></div><div className="run-table"><div className="run-table-head"><span>任务</span><span>状态</span><span>开始时间</span><span>详细信息</span></div>{runs.map((item) => <button className="run-table-row" key={item.id} onClick={async () => { try { setActiveRun(await api<Run>(`/api/runs/${item.id}`)); setRunConnectionError(""); } catch (cause) { fail(cause); } }}><strong>{item.title || item.id}</strong><span className={["completed", "success"].includes(item.status) ? "status-good" : "status-amber"}>{item.status_label || "状态待读取"}</span><span>{niceDate(item.created_at)}</span><span>{item.display_message || "查看进度详情"}</span></button>)}{!runs.length && <p className="muted empty-list">尚无运行记录。</p>}</div>{activeRun && <div className="run-detail"><h2>任务详情</h2><RunProgress run={activeRun} connectionError={runConnectionError} onRefresh={refreshRun} />{activeRun.local_post_ids?.length ? <div className="run-draft-links"><strong>本地生成草稿，仍需人工审查</strong>{activeRun.local_post_ids.map((id) => <button className="quiet-button" key={id} onClick={() => showRunDraft(id)}>查看草稿 {id.slice(0, 8)}<ChevronRight size={14} /></button>)}</div> : null}<TechnicalLog run={activeRun} /></div>}</main>}
+        {ready && page === "runs" && <main className="standard-page"><div className="page-heading"><div><h1>运行记录</h1><p>查看每项任务的状态、耗时和错误原因。</p></div><button className="quiet-button" onClick={() => refreshRuns().catch(fail)}><RefreshCw size={16} />刷新</button></div><div className="review-actions"><button className="quiet-button" disabled={!runCursor} onClick={() => olderRuns().catch(fail)}>较早记录</button><button className="quiet-button" onClick={() => refreshRuns().catch(fail)}>最新记录</button></div><div className="run-table"><div className="run-table-head"><span>任务</span><span>状态</span><span>开始时间</span><span>详细信息</span></div>{runs.map((item) => <button className="run-table-row" key={item.id} onClick={async () => { try { setActiveRun(await api<Run>(`/api/runs/${item.id}`)); setRunConnectionError(""); } catch (cause) { fail(cause); } }}><strong>{item.title || item.id}</strong><span className={["completed", "success"].includes(item.status) ? "status-good" : "status-amber"}>{item.status_label || "状态待读取"}</span><span>{niceDate(item.created_at)}</span><span>{item.display_message || "查看进度详情"}</span></button>)}{!runs.length && <p className="muted empty-list">尚无运行记录。</p>}</div>{activeRun && <div className="run-detail"><h2>任务详情</h2><RunProgress run={activeRun} connectionError={runConnectionError} onRefresh={refreshRun} />{activeRun.local_post_ids?.length ? <div className="run-draft-links"><strong>本地生成草稿，仍需人工审查</strong>{activeRun.local_post_ids.map((id) => <button className="quiet-button" key={id} onClick={() => showRunDraft(id)}>查看草稿 {id.slice(0, 8)}<ChevronRight size={14} /></button>)}</div> : null}<TechnicalLog run={activeRun} /></div>}</main>}
         {ready && page === "connections" && <main className="standard-page connections-page"><div className="page-heading"><div><h1>连接与模型</h1><p>主控、写稿和生图分别选择；更改仅影响之后的新任务。</p></div></div><section className="db-line"><Database size={20} /><div><strong>PostgreSQL 与知识库</strong><p>{connections?.database.status === "ready" ? `连接正常 · 文档 ${connections.database.documents ?? 0} 条 · 已索引 ${connections.database.indexed_documents ?? 0} 条` : connections?.database.error || "未连接"}</p></div><button className="quiet-button" onClick={() => load().catch(fail)}><RefreshCw size={16} />检查连接</button></section><ModelPlatforms call={api} legacyModels={modelRows} defaultRoles={roles} onChanged={refreshModelConfiguration} /><section className="db-line"><div><strong>小红书创作者中心</strong><p>{connections?.profile_configured ? "专用 profile 已配置" : "专用 profile 未配置"}</p></div><button className="quiet-button" onClick={openProfile} disabled={busy}>打开专用浏览器</button></section></main>}
       </div>
     </div>

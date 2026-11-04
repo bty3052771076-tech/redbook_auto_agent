@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from apps import gui
+from src.workflow.job_journal import JobJournal
 from src.agent.conversation_store import PostgresConversationStore
 from src.config import DEFAULT_MINIMAX_IMAGE_MODEL, DEFAULT_MINIMAX_LLM_MODEL, MINIMAX_FLASH_LLM_MODEL
 from src.storage.files import _write_json_atomic, latest_execution, load_post, save_post
@@ -30,7 +31,7 @@ from src.global_map.service import preview_global_map_from_service
 from src.news.topics import DEFAULT_DAILY_NEWS_PROMPT
 
 ROOT = Path(os.getenv("REDBOOK_RUNTIME_ROOT") or Path(__file__).resolve().parents[1]).resolve()
-PROVIDERS = {"aliyun": "阿里云", "volcengine": "火山引擎", "siliconflow": "硅基流动", "minimax": "MiniMax", "opencodex": "OpenCodex / ChatGPT订阅"}
+PROVIDERS = {"aliyun": "阿里云", "volcengine": "火山引擎", "siliconflow": "硅基流动", "minimax": "MiniMax", "opencodex": "OpenCodex / ChatGPT订阅", "ccswitch": "CC Switch / ChatGPT订阅"}
 ROLE_NAMES = {"agent": "智能体主控", "writer": "写稿模型", "image": "生图模型"}
 CUSTOM_PROVIDER_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{1,50}$")
 CUSTOM_MODEL_ID = re.compile(r"^[^\s]{1,200}$")
@@ -167,14 +168,13 @@ class Workbench:
         self.conversation_store = conversation_store or PostgresConversationStore()
         self.lock = threading.RLock()
         self.process: subprocess.Popen | None = None
-        self.jobs: dict[str, dict] = {}
+        self.jobs = JobJournal(self.directory / "jobs", active_statuses=ACTIVE)
         for path in (self.directory / "jobs").glob("*.json"):
             job = read_json(path, {})
             if job.get("id"):
                 if job.get("status") in ACTIVE:
                     job.update(status="interrupted", ended_at=time.time(), message="服务曾中断。先核对平台草稿，不会自动重传。")
                     _write_json_atomic(path, job)
-                self.jobs[job["id"]] = job
 
     def _agent_conversation_path(self, conversation_id: str) -> Path:
         return self.directory / "conversations" / f"{valid_conversation_id(conversation_id)}.json"
@@ -452,8 +452,16 @@ class Workbench:
         self._write_agent_conversation(conversation)
         return {"message": self.redact(conversation["messages"][-2]), "assistant": self.redact(conversation["messages"][-1]), "plan": self.redact(plan)}
 
-    def get_agent_conversation(self, conversation_id: str) -> dict:
-        conversation = self._read_agent_conversation(valid_conversation_id(conversation_id))
+    def get_agent_conversation(self, conversation_id: str, *, message_limit=None, before_seq=None) -> dict:
+        if message_limit is not None and isinstance(self.conversation_store, PostgresConversationStore):
+            try:
+                conversation = self.conversation_store.get(valid_conversation_id(conversation_id),
+                    message_limit=message_limit, before_seq=before_seq)
+            except KeyError:
+                self._read_agent_conversation(valid_conversation_id(conversation_id))
+                conversation = self.conversation_store.get(conversation_id, message_limit=message_limit, before_seq=before_seq)
+        else:
+            conversation = self._read_agent_conversation(valid_conversation_id(conversation_id))
         conversation['conversation_revision'] = conversation.pop("_revision", 0)
         conversation.pop("_last_message_seq", None)
         from src.agent.plan_contract import normalize_plan
@@ -946,13 +954,15 @@ class Workbench:
             configured = any(value for key, value in env.items() if key.startswith(prefix) and ("KEY" in key or "TOKEN" in key))
             if provider == "opencodex":
                 configured = env.get("OPENCODEX_IMAGE_ENABLED") == "1"
+            elif provider == "ccswitch":
+                configured = env.get("CCSWITCH_IMAGE_ENABLED") == "1"
             rows.append({
                 "id": provider,
                 "name": label,
                 "label": label,
                 "builtin": True,
                 "protocol": "内置适配器",
-                "billing": "subscription" if provider in {"minimax", "opencodex"} else "unknown",
+                "billing": "subscription" if provider in {"minimax", "opencodex", "ccswitch"} else "unknown",
                 "configured": bool(configured),
                 "verification_status": "configured" if configured else "not_configured",
                 "models": [],
@@ -1168,10 +1178,12 @@ class Workbench:
                              "unit": "", "cost_class": billing, "quota_pool": "", "status": "custom",
                              "selectable": not reason, "disabled_reason": reason, "snapshot_at": 0, "expires_at": ""})
         from src.images.opencodex_images import image_connection_status
-        connection = image_connection_status(env)
-        if connection["enabled"]:
-            rows.append({"id": "opencodex:gpt-image-2", "provider": "opencodex",
-                         "provider_name": PROVIDERS["opencodex"], "model": "gpt-image-2", "kind": "image",
+        from src.images.ccswitch_images import image_connection_status as ccswitch_status
+        for provider, connection in (("opencodex", image_connection_status(env)), ("ccswitch", ccswitch_status(env))):
+            if not connection["enabled"]:
+                continue
+            rows.append({"id": provider + ":gpt-image-2", "provider": provider,
+                         "provider_name": PROVIDERS[provider], "model": "gpt-image-2", "kind": "image",
                          "remaining": None, "total": None, "used": None, "unit": "订阅额度未查询",
                          "cost_class": "subscription_included", "quota_pool": "ChatGPT subscription",
                          "status": "preflight_required", "selectable": True, "disabled_reason": "",
@@ -1413,8 +1425,8 @@ class Workbench:
                 if not image_role or not image_role.get("selectable") or image_role.get("kind") != "image":
                     raise ValueError("生图模型不可用：请重新选择有有效额度的生图模型")
             else:
-                image_provider = "opencodex" if env.get("IMAGE_PROVIDER") == "opencodex" else "minimax"
-                image_role = {"provider": image_provider, "model": "gpt-image-2" if image_provider == "opencodex" else env.get("MINIMAX_IMAGE_MODEL") or ""}
+                image_provider = env.get("IMAGE_PROVIDER") if env.get("IMAGE_PROVIDER") in {"opencodex", "ccswitch"} else "minimax"
+                image_role = {"provider": image_provider, "model": "gpt-image-2" if image_provider in {"opencodex", "ccswitch"} else env.get("MINIMAX_IMAGE_MODEL") or ""}
 
             # The agent owns provider selection, but the selected role values are
             # passed explicitly so the controller cannot silently reuse the writer.
@@ -1696,6 +1708,8 @@ class Workbench:
 
     def persist(self, job: dict) -> None:
         _write_json_atomic(self.directory / "jobs" / f"{job['id']}.json", job)
+        if job.get("status") not in ACTIVE:
+            self.jobs.trim()
 
     def event(self, job: dict, message: str) -> None:
         with self.lock:
@@ -1720,6 +1734,9 @@ class Workbench:
                 log.write(message + "\n")
 
     def _run(self, job: dict, args: list[str], env: dict) -> None:
+        from src.workflow.resources import process_identity
+        from src.integrations.local_process import release_process_services
+        process, identity = None, None
         try:
             with self.lock:
                 job.update(status="running", started_at=time.time())
@@ -1728,6 +1745,7 @@ class Workbench:
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                 process = self.process
+                identity = process_identity(process.pid)
             assert process.stdout is not None
             for line in process.stdout:
                 self.event(job, line)
@@ -1761,6 +1779,11 @@ class Workbench:
             job.update(status="failed", ended_at=time.time())
             self.persist(job)
         finally:
+            if process is not None and process.poll() is not None:
+                try:
+                    release_process_services(process.pid, identity)
+                except (OSError, subprocess.SubprocessError):
+                    pass
             with self.lock:
                 self.process = None
 
@@ -1771,14 +1794,16 @@ class Workbench:
                 job["status"] = "stopping"
                 self.persist(job)
                 if os.name == "nt":
-                    subprocess.run(["taskkill", "/PID", str(self.process.pid), "/T", "/F"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    from src.integrations.local_process import terminate_task_tree
+                    from src.workflow.resources import process_identity
+                    terminate_task_tree(self.process.pid, process_identity(self.process.pid))
                 else:
                     self.process.terminate()
             return self.redact(job)
 
-    def list_jobs(self) -> list[dict]:
+    def list_jobs(self, *, limit: int = 100, before: str | None = None) -> list[dict]:
         with self.lock:
-            return [self.redact({k: v for k, v in j.items() if k not in {"events", "key", "digest"}}) for j in sorted(self.jobs.values(), key=lambda j: j["created_at"], reverse=True)[:100]]
+            return self.redact(self.jobs.recent(limit=limit, before=before))
 
     def job_detail(self, job_id: str) -> dict:
         with self.lock:

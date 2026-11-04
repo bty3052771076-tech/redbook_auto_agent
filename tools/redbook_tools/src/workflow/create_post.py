@@ -4142,6 +4142,7 @@ def _daily_news_raw_candidate_fetch_limit(target_fetch_count: int) -> int:
 
 _AI_IMAGE_PROVIDER_ALIASES = {
     "opencodex",
+    "ccswitch",
     "aliyun",
     "dashscope",
     "bailian",

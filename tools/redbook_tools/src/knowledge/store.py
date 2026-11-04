@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import atexit
 from typing import Any, Iterable, Iterator
 
 from psycopg import Connection
@@ -25,12 +26,36 @@ _POOL_LOCK = threading.Lock()
 _POOLS: dict[str, ConnectionPool] = {}
 
 
+def close_pools() -> None:
+    with _POOL_LOCK:
+        pools = list(_POOLS.values())
+        _POOLS.clear()
+    for pool in pools:
+        pool.close()
+
+
+atexit.register(close_pools)
+
+
 def _configure_connection(conn: Connection) -> None:
     register_vector(conn)
 
 
 class KnowledgeStore:
     """PostgreSQL/pgvector knowledge store. Production never falls back to files or memory."""
+
+    streaming_chunks = True
+
+    def current_versions(self, record_ids: list[str], *, account_namespace: str = "local") -> dict[str, str]:
+        if self._memory:
+            return {record_id: self._memory_documents[(account_namespace, record_id)]["content_hash"]
+                    for record_id in record_ids if (account_namespace, record_id) in self._memory_documents}
+        if not record_ids:
+            return {}
+        with self.connection() as conn:
+            rows = conn.execute("SELECT record_id,content_hash FROM knowledge.documents WHERE account_namespace=%s AND record_id=ANY(%s)",
+                                (account_namespace, record_ids)).fetchall()
+        return {row["record_id"]: row["content_hash"] for row in rows}
 
     def __init__(self, *, credentials_path: Path | None = None):
         self.credentials_path = Path(credentials_path or os.getenv(
@@ -67,8 +92,10 @@ class KnowledgeStore:
             if pool is None:
                 pool = ConnectionPool(
                     conninfo,
-                    min_size=1,
-                    max_size=max(2, min(12, int(os.getenv("KNOWLEDGE_DB_POOL_MAX", "8")))),
+                    min_size=0,
+                    max_size=max(1, min(12, int(os.getenv("KNOWLEDGE_DB_POOL_MAX_" + role.upper(),
+                                                       os.getenv("KNOWLEDGE_DB_POOL_MAX", "8"))))),
+                    max_idle=60,
                     timeout=max(1.0, float(os.getenv("KNOWLEDGE_DB_POOL_TIMEOUT", "5"))),
                     kwargs={"row_factory": dict_row},
                     configure=_configure_connection,
@@ -320,14 +347,17 @@ class KnowledgeStore:
         return {"documents": total, "indexed_documents": indexed, "empty_documents": empty,
                 "pending_documents": total - indexed - empty}
 
-    def upsert_chunks(self, record_id: str, chunks: list[dict[str, Any]], *, account_namespace: str = "local") -> int:
+    def upsert_chunks(self, record_id: str, chunks: Iterable[dict[str, Any]], *, account_namespace: str = "local") -> int:
         if self._memory:
             raise RuntimeError("RAG vectors are disabled in test-only in-memory mode")
+        count = 0
         with self.connection() as conn, conn.transaction():
-            row = conn.execute("SELECT id,content_hash FROM knowledge.documents WHERE account_namespace=%s AND record_id=%s", (account_namespace, record_id)).fetchone()
+            row = conn.execute("SELECT id,content_hash FROM knowledge.documents WHERE account_namespace=%s AND record_id=%s FOR SHARE", (account_namespace, record_id)).fetchone()
             if not row:
                 raise KeyError(record_id)
             for chunk in chunks:
+                if chunk.get("document_version", row["content_hash"]) != row["content_hash"]:
+                    raise RuntimeError("KNOWLEDGE_DOCUMENT_CHANGED: retry the current version")
                 conn.execute("""
                     INSERT INTO knowledge.chunks(chunk_id,document_id,document_version,chunk_index,content,char_start,char_end,
                         token_count,embedding,model_id,chunk_version,batch_id,index_status)
@@ -336,7 +366,8 @@ class KnowledgeStore:
                         char_end=EXCLUDED.char_end,token_count=EXCLUDED.token_count,embedding=EXCLUDED.embedding,
                         index_status='ready',batch_id=EXCLUDED.batch_id
                 """, (chunk["chunk_id"], row["id"], row["content_hash"], chunk["chunk_index"], chunk["content"], chunk["char_start"], chunk["char_end"], chunk["token_count"], Vector(chunk["embedding"]), _MODEL_ID, _CHUNK_VERSION, chunk["batch_id"]))
-        return len(chunks)
+                count += 1
+        return count
 
     def search(self, query: str, *, purpose: str | None = None, limit: int = 20, account_namespace: str = 'local') -> list[dict[str, Any]]:
         query = str(query or "").strip()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from src.workflow.resources import memory_bound
+
 import json
 import os
 import re
@@ -746,6 +748,7 @@ def _download_image(
     dest_path.write_bytes(data)
 
 
+@memory_bound("image", limit=2)
 def fetch_and_download_related_images(
     *,
     title: str,
@@ -799,8 +802,11 @@ def fetch_and_download_related_images(
 
     query_original = build_image_query(title, body, topics, prompt_hint)
 
-    if provider_name == "opencodex":
-        from src.images.opencodex_images import generate_subscription_image
+    if provider_name in {"opencodex", "ccswitch"}:
+        if provider_name == "ccswitch":
+            from src.images.ccswitch_images import generate_subscription_image
+        else:
+            from src.images.opencodex_images import generate_subscription_image
 
         if requested_count is None and not (os.getenv("AUTO_IMAGE_COUNT") or "").strip():
             count = 1

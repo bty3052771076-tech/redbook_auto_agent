@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Iterator
+from src.workflow.resources import memory_slot
 
 
 _XHS_UPLOAD_LOCK = Lock()
@@ -23,7 +24,7 @@ def xhs_upload_slot(*, timeout_s: float | None = None) -> Iterator[None]:
     timeout = float(timeout_s if timeout_s is not None else os.getenv("XHS_UPLOAD_LOCK_TIMEOUT_S", "900"))
     lock_path = Path(os.getenv("XHS_UPLOAD_LOCK_PATH", "data/runs/xhs-upload.lock"))
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with _XHS_UPLOAD_LOCK:
+    with _XHS_UPLOAD_LOCK, memory_slot("browser"):
         with lock_path.open("a+b") as stream:
             stream.seek(0)
             stream.write(b"0")

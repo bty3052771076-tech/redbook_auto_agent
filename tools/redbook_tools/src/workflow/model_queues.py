@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from threading import Event, Lock
+from threading import BoundedSemaphore, Event, Lock
 from typing import Callable, Generic, TypeVar
 from src.agent.capabilities.dispatcher import contextual_callback
+from .resources import memory_slot
 
 
 T = TypeVar("T")
@@ -63,6 +64,8 @@ class ModelWorkQueues:
         self._admission_lock = Lock()
         self.llm = ThreadPoolExecutor(max_workers=self.llm_workers, thread_name_prefix="redbook-llm")
         self.image = ThreadPoolExecutor(max_workers=self.image_workers, thread_name_prefix="redbook-image")
+        self._pending = {self.llm: BoundedSemaphore(self.llm_workers * 2),
+                         self.image: BoundedSemaphore(self.image_workers * 2)}
 
     @property
     def stopped(self) -> bool:
@@ -84,15 +87,25 @@ class ModelWorkQueues:
         limit = (5 if self.llm_provider == "minimax" else 2) if modality == "text" else 2
         slot = (self.capacity.slot(group,modality=modality,limit=limit,stop_event=self.stop_event)
                 if self.capacity else nullcontext())
-        with slot:
+        with memory_slot(modality, limit=limit, stop_event=self.stop_event), slot:
             return fn(*args, **kwargs)
 
     def _submit(self, executor: ThreadPoolExecutor, fn: Callable[..., T], args: tuple, kwargs: dict) -> Future[T]:
-        with self._admission_lock:
+        permit = self._pending[executor]
+        while not permit.acquire(timeout=.2):
             if self.stopped:
                 raise ModelWorkStopped("model work stopped before submission")
-            return executor.submit(contextual_callback(self._invoke), fn, args, kwargs,
-                                   "image" if executor is self.image else "text")
+        try:
+            with self._admission_lock:
+                if self.stopped:
+                    raise ModelWorkStopped("model work stopped before submission")
+                future = executor.submit(contextual_callback(self._invoke), fn, args, kwargs,
+                                         "image" if executor is self.image else "text")
+        except BaseException:
+            permit.release()
+            raise
+        future.add_done_callback(lambda _: permit.release())
+        return future
 
     def submit_llm(self, fn: Callable[..., T], *args, **kwargs) -> Future[T]:
         return self._submit(self.llm, fn, args, kwargs)

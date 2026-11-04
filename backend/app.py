@@ -271,9 +271,15 @@ def create_conversation(body: ConversationCreate):
 
 
 @app.get("/api/conversations/{conversation_id}", dependencies=[Depends(authenticated)])
-def conversation(conversation_id: str):
+def conversation(conversation_id: str, message_limit: int | None = None,
+                 before_seq: int | None = None, since_revision: int | None = None):
     current = service()
-    result = current.get_agent_conversation(valid_conversation_id(conversation_id))
+    conversation_id = valid_conversation_id(conversation_id)
+    if since_revision is not None and before_seq is None:
+        revision = getattr(current.conversation_store, "revision", lambda _: None)(conversation_id)
+        if revision is not None and revision == since_revision:
+            return {"not_modified": True, "conversation_revision": revision}
+    result = current.get_agent_conversation(conversation_id, message_limit=message_limit, before_seq=before_seq)
     plans = PlanService(current)
     if any(plan.get('plan_kind') != 'draft_management' for plan in result.get('plans', [])):
         catalog = {model['id']: model for model in current.models()['rows']}
@@ -419,12 +425,13 @@ def discard_task_recognition(conversation_id: str, recognition_id: str):
 
 
 @app.get("/api/runs", dependencies=[Depends(authenticated)])
-def runs():
-    return {"rows": [{**row, **run_overview(row)} for row in service().list_jobs()]}
+def runs(limit: int = 100, before: str | None = None):
+    rows = [{**row, **run_overview(row)} for row in service().list_jobs(limit=limit, before=valid_id(before) if before else None)]
+    return {"rows": rows, "next_cursor": rows[-1]["id"] if len(rows) == min(100, max(1, limit)) else None}
 
 
 @app.get("/api/runs/{run_id}", dependencies=[Depends(authenticated)])
-def run(run_id: str):
+def run(run_id: str, compact: bool = False):
     run_id = valid_id(run_id)
     current = service()
     try:
@@ -458,7 +465,38 @@ def run(run_id: str):
         except (OSError, ValueError):
             continue
     detail["activity"] = current.redact(build_activity(detail, checkpoint))
+    from src.workflow.resources import resource_status
+    detail["resources"] = resource_status()
+    if "RESOURCE_MEMORY_WAIT" in str(detail.get("message") or ""):
+        detail["activity"].update(headline="等待可用内存，已完成产物保留", stage="资源等待")
+    if compact:
+        detail["events"] = detail.get("events", [])[-8:]
     return detail
+
+
+@app.get("/api/resources", dependencies=[Depends(authenticated)])
+def resources():
+    from src.workflow.resources import resource_status
+    return resource_status()
+
+
+@app.get("/api/runs/{run_id}/log", dependencies=[Depends(authenticated)])
+def run_log(run_id: str, before: int | None = None, limit: int = 100):
+    detail = service().job_detail(valid_id(run_id))
+    events = detail.get("events", [])
+    rows = [row for row in events if before is None or row["id"] < before][-max(1, min(200, limit)):]
+    return {"rows": rows, "before": rows[0]["id"] if rows else None,
+            "has_more": bool(rows and events and rows[0]["id"] > events[0]["id"]),
+            "truncated": bool(events and events[0]["id"] > 1),
+            "full_log_url": f"/api/runs/{run_id}/log-file"}
+
+
+@app.get("/api/runs/{run_id}/log-file", dependencies=[Depends(authenticated)])
+def run_log_file(run_id: str):
+    path = service().directory / f"{valid_id(run_id)}.log"
+    if not path.is_file():
+        raise HTTPException(404, "日志文件不存在")
+    return FileResponse(path, media_type="text/plain", filename=path.name)
 
 
 @app.get("/api/runs/{run_id}/events", dependencies=[Depends(authenticated)])

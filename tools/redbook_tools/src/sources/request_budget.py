@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import threading
 import time
 from typing import Callable, Generic, Iterator, TypeVar
+from src.workflow.resources import memory_slot
 
 
 T = TypeVar("T")
@@ -27,7 +28,8 @@ class RequestBudget:
         if not acquired:
             raise TimeoutError("request budget slot unavailable before deadline")
         try:
-            yield
+            with memory_slot("source", limit=self.max_in_flight):
+                yield
         finally:
             self._semaphore.release()
 

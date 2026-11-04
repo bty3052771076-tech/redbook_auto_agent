@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from .resources import sample_memory
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -141,6 +142,7 @@ class RunContext:
             "status": str(status),
             "elapsed_s": round(max(0.0, time.monotonic() - self._started_monotonic), 3),
             "details": _sanitize(details),
+            "memory": asdict(sample_memory()),
         }
         with self._write_lock:
             with self.telemetry_path.open("a", encoding="utf-8") as stream:

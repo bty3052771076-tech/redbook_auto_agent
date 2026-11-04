@@ -215,11 +215,11 @@ def create_daily_wool_posts(
         },
     )
     if (os.getenv("WOOL_IMAGE_MODE") == "reference_edit"
-            or os.getenv("IMAGE_PROVIDER") == "opencodex"
+            or os.getenv("IMAGE_PROVIDER") in {"opencodex", "ccswitch"}
             or WoolReferenceLibrary(wool_asset_root()).has_approved_references()):
         from .image_edit import create_wool_image
         if progress:
-            progress("image", "in_progress provider=opencodex")
+            progress("image", "in_progress provider=" + ("ccswitch" if os.getenv("IMAGE_PROVIDER") == "ccswitch" else "opencodex"))
         selected, image_meta = create_wool_image(
             post_id=post.id, offers=offers, issue_date=issue_date.isoformat()
         )

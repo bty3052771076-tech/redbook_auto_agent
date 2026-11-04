@@ -29,7 +29,16 @@ class PostgresConversationStore:
             raise ValueError('invalid conversation namespace')
         self.namespace = namespace
 
-    def get(self, conversation_id: str, *, connection=None) -> dict[str, Any]:
+    def revision(self, conversation_id: str) -> int:
+        with self.knowledge_store.connection() as conn:
+            row = conn.execute("SELECT revision FROM agent.conversations WHERE conversation_id=%s AND account_namespace=%s",
+                               (conversation_id, self.namespace)).fetchone()
+        if row is None:
+            raise KeyError(conversation_id)
+        return int(row["revision"])
+
+    def get(self, conversation_id: str, *, connection=None, message_limit: int | None = None,
+            before_seq: int | None = None) -> dict[str, Any]:
         with (nullcontext(connection) if connection is not None else self.knowledge_store.connection()) as conn:
             row = conn.execute(
                 "SELECT payload,revision,last_message_seq FROM agent.conversations WHERE conversation_id=%s AND account_namespace=%s",
@@ -37,12 +46,24 @@ class PostgresConversationStore:
             ).fetchone()
             if row is None:
                 raise KeyError(conversation_id)
-            messages = conn.execute(
-                "SELECT content FROM agent.messages WHERE conversation_id=%s ORDER BY seq",
-                (conversation_id,),
-            ).fetchall()
+            if message_limit is None:
+                messages = conn.execute(
+                    "SELECT content FROM agent.messages WHERE conversation_id=%s ORDER BY seq",
+                    (conversation_id,),
+                ).fetchall()
+            else:
+                message_limit = max(1, min(100, int(message_limit)))
+                messages = conn.execute(
+                    "SELECT seq,content FROM agent.messages WHERE conversation_id=%s AND (%s::bigint IS NULL OR seq<%s) ORDER BY seq DESC LIMIT %s",
+                    (conversation_id, before_seq, before_seq, message_limit + 1),
+                ).fetchall()
         conversation = deepcopy(row["payload"] or {})
         conversation["id"] = conversation_id
+        if message_limit is not None:
+            has_more = len(messages) > message_limit
+            messages = list(reversed(messages[:message_limit]))
+            conversation["message_page"] = {"has_more": has_more,
+                "before_seq": messages[0]["seq"] if messages else None, "latest": before_seq is None}
         conversation["messages"] = [deepcopy(item["content"]) for item in messages]
         conversation["_revision"] = int(row["revision"])
         conversation["_last_message_seq"] = int(row["last_message_seq"])

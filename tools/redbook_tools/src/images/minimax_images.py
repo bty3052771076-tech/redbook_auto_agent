@@ -15,6 +15,7 @@ import httpx
 
 from src.config import DEFAULT_MINIMAX_LLM_BASE_URL
 from src.minimax.quota import load_minimax_subscription_key
+from src.workflow.resources import memory_bound
 
 
 DEFAULT_BASE_URL = DEFAULT_MINIMAX_LLM_BASE_URL
@@ -218,6 +219,7 @@ def _model_candidates(model: Optional[str]) -> list[str]:
     return [selected] if selected else list(DEFAULT_MODELS)
 
 
+@memory_bound("image", limit=2)
 @governed('builtin:image.generate', 'generate')
 def generate_minimax_image(
     *,

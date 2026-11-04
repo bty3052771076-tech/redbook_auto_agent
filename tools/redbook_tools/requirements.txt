@@ -9,6 +9,7 @@ fastembed==0.8.1
 typer[all]>=0.12.5
 pydantic>=2.7.0
 python-dotenv>=1.0.0
+tomli>=2.0.0; python_version < "3.11"
 langchain-openai>=0.2.0
 playwright>=1.42.0
 certifi>=2024.8.30

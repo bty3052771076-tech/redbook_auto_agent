@@ -235,11 +235,11 @@ def test_emergency_flag_cannot_override_manual_policy():
     assert not calls
 
 
-def test_waiter_reuses_committed_snapshot_without_calling_another_summarizer():
+def test_waiter_reuses_committed_snapshot_without_calling_another_summarizer(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
-    from threading import Event, Timer
+    from threading import Event
     from src.agent.compaction import compact_conversation
-    from src.agent.context_builder import prepare_model_context
+    from src.agent.context_builder import ContextBuilder, prepare_model_context
 
     store, goals, cid, goal = history()
     limits = {'context_window': 9000, 'max_output_tokens': 1200}
@@ -254,10 +254,21 @@ def test_waiter_reuses_committed_snapshot_without_calling_another_summarizer():
     with ThreadPoolExecutor(1) as pool:
         first = pool.submit(compact_conversation, store, cid, summarize=summarize,
                             purpose='controller', model_limits=limits)
-        timer = Timer(.15, release.set)
         try:
             assert entered.wait(5)
-            timer.start()
+            original_build = ContextBuilder.build
+            waiting_builds = []
+
+            def observe_waiter(self, *args, **kwargs):
+                result = original_build(self, *args, **kwargs)
+                waiting_builds.append(result['can_send'])
+                if len(waiting_builds) == 2:
+                    # Release only after the waiter observed the held compaction lock.
+                    assert not result['can_send']
+                    release.set()
+                return result
+
+            monkeypatch.setattr(ContextBuilder, 'build', observe_waiter)
             built = prepare_model_context(store, goals, cid, goal['goal_id'], 'controller', limits,
                 summarize=lambda payload: calls.append(payload), wait_timeout_seconds=2)
             assert built['can_send'] and built['compaction']['saved']
@@ -266,7 +277,6 @@ def test_waiter_reuses_committed_snapshot_without_calling_another_summarizer():
             assert not calls
         finally:
             release.set()
-            timer.cancel()
         assert first.result(10)['saved']
 
 

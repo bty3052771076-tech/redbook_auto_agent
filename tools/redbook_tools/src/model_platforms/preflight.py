@@ -13,7 +13,7 @@ def authorized_plan(config, *, require_image, current, quota_dir, provider_keys)
     snapshot = config.platform_snapshot
     image = None
     provider = os.getenv('IMAGE_PROVIDER', 'auto')
-    if require_image and provider not in {'local', 'opencodex'}:
+    if require_image and provider not in {'local', 'opencodex', 'ccswitch'}:
         records, _ = load_quota_records(quota_dir=quota_dir, now=current, max_age=timedelta(hours=2), provider_keys=provider_keys)
         if provider == 'minimax':
             if (not provider_keys.get('minimax') or os.getenv('MINIMAX_BILLING_MODE', 'subscription_only') != 'subscription_only'

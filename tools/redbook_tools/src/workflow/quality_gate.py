@@ -445,7 +445,7 @@ def _post_issues(post: Post) -> list[QualityIssue]:
                 if isinstance(item, Mapping)
             }
             if not providers or not providers.issubset(
-                {"aliyun", "volcengine", "minimax", "siliconflow", "qwen", "doubao", "opencodex"}
+                {"aliyun", "volcengine", "minimax", "siliconflow", "qwen", "doubao", "opencodex", "ccswitch"}
             ):
                 issues.append(
                     QualityIssue(

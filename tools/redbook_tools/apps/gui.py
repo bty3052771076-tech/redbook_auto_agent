@@ -102,7 +102,7 @@ FILTER_REFRESH_DEBOUNCE_MS = 140
 
 LLM_PROVIDER_OPTIONS = ["aliyun", "volcengine", "siliconflow", "minimax", "ppinfra", "auto"]
 IMAGE_SOURCE_LOCAL = "local"
-IMAGE_PROVIDER_OPTIONS = ["auto", "aliyun", "volcengine", "siliconflow", "minimax", "opencodex", "pexels"]
+IMAGE_PROVIDER_OPTIONS = ["auto", "aliyun", "volcengine", "siliconflow", "minimax", "opencodex", "ccswitch", "pexels"]
 IMAGE_SOURCE_OPTIONS = [IMAGE_SOURCE_LOCAL] + IMAGE_PROVIDER_OPTIONS
 
 ALIYUN_LLM_MODEL_OPTIONS = list(ALIYUN_FREE_LLM_MODELS)
@@ -2249,6 +2249,9 @@ def build_provider_env_overrides(
     elif img_provider == "opencodex":
         env["OPENCODEX_IMAGE_ENABLED"] = "1"
         env["OPENCODEX_IMAGE_MODEL"] = "gpt-image-2"
+    elif img_provider == "ccswitch":
+        env["CCSWITCH_IMAGE_ENABLED"] = "1"
+        env["CCSWITCH_IMAGE_MODEL"] = "gpt-image-2"
     elif img_provider == "minimax":
         selected_image = (image_model or DEFAULT_MINIMAX_IMAGE_MODELS).strip()
         env["MINIMAX_IMAGE_MODEL"] = selected_image
