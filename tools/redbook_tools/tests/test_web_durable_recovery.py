@@ -15,6 +15,14 @@ from src.agent import postgres_checkpoint
 ROOT_ID = "a" * 32
 
 
+class FinishedProcess:
+    # Terminal worker doubles implement the ownership/poll contract used by cleanup.
+    pid = 2147483000
+
+    def poll(self):
+        return 0
+
+
 @pytest.fixture(autouse=True)
 def forbid_real_connections_and_workers(monkeypatch):
     def forbidden(*args, **kwargs):
@@ -270,7 +278,7 @@ def test_agent_terminal_status_uses_durable_result_not_historical_warning(
     durable["state"]["status"] = business_status
     job = service.jobs[ROOT_ID]
 
-    class Process:
+    class Process(FinishedProcess):
         stdout = ["[agent] stage=generate | failed | temporary error\n",
                   "[agent] stage=generate | success | daily_news posts=1\n"]
 
@@ -292,7 +300,7 @@ def test_zero_exit_without_postgres_result_is_not_reported_completed(workbench, 
     durable["error"] = OSError("database unavailable")
     job = service.jobs[ROOT_ID]
 
-    class Process:
+    class Process(FinishedProcess):
         stdout = []
 
         def wait(self):
@@ -313,7 +321,7 @@ def test_exit_failure_and_cancellation_take_precedence_over_durable_completed(
     durable["state"]["status"] = "completed"
     job = service.jobs[ROOT_ID]
 
-    class Process:
+    class Process(FinishedProcess):
         stdout = []
 
         def wait(self):
@@ -341,7 +349,7 @@ def test_workbench_pg_state_stub_completes_despite_existing_warning(
     job = service.jobs[ROOT_ID]
     job["has_warnings"] = True
 
-    class Process:
+    class Process(FinishedProcess):
         stdout = ["[agent] stage=finish | completed | uploaded=0\n"]
 
         def wait(self):

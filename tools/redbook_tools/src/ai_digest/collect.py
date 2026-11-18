@@ -2,6 +2,7 @@ from __future__ import annotations
 from src.agent.capabilities.dispatcher import governed, contextual_callback
 
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 import json
 import os
@@ -35,6 +36,7 @@ from .rank import (
     ai_digest_official_count,
     ai_digest_quota_counts,
     ai_update_history_key,
+    ai_update_is_relevant,
     ai_update_quality_issues,
     dedupe_ai_updates,
     filter_recent_ai_updates,
@@ -58,6 +60,7 @@ from src.ai_digest.search_plan import build_search_plan
 
 FetchSource = Callable[[AIDigestSource], list[AIUpdateItem]]
 ProgressCallback = Callable[[str, str], None]
+_SOURCE_DEADLINE: ContextVar[float | None] = ContextVar("ai_source_deadline", default=None)
 DEFAULT_SEARCH_BACKFILL_QUERIES = (
     "DeepSeek 新模型 发布 内测 官方",
     "Qwen GLM 豆包 Kimi MiniMax 新模型 发布 官方",
@@ -210,10 +213,14 @@ def _curl_get_text(url: str, *, timeout_s: float, executable: str) -> str:
     # Parallel fetches make the Windows TLS handshake fail more often, so
     # allow a few bounded retries with a short backoff before giving up.
     attempts = 4
+    deadline = time.monotonic() + timeout_s
     last_exc: Exception | None = None
     for attempt in range(attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise last_exc if last_exc is not None else TimeoutError("source request deadline exceeded")
         try:
-            return _curl_get_text_once(url, timeout_s=timeout_s, executable=executable)
+            return _curl_get_text_once(url, timeout_s=remaining, executable=executable)
         except (URLError, TimeoutError) as exc:
             last_exc = exc
             message = str(exc).lower()
@@ -225,7 +232,7 @@ def _curl_get_text(url: str, *, timeout_s: float, executable: str) -> str:
                 raise
             # A failing TLS handshake often succeeds immediately afterwards;
             # a short pause also stops parallel attempts from colliding.
-            time.sleep(0.6 * (attempt + 1))
+            time.sleep(min(0.6 * (attempt + 1), max(0.0, deadline - time.monotonic())))
     raise last_exc if last_exc is not None else URLError(f"failed to fetch {url}")
 
 
@@ -288,9 +295,33 @@ def _curl_get_text_once(url: str, *, timeout_s: float, executable: str) -> str:
 
 
 def _http_get_text(url: str, *, timeout_s: float = 12.0) -> str:
+    deadline = _SOURCE_DEADLINE.get()
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("source request deadline exceeded")
+        timeout_s = min(timeout_s, remaining)
     curl_executable = _curl_executable()
     if curl_executable:
-        return _curl_get_text(url, timeout_s=timeout_s, executable=curl_executable)
+        try:
+            return _curl_get_text(url, timeout_s=timeout_s, executable=curl_executable)
+        except URLError as exc:
+            message = str(exc).lower()
+            # Use the existing CA-verified Python transport for Schannel
+            # handshake/revocation-server outages, never for rejected certs.
+            rejected_certificate = any(marker in message for marker in (
+                "certificate revoked", "crypt_e_revoked", "cert_e_revoked", "cert_trust_is_revoked",
+                "certificate verify failed", "sec_e_untrusted_root", "sec_e_cert_unknown",
+            ))
+            if isinstance(exc, HTTPError) or rejected_certificate or not any(marker in message for marker in (
+                "failed to receive handshake", "ssl/tls connection failed", "crypt_e_revocation_offline",
+            )):
+                raise
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("source request deadline exceeded")
+        timeout_s = min(timeout_s, remaining)
     req = urllib.request.Request(
         url,
         headers={"User-Agent": "Mozilla/5.0 (AutoRedbook AI Digest)"},
@@ -919,6 +950,15 @@ def fetch_ai_digest_search_backfill(
                     search_days=max_age_days or 3,
                     timeout_s=request_timeout_s,
                     expand_query_variants=False,
+                    # This is a keyword search, not a broad world-news pool.
+                    # The latter can fill a 12-row cap before any AI results.
+                    _unified_sources=False,
+                    preferred_providers=("google_rss_cn", "google_rss"),
+                    minimum_qualified_records=1,
+                    qualified_count_callback=lambda rows: sum(
+                        ai_update_is_relevant(_news_item_to_ai_update(row, query=query))
+                        for row in rows
+                    ),
                 )
             recent, date_meta = filter_recent_news_items(
                 list(candidates),
@@ -931,19 +971,23 @@ def fetch_ai_digest_search_backfill(
                 for item in recent
                 if str(getattr(item, "title", "") or "").strip() and str(getattr(item, "url", "") or "").strip()
             ]
+            relevant = [item for item in converted if ai_update_is_relevant(item)]
             row = {
                 "query": query,
                 "raw_count": len(candidates),
                 "recent_count": len(recent),
                 "converted_count": len(converted),
+                "relevant_count": len(relevant),
+                "irrelevant_count": len(converted) - len(relevant),
                 "date_window": date_meta,
             }
             _emit_progress(
                 progress,
                 "search_backfill_query",
-                f"success query={query[:60]} raw={len(candidates)} recent={len(recent)} converted={len(converted)}",
+                f"success query={query[:60]} raw={len(candidates)} recent={len(recent)} "
+                f"converted={len(converted)} relevant={len(relevant)}",
             )
-            return query, converted, row, None
+            return query, relevant, row, None
         except Exception as exc:
             _emit_progress(progress, "search_backfill_query", f"failed query={query[:60]} error={exc}")
             return query, [], {}, str(exc)
@@ -1141,11 +1185,14 @@ def collect_ai_digest_updates(
 
     def _fetch_one(source: AIDigestSource) -> tuple[str, float, list[AIUpdateItem], Exception | None]:
         started = time.perf_counter()
+        token = _SOURCE_DEADLINE.set(time.monotonic() + batch_timeout_s)
         try:
             source_items = fetcher(source)
             return _health_timestamp(health_now), time.perf_counter() - started, source_items, None
         except Exception as exc:
             return _health_timestamp(health_now), time.perf_counter() - started, [], exc
+        finally:
+            _SOURCE_DEADLINE.reset(token)
 
     def _fetch_stage(stage_sources: list[AIDigestSource]) -> None:
         eligible: list[AIDigestSource] = []
@@ -1199,22 +1246,34 @@ def collect_ai_digest_updates(
                 _record_source_result(source, checked_at, elapsed, source_items, error)
             return
 
-        executor = ThreadPoolExecutor(max_workers=min(source_concurrency, len(eligible)))
-        futures = {executor.submit(_fetch_one, source): source for source in eligible}
+        workers = min(source_concurrency, len(eligible))
+        executor = ThreadPoolExecutor(max_workers=workers)
         results: dict[AIDigestSource, tuple[str, float, list[AIUpdateItem], Exception | None]] = {}
+        queued: set[AIDigestSource] = set()
         try:
-            done, pending = wait(futures, timeout=batch_timeout_s)
-            for future in done:
-                source = futures[future]
-                try:
-                    results[source] = future.result()
-                except Exception as exc:
-                    results[source] = (_health_timestamp(health_now), batch_timeout_s, [], exc)
-            for future in pending:
-                future.cancel()
+            # Start bounded waves so later sources do not spend their entire
+            # timeout waiting behind earlier sources. Keep one pool to cap I/O.
+            for offset in range(0, len(eligible), workers):
+                futures = {executor.submit(contextual_callback(_fetch_one), source): source
+                           for source in eligible[offset:offset + workers]}
+                done, pending = wait(futures, timeout=batch_timeout_s)
+                for future in done:
+                    source = futures[future]
+                    try:
+                        results[source] = future.result()
+                    except Exception as exc:
+                        results[source] = (_health_timestamp(health_now), batch_timeout_s, [], exc)
+                for future in pending:
+                    if future.cancel():
+                        queued.add(futures[future])
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
         for source in eligible:
+            if source in queued:
+                # A queued request is not evidence of a broken endpoint.
+                errors.append(f"{source.name}: source queue wait exceeded; not fetched")
+                _emit_progress(progress, "fetch_source", f"deferred_queue name={source.name}")
+                continue
             result = results.get(source)
             if result is None:
                 timeout_error = TimeoutError(f"source batch deadline exceeded after {batch_timeout_s:.1f}s")
@@ -1317,7 +1376,7 @@ def collect_ai_digest_updates(
                 resolved_discovery = list(executor.map(
                     lambda item: resolve_ai_digest_discovery_source(item, timeout_s=timeout), discovery_candidates,
                 ))
-            resolved_by_url = {item.url: item for item in resolved_discovery}
+            resolved_by_url = {lead.url: original for lead, original in zip(discovery_candidates, resolved_discovery)}
             for index, attempt in enumerate(health_attempts):
                 original_items = discovery_items_by_source.get(attempt.source_name)
                 if original_items is None:
@@ -1494,6 +1553,26 @@ def collect_ai_digest_updates(
         # Put them first so a generic search result cannot occupy the same
         # official URL and hide the stronger, topic-specific record.
         deduped_items = dedupe_ai_updates([*prompt_topic_items, *deduped_items])
+    pool_diagnostics = {
+        "fetched_after_history": len(fetched),
+        "historical_excluded": sum(history_excluded_by_source.values()),
+        "outside_window_or_missing_date_url": max(0, len(fetched) - len(fresh_items)),
+        "fresh": len(fresh_items),
+        "deduped": len(deduped_items),
+        "irrelevant": sum(not ai_update_is_relevant(item) for item in deduped_items),
+        "quality_rejected": sum(bool(ai_update_quality_issues(item)) for item in deduped_items),
+        "ranked": len(ranked),
+        "source_errors": len(errors),
+    }
+    _emit_progress(progress, "pool_diagnostics", json.dumps(pool_diagnostics, ensure_ascii=False))
+    for item in deduped_items[:100]:
+        issues = list(ai_update_quality_issues(item))
+        if not ai_update_is_relevant(item):
+            issues.append("irrelevant")
+        if issues:
+            _emit_progress(progress, "candidate_rejected", json.dumps({
+                "title": item.title[:160], "url": item.url, "reasons": issues,
+            }, ensure_ascii=False))
     health_snapshot_path = ""
     if health_path is not None and should_persist_health:
         snapshot = SourceHealthSnapshot(
@@ -1509,6 +1588,7 @@ def collect_ai_digest_updates(
         "min_foreign_ai_count": min_foreign_ai_count,
         "max_age_days": max_age_days,
         "fetched_count": len(fetched),
+        "pool_diagnostics": pool_diagnostics,
         "fresh_count": len(fresh_items),
         "deduped_count": len(deduped_items),
         "duplicate_removed_count": max(0, len(fresh_items) - len(deduped_items)),

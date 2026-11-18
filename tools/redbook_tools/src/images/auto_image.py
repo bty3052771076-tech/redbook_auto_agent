@@ -285,6 +285,7 @@ def _body_snippet_for_prompt(body: str, *, limit: int = 180) -> str:
 
 
 NEWS_IMAGE_PROMPT_VERSION = "2026-10-02-single-scene-v6"
+MINIMAX_NEWS_IMAGE_PROMPT_VERSION = "2026-11-18-wordless-scene-v7"
 
 
 def clean_news_image_event(value: str) -> str:
@@ -326,10 +327,7 @@ def _news_image_fact_context(body: str) -> str:
     return " ".join(sentences)
 
 
-def _build_aliyun_image_prompt(
-    *, title: str, body: str, topics: list[str], prompt_hint: str, repair_hint: str = ""
-) -> str:
-    """Render the writer's scene; the full post remains the vision review input."""
+def _news_visual_scene(*, title: str, body: str, prompt_hint: str) -> str:
     event = clean_news_image_event(prompt_hint) or clean_news_image_event(title)
     # Older writer contracts prepend a factual lead for provenance. Only the
     # explicit concept scene is drawable; full facts still reach vision review.
@@ -341,8 +339,35 @@ def _build_aliyun_image_prompt(
         and re.search(r"(?:概念|政策|立场|编辑)示意", scene)
     ):
         event = scene.strip()
+    return event
+
+
+def _build_minimax_news_image_prompt(
+    *, title: str, body: str, prompt_hint: str, repair_hint: str = ""
+) -> str:
+    scene = _news_visual_scene(title=title, body=body, prompt_hint=prompt_hint)
+    scene = re.split(r"的概念示意，采用非写实新闻插画|。保持事实中的", scene, maxsplit=1)[0]
+    scene = re.sub(r"《[^》]+》", "相关文件", scene)
+    scene = re.sub(r"“[^”]+”|「[^」]+」|\"[^\"\r\n]+\"", "相关表述", scene)
+    scene = re.sub(r"^(?:\d{4}年)?\d{1,2}月\d{1,2}(?:日|号)[，,]\s*", "", scene)
+    scene = re.sub(r"(?:画面无|不出现|不含)(?:任何)?(?:文字|字母|数字|标志|水印)(?:[、与或和]*(?:文字|字母|数字|标志|水印))*", "纯色无纹理", scene)
+    scene = scene.strip(" ，,；;。.")
+    if repair_hint:
+        scene += f"。{repair_hint}"
+    return (
+        "One full-bleed, completely wordless illustration. Simple flat color shapes and one continuous scene. "
+        f"{scene}。"
+        " Show only the described subjects and actual state; plans and claims stay conceptual. "
+        "Every surface is plain and unmarked. Zero text, letters, numbers, glyphs, captions, logos, or watermarks."
+    )
+
+
+def _build_aliyun_image_prompt(
+    *, title: str, body: str, topics: list[str], prompt_hint: str, repair_hint: str = ""
+) -> str:
+    """Render the writer's scene; the full post remains the vision review input."""
     lines = [
-        event,
+        _news_visual_scene(title=title, body=body, prompt_hint=prompt_hint),
         "竖版3:4，彩色平面编辑示意插画。只呈现上述一个地点、同一时刻的主体动作和状态，背景简洁。",
         "单幅画面铺满画布，不分栏、不留文字区域。",
         "角色、地点与状态以已证实事实为准；声明或计划仅表现表达或讨论，不画成已实施结果。",

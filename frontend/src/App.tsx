@@ -16,11 +16,13 @@ import { CapabilityCenter } from "./capabilities/CapabilityCenter";
 import { PlanCapabilities, readPlanSelection } from "./capabilities/PlanCapabilities";
 import { guarded } from "./capabilities/shared";
 import { CompactionEvents } from "./capabilities/Memory";
+import { DialogueChat } from "./DialogueChat";
 import "./source-diagnostics.css";
 
-type Page = "chat" | "drafts" | "runs" | "connections" | "wool" | "sources" | "capabilities";
+type Page = "chat" | "manual" | "drafts" | "runs" | "connections" | "wool" | "sources" | "capabilities";
 const pages: { id: Page; label: string; icon: typeof MessageSquare }[] = [
   { id: "chat", label: "对话任务", icon: MessageSquare },
+  { id: "manual", label: "人工计划", icon: ClipboardList },
   { id: "drafts", label: "草稿审查", icon: FileText },
   { id: "runs", label: "运行记录", icon: ClipboardList },
   { id: "connections", label: "连接与模型", icon: Settings2 },
@@ -50,7 +52,7 @@ function DraftEvidence({ evidence }: { evidence: Draft["evidence"] }) {
 }
 
 function App() {
-  const [page, setPage] = useState<Page>(location.hash.startsWith("#capabilities") ? "capabilities" : "chat");
+  const [page, setPage] = useState<Page>(location.hash.startsWith("#capabilities") ? "capabilities" : location.hash === "#manual" ? "manual" : "chat");
   const [mobileNav, setMobileNav] = useState(false);
   const [ready, setReady] = useState(false);
   const [sessionReady, setSessionReady] = useState(false);
@@ -58,6 +60,7 @@ function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [conversation, setConversation] = useState<Conversation | null>(null);
+  const [conversationLoading, setConversationLoading] = useState(true);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [prompt, setPrompt] = useState("");
   const [plan, setPlan] = useState<Plan | null>(null);
@@ -137,7 +140,7 @@ function App() {
     if (response.plan) setPlan(response.plan);
   }
   useEffect(() => {
-    const listener = () => { if (location.hash.startsWith("#capabilities")) setPage("capabilities"); else if (location.hash === "#chat") setPage("chat"); };
+    const listener = () => { if (location.hash.startsWith("#capabilities")) setPage("capabilities"); else { const next = pages.find(item => `#${item.id}` === location.hash); if (next) setPage(next.id); } };
     window.addEventListener("hashchange", listener);
     return () => window.removeEventListener("hashchange", listener);
   }, []);
@@ -168,12 +171,14 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const version = selectionVersion.current;
     startSession().then(async () => {
       setSessionReady(true);
       await load();
+      if (version !== selectionVersion.current) return;
       const saved = localStorage.getItem("agent-conversation");
       if (saved) await openConversation(saved);
-    }).catch(fail);
+    }).catch(fail).finally(() => { if (version === selectionVersion.current) setConversationLoading(false); });
   }, [load]);
 
   useEffect(() => {
@@ -232,7 +237,7 @@ function App() {
         if (current && activeStatuses.has(current.status)) setActiveRun(current);
         setRunConnectionError("");
         const terminal = current && !activeStatuses.has(current.status);
-        if (hasContinuity && conversationId && page === 'chat' && (terminal || Date.now() - lastConversationPoll >= 15000)) {
+        if (hasContinuity && conversationId && page === 'manual' && (terminal || Date.now() - lastConversationPoll >= 15000)) {
           lastConversationPoll = Date.now();
           const updated = await readConversation(conversationId, conversationRef.current?.conversation_revision);
           const goalRows = await api<{ rows: GoalSnapshot[] }>(`/api/conversations/${conversationId}/goals`);
@@ -282,19 +287,23 @@ function App() {
   }
 
   async function createConversation() {
-    selectionVersion.current++;
+    const version = ++selectionVersion.current;
     setSelectionEpoch(value => value + 1);
+    setConversationLoading(true);
     setBusy(true); setError("");
     try {
       const created = await api<Conversation>("/api/conversations", "POST", { title: "新对话" });
+      if (version !== selectionVersion.current) return;
       receiveConversation(created); setPlan(null); setActiveRun(null); setRunConnectionError("");
       localStorage.setItem("agent-conversation", created.id); await load();
-    } catch (cause) { fail(cause); } finally { setBusy(false); }
+    } catch (cause) { if (version === selectionVersion.current) fail(cause); }
+    finally { if (version === selectionVersion.current) { setBusy(false); setConversationLoading(false); } }
   }
 
   async function openConversation(id: string) {
     const version = ++selectionVersion.current;
     setSelectionEpoch(value => value + 1);
+    setConversationLoading(true);
     setError("");
     try {
       let loaded = await readConversation(id);
@@ -314,6 +323,26 @@ function App() {
       localStorage.setItem("agent-conversation", loaded.id); setRunConnectionError("");
       setActiveRun(run);
     } catch (cause) { if (version === selectionVersion.current) fail(cause); }
+    finally { if (version === selectionVersion.current) setConversationLoading(false); }
+  }
+
+  function selectConversation(id: string) {
+    if (id) { void openConversation(id); return; }
+    selectionVersion.current++; setSelectionEpoch(value => value + 1);
+    conversationRef.current = null; setConversation(null); setConversationLoading(false); setBusy(false);
+    setSelectedGoalId(''); setContextOverview(null); setPlan(null); setActiveRun(null);
+    localStorage.removeItem("agent-conversation");
+  }
+
+  function dialogueCreated(created: Conversation) {
+    receiveConversation(created); setPlan(null); setActiveRun(null);
+    setConversations(previous => [created, ...previous.filter(item => item.id !== created.id)]);
+    localStorage.setItem("agent-conversation", created.id);
+  }
+
+  async function dialogueChanged(_conversationId: string) {
+    try { const value = await api<{ rows: Conversation[] }>("/api/conversations"); setConversations(value.rows); }
+    catch (cause) { fail(cause); }
   }
 
   async function sendMessage(text?: string) {
@@ -477,11 +506,25 @@ function App() {
         {sessionReady && !ready && <div className="startup"><CircleAlert size={18} />业务数据暂不可用，可查看能力中心。<button className="quiet-button" onClick={() => load().catch(fail)}><RefreshCw size={16} />重新读取业务数据</button></div>}
         {error && <div className="banner error" role="alert"><CircleAlert size={17} /><span>{error}</span><button className="icon-button" title="关闭提示" aria-label="关闭提示" onClick={() => setError("")}><X size={16} /></button></div>}
         {notice && <div className="banner notice" role="status"><CheckCircle2 size={17} /><span>{notice}</span><button className="icon-button" title="关闭提示" aria-label="关闭提示" onClick={() => setNotice("")}><X size={16} /></button></div>}
-        {ready && page === "chat" && <div className="chat-layout">
+        {sessionReady && page === "chat" && <main className="dialogue-page">
+          <div className="page-heading"><h1>任务对话</h1><div className="dialogue-heading-actions">
+            <button className="quiet-button" onClick={() => goPage("manual")}><ClipboardList size={16} />人工计划</button>
+            <button className="quiet-button" onClick={() => selectConversation("")}><MessageSquare size={16} />新对话</button>
+          </div></div>
+          <div className="conversation-selector"><label htmlFor="dialogue-conversation-select">当前对话</label>
+            <select id="dialogue-conversation-select" value={conversation?.id || ""} onChange={event => selectConversation(event.target.value)}>
+              <option value="">新对话</option>{conversations.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}
+            </select>
+          </div>
+          {conversationLoading ? <div className="startup" role="status"><LoaderCircle size={18} className="spin" />正在切换对话</div>
+            : <DialogueChat key={selectionEpoch} conversation={conversation} onCreated={dialogueCreated} onChanged={dialogueChanged}
+              onCapabilities={() => goPage("capabilities")} onModels={() => goPage("connections")} />}
+        </main>}
+        {ready && page === "manual" && <div className="chat-layout">
           <section className="chat-main">
-            <div className="page-heading"><div><h1>任务对话</h1><p>说明栏目和数量，确认计划后执行。</p></div><button className="quiet-button" onClick={createConversation} disabled={busy}><MessageSquare size={16} />新对话</button></div>
+            <div className="page-heading"><div><h1>人工计划</h1><p>说明栏目和数量，确认计划后执行。</p></div><button className="quiet-button" onClick={createConversation} disabled={busy}><MessageSquare size={16} />新对话</button></div>
             <div className="context-line"><span className="status-dot good" />已发布数据和知识库状态：{connections?.database.status === "ready" ? "数据库可用" : "待检查"}</div>
-            <div className="conversation-selector"><label htmlFor="conversation-select">当前对话</label><select id="conversation-select" value={conversation?.id || ""} onChange={(event) => { if (event.target.value) openConversation(event.target.value); else { selectionVersion.current++; setSelectionEpoch(v => v + 1); conversationRef.current = null; setConversation(null); setSelectedGoalId(''); setContextOverview(null); setPlan(null); setActiveRun(null); localStorage.removeItem("agent-conversation"); } }}><option value="">新任务</option>{conversations.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></div>
+            <div className="conversation-selector"><label htmlFor="conversation-select">当前对话</label><select id="conversation-select" value={conversation?.id || ""} onChange={event => selectConversation(event.target.value)}><option value="">新任务</option>{conversations.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></div>
             {hasContinuity && <section className="conversation-goals" aria-label="对话目标">
               <div className="conversation-selector"><label htmlFor="goal-select">当前目标</label><select id="goal-select" value={selectedGoalId} disabled={planEditing} onChange={async event => {
                 if (!conversation) return;

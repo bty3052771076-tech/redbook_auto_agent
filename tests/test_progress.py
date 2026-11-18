@@ -159,3 +159,13 @@ def test_wool_notice_survives_log_rollover_and_resume():
           'job_states': {'0': {'wool_notice': '今日暂未发现可核验且可领取的AI福利。'}}}
     activity = build_activity({'status': 'completed', 'events': []}, cp, now=120)
     assert '暂未发现可核验' in activity['summary']
+
+
+def test_source_refresh_has_material_guidance_not_uncertain_upload_guidance():
+    from backend.progress import _issue
+    issue = _issue("SOURCE_REFRESH_REQUIRED: daily ai digest high-impact material insufficient")
+    assert "材料不足" in issue["message"]
+    assert "核对平台已有草稿" not in issue["action"]
+    assert "原任务" in issue["action"]
+    uncertain = _issue("XHS_WRITE_UNCERTAIN: SOURCE_REFRESH_REQUIRED")
+    assert "保存结果不确定" in uncertain["message"]

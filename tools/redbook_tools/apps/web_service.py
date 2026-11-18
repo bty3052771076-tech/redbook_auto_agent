@@ -168,6 +168,8 @@ class Workbench:
         self.conversation_store = conversation_store or PostgresConversationStore()
         self.lock = threading.RLock()
         self.process: subprocess.Popen | None = None
+        self._process_job_id: str | None = None
+        self._process_identity: str | None = None
         self.jobs = JobJournal(self.directory / "jobs", active_statuses=ACTIVE)
         for path in (self.directory / "jobs").glob("*.json"):
             job = read_json(path, {})
@@ -1735,30 +1737,33 @@ class Workbench:
 
     def _run(self, job: dict, args: list[str], env: dict) -> None:
         from src.workflow.resources import process_identity
-        from src.integrations.local_process import release_process_services
         process, identity = None, None
         try:
             with self.lock:
+                if job.get('stop_requested_at') or job['status'] in {'stopping', 'cancelled'}:
+                    return
                 job.update(status="running", started_at=time.time())
                 self.persist(job)
                 self.process = subprocess.Popen(args, cwd=self.root, env=env, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
                 process = self.process
+                self._process_job_id = job['id']
                 identity = process_identity(process.pid)
+                self._process_identity = identity
             assert process.stdout is not None
             for line in process.stdout:
                 self.event(job, line)
             code = process.wait()
             agent_state = None
             completion_error = ""
-            if not code and job.get("kind") == "agent" and job["status"] != "stopping":
+            if not code and job.get("kind") == "agent" and not job.get('stop_requested_at') and job["status"] != "stopping":
                 try:
                     agent_state = self._agent_checkpoint_state(str(job.get("agent_run_id") or job["id"]))
                 except (RuntimeError, ValueError) as exc:
                     completion_error = str(exc)
             with self.lock:
-                cancelled = job["status"] == "stopping"
+                cancelled = bool(job.get('stop_requested_at') or job["status"] == "stopping")
                 status = "cancelled" if cancelled else "failed" if code else "partial_success" if job.get("has_warnings") else "completed"
                 if not cancelled and not code and job.get("kind") == "agent":
                     # Historical warnings remain visible, but only durable business
@@ -1775,31 +1780,96 @@ class Workbench:
                     job["message"] = f"任务退出码 {code}。请查看日志末尾错误，修正后重新提交；已保存草稿不会自动重传。"
                 self.persist(job)
         except Exception as exc:
-            self.event(job, f"启动或执行失败：{exc}")
-            job.update(status="failed", ended_at=time.time())
-            self.persist(job)
+            with self.lock:
+                if job.get('stop_requested_at'):
+                    exited = process is None or process.poll() is not None
+                    job.update(status='cancelled' if exited else 'stopping',
+                               ended_at=time.time() if exited else None)
+                    self.persist(job)
+                else:
+                    self.event(job, f"启动或执行失败：{exc}")
+                    job.update(status="failed", ended_at=time.time())
+                    self.persist(job)
         finally:
             if process is not None and process.poll() is not None:
                 try:
-                    release_process_services(process.pid, identity)
+                    self._release_job_services(job, process, identity)
                 except (OSError, subprocess.SubprocessError):
                     pass
             with self.lock:
-                self.process = None
+                if process is not None and self.process is process and process.poll() is not None:
+                    self.process = None
+                    self._process_job_id = None
+                    self._process_identity = None
 
     def stop(self, job_id: str) -> dict:
         with self.lock:
             job = self.jobs[valid_id(job_id)]
-            if job["status"] in ACTIVE and self.process:
-                job["status"] = "stopping"
+            process = self.process
+            owned = process is not None and self._process_job_id == job_id
+            if job['status'] not in ACTIVE and not (owned and process.poll() is None):
+                return self.redact(deepcopy(job))
+            if process is not None and not owned:
+                raise ValueError('JOB_PROCESS_OWNERSHIP_MISMATCH: 未停止其他任务的执行进程')
+            job.setdefault('stop_requested_at', time.time())
+            job.update(status='stopping', message='已请求停止；检查点、稿件和未确认的平台动作保留，不会自动重试。')
+            self.persist(job)
+            if process is None or process.poll() is not None:
+                job.update(status='cancelled', ended_at=time.time())
                 self.persist(job)
-                if os.name == "nt":
-                    from src.integrations.local_process import terminate_task_tree
-                    from src.workflow.resources import process_identity
-                    terminate_task_tree(self.process.pid, process_identity(self.process.pid))
+            elif not job.get('stop_dispatched_at'):
+                identity = self._process_identity
+                if not identity:
+                    job['stop_error'] = 'PROCESS_IDENTITY_UNKNOWN: 未确认进程身份，未发送终止信号'
+                    self.persist(job)
                 else:
-                    self.process.terminate()
-            return self.redact(job)
+                    job['stop_dispatched_at'] = time.time()
+                    self.persist(job)
+                    try:
+                        threading.Thread(target=self._stop_owned_process,
+                            args=(job, process, identity), daemon=True, name='stop-' + job_id).start()
+                    except Exception as exc:
+                        job.pop('stop_dispatched_at', None)
+                        job['stop_error'] = self.redact(str(exc))
+                        self.persist(job)
+            return self.redact(deepcopy(job))
+
+    def _stop_owned_process(self, job: dict, process: subprocess.Popen, identity: str) -> None:
+        from src.integrations.local_process import terminate_task_tree
+        error = ''
+        try:
+            # Use the birth identity captured at launch, never a recycled PID's identity.
+            terminate_task_tree(process.pid, identity)
+            if process.poll() is None:
+                error = 'PROCESS_STOP_UNCONFIRMED: 执行进程仍未退出，请核对；不会自动重试任务'
+            else:
+                self._release_job_services(job, process, identity)
+        except Exception as exc:
+            error = self.redact(str(exc))
+        with self.lock:
+            if error:
+                job['stop_error'] = error
+            else:
+                job.pop('stop_error', None)
+                job.update(status='cancelled', ended_at=time.time())
+                if self.process is process:
+                    self.process = None
+                    self._process_job_id = None
+                    self._process_identity = None
+            self.persist(job)
+
+    def _release_job_services(self, job: dict, process: subprocess.Popen, identity: str | None) -> None:
+        from src.integrations.local_process import release_process_services
+        with self.lock:
+            if job.get('services_release_started'):
+                return
+            job['services_release_started'] = True
+        try:
+            release_process_services(process.pid, identity)
+        except Exception:
+            with self.lock:
+                job.pop('services_release_started', None)
+            raise
 
     def list_jobs(self, *, limit: int = 100, before: str | None = None) -> list[dict]:
         with self.lock:

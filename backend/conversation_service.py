@@ -129,6 +129,40 @@ class ConversationService:
         from apps.web_service import read_json, valid_id
         return read_json(self.current.directory / 'jobs' / (valid_id(identity) + '.json'), {})
 
+    def stop_goal(self, conversation_id, goal_id, *, cancel=False,
+                  expected_goal_revision=None, expected_attempt_id=None):
+        """Fence the current attempt before stopping its locally owned worker."""
+        with self.current.lock:
+            goal = self.goals.snapshot(self.namespace, goal_id)
+            if goal['conversation_id'] != conversation_id:
+                raise PlanContractError('GOAL_NOT_FOUND', '目标不属于当前对话', status=404)
+            if expected_goal_revision not in (None, goal['revision']):
+                raise PlanContractError('GOAL_REVISION_CONFLICT', '目标已更新，请刷新后核对', status=409)
+            if expected_attempt_id not in (None, goal['active_attempt_id']):
+                raise PlanContractError('GOAL_ATTEMPT_CONFLICT', '活动执行已变化，请刷新后核对', status=409)
+            state = 'cancelled' if cancel or goal['state'] == 'cancelled' else 'paused'
+            # set_state alone lets an old worker overwrite this control during finalization.
+            with self.goals.knowledge_store.connection() as conn:
+                row = conn.execute('''UPDATE agent.conversation_goals SET state=%s,
+                    lease_epoch=lease_epoch+1,updated_at=now()
+                    WHERE namespace=%s AND conversation_id=%s AND goal_id=%s
+                    AND revision=%s AND active_attempt_id=%s AND lease_epoch=%s RETURNING goal_id''',
+                    (state, self.namespace, conversation_id, goal_id, goal['revision'],
+                     goal['active_attempt_id'], goal['lease_epoch'])).fetchone()
+            if not row:
+                raise PlanContractError('GOAL_ATTEMPT_CONFLICT', '目标执行已变化，未停止其他执行', status=409)
+            job = self._job(goal)
+            error = ''
+            if job:
+                try:
+                    job = self.current.stop(goal['active_attempt_id'])
+                except (ValueError, KeyError, OSError, RuntimeError) as exc:
+                    error = self.current.redact(str(exc))
+            pending = bool(error or job and job.get('status') in ACTIVE)
+            return {'goal': self.goals.snapshot(self.namespace, goal_id), 'job': job,
+                    'status': 'stopping' if pending else state, 'stop_pending': pending,
+                    'error': error or (job or {}).get('stop_error', '')}
+
     def _message(self, cid, turn, text):
         saved = self.current._read_agent_conversation(cid)
         mid = turn['source_message_id']
@@ -200,6 +234,10 @@ class ConversationService:
         if not claim:
             return {'turn': self.goals.turn(self.namespace, turn['turn_id']), 'action': 'accepted', 'plan': None, 'run': None, 'goal': None}
         turn = claim
+        if turn['kind'] in {'pause_goal', 'cancel_goal'}:
+            # A recovered control must not attach itself to a newer attempt.
+            request = {**request, **{key: turn['command_payload'][key] for key in
+                ('goal_id', 'expected_goal_revision', 'expected_attempt_id') if key in turn['command_payload']}}
         rows = self.ensure_goals(cid)
         new_intent = re.sub(r'(?:不要|不用|不必|无需|禁止)\s*(?:再)?\s*(?:另开(?:新任务|一批)?|新一批|新建任务|重新开始)', '', content)
         explicit_new = bool(re.search(r'另开|新一批|新建任务|重新开始', new_intent))
@@ -244,12 +282,21 @@ class ConversationService:
             reply = '“再来”是补齐原目标，还是额外增加？请明确后继续。'
         elif control:
             action = control
-            reply = '已收到，等待当前操作结束后' + ('取消任务。' if control == 'cancel_goal' else '暂停后续生成和上传。')
-            command = {**turn['command_payload'], 'kind': action, 'goal_id': goal['goal_id']}
+            command = {**turn['command_payload'], 'kind': action, 'goal_id': goal['goal_id'],
+                       'expected_attempt_id': goal['active_attempt_id'], 'expected_goal_revision': goal['revision']}
             turn = self.goals.update_turn(self.namespace, turn['turn_id'], state='queued', command=command, goal_id=goal['goal_id'])
-            if not (self._job(goal) and self._job(goal).get('status') in ACTIVE):
-                self.goals.set_state(self.namespace, goal['goal_id'],
-                    'cancelled' if control == 'cancel_goal' else 'paused', expected_epoch=goal['lease_epoch'])
+            stopped = self.stop_goal(cid, goal['goal_id'], cancel=control == 'cancel_goal',
+                expected_goal_revision=goal['revision'], expected_attempt_id=goal['active_attempt_id'])
+            goal = stopped['goal']
+            if stopped['stop_pending']:
+                reply = '已记录取消请求。' if goal['state'] == 'cancelled' else '已记录暂停请求。'
+                reply += '对应执行仍在停止中，尚未确认退出。'
+            else:
+                reply = ('目标已取消。' if goal['state'] == 'cancelled' else '目标已暂停。')
+                reply += '对应执行已停止或未启动。'
+            reply += '检查点和已有稿件保留；平台未确认动作仍需核对，不会自动重试。'
+            if stopped['error']:
+                reply += '停止未确认：' + stopped['error']
         elif amendment:
             return self._amend(cid, turn, goal)
         elif continuation:
@@ -312,8 +359,9 @@ class ConversationService:
             message, assistant = self._message(cid, turn, reply)
         response = {'message': message, 'assistant': assistant, 'plan': plan, 'run': run,
                     'action': action, 'goal': self.goals.snapshot(self.namespace, goal['goal_id']) if goal else None}
-        pending = action in {'pause_goal', 'cancel_goal'} and bool(self._job(goal) and self._job(goal).get('status') in ACTIVE)
-        turn = self.goals.update_turn(self.namespace, turn['turn_id'], state='queued' if pending else 'applied',
+        if action in {'pause_goal', 'cancel_goal'}:
+            response['stop'] = {key: value for key, value in stopped.items() if key != 'goal'}
+        turn = self.goals.update_turn(self.namespace, turn['turn_id'], state='applied',
                     command={**turn['command_payload'], 'kind': action, 'goal_id': goal['goal_id'] if goal else None},
                     goal_id=goal['goal_id'] if goal else None, result={'response': response})
         response['turn'] = turn

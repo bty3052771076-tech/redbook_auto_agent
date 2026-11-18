@@ -154,7 +154,7 @@ def test_default_choice_persists_on_selection_and_reopen(selection_page, selecti
         expect(page.get_by_text('默认角色已保存', exact=True)).to_be_visible()
         expect(page.get_by_role('button', name=label, exact=True)).to_contain_text(name)
     assert current.providers()['bindings'] == {'agent': first, 'writer': second, 'image': ''}
-    page.get_by_role('button', name='对话任务', exact=True).click()
+    page.get_by_role('navigation', name='主导航').get_by_role('button', name='人工计划', exact=True).click()
     page.get_by_role('button', name='连接与模型', exact=True).click()
     page.get_by_role('tab', name='默认角色', exact=True).click()
     expect(page.get_by_role('button', name='智能体主控模型', exact=True)).to_contain_text('first')
@@ -261,7 +261,7 @@ def test_task_override_requires_apply_and_never_changes_defaults(selection_page,
     page.get_by_role('button', name='智能体主控模型', exact=True).click()
     page.get_by_role('option', name='Local test · first', exact=True).click()
     expect(page.get_by_text('默认角色已保存', exact=True)).to_be_visible()
-    page.get_by_role('button', name='对话任务', exact=True).click()
+    page.get_by_role('navigation', name='主导航').get_by_role('button', name='人工计划', exact=True).click()
     page.locator('#prompt').fill('生成1条每日新闻，不上传')
     page.get_by_role('button', name='发送', exact=True).click()
     page.get_by_text('本次模型', exact=True).click()
@@ -288,7 +288,7 @@ def test_task_override_requires_apply_and_never_changes_defaults(selection_page,
 def test_task_picker_can_save_defaults_for_new_tasks_after_restart(selection_page, selection_store, monkeypatch, tmp_path):
     page = selection_page
     current, (first, second), conversations = selection_store
-    page.get_by_role('button', name='对话任务', exact=True).click()
+    page.get_by_role('navigation', name='主导航').get_by_role('button', name='人工计划', exact=True).click()
     page.locator('#prompt').fill('生成1条每日新闻，不上传')
     page.get_by_role('button', name='发送', exact=True).click()
     page.get_by_text('本次模型', exact=True).click()
@@ -326,7 +326,7 @@ def test_task_picker_can_save_defaults_for_new_tasks_after_restart(selection_pag
 def test_task_default_save_failure_preserves_existing_defaults(selection_page, selection_store):
     page = selection_page
     current, (first, _), _ = selection_store
-    page.get_by_role('button', name='对话任务', exact=True).click()
+    page.get_by_role('navigation', name='主导航').get_by_role('button', name='人工计划', exact=True).click()
     page.locator('#prompt').fill('生成1条每日新闻，不上传')
     page.get_by_role('button', name='发送', exact=True).click()
     page.get_by_text('本次模型', exact=True).click()
@@ -409,7 +409,7 @@ def test_saving_task_defaults_refreshes_confirmation_fingerprint(selection_page,
     from backend.plan_service import PlanService
     page = selection_page
     current, _, _ = selection_store
-    page.get_by_role('button', name='对话任务', exact=True).click()
+    page.get_by_role('navigation', name='主导航').get_by_role('button', name='人工计划', exact=True).click()
     page.locator('#prompt').fill('生成1条每日新闻，不上传')
     page.get_by_role('button', name='发送', exact=True).click()
     if origin == 'global':
@@ -422,7 +422,7 @@ def test_saving_task_defaults_refreshes_confirmation_fingerprint(selection_page,
     page.get_by_role('option', name='Local test · first', exact=True).click()
     if origin == 'global':
         expect(page.get_by_text('默认角色已保存', exact=True)).to_be_visible()
-        page.get_by_role('button', name='对话任务', exact=True).click()
+        page.get_by_role('navigation', name='主导航').get_by_role('button', name='人工计划', exact=True).click()
     else:
         page.get_by_role('button', name='保存为默认模型', exact=True).click()
         expect(page.get_by_role('status').filter(has_text='默认模型已保存')).to_be_visible()

@@ -49,7 +49,7 @@ def test_resumed_progress_renders_retained_items_without_network(tmp_path, monke
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.route("**/*", route)
         page.add_init_script(f"localStorage.setItem('agent-conversation', '{cid}')")
-        page.goto("http://127.0.0.1:8786/")
+        page.goto("http://127.0.0.1:8786/#manual")
         progress = page.locator(".live-message .run-progress")
         expect(progress.get_by_text("保留待上传 1", exact=False)).to_be_visible()
         expect(progress.get_by_text("保留下来的合格新闻", exact=True)).to_be_visible()

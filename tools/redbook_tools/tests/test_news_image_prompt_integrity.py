@@ -226,7 +226,7 @@ def test_repair_passes_full_override_with_clean_event(monkeypatch, tmp_path):
 
     def fake_fetch(**kwargs):
         captured.update(kwargs)
-        return [image_path], [{"provider": "minimax", "prompt": kwargs["prompt_override"]}], None
+        return [image_path], [{"provider": "minimax"}], None
 
     monkeypatch.setattr(create_post, "_fetch_daily_news_related_images", fake_fetch)
     monkeypatch.setattr(create_post, "_build_asset_infos", lambda paths: [AssetInfo(path=str(paths[0]))])
@@ -235,9 +235,8 @@ def test_repair_passes_full_override_with_clean_event(monkeypatch, tmp_path):
     event = post.platform["news"]["image_event"]
     assert create_post.regenerate_daily_news_post_image(post, "近岸场景错误，船体状态不符", provider="minimax")
     assert captured["prompt_hint"] == event
-    assert "局部修正：" in captured["prompt_override"]
-    assert event in captured["prompt_override"]
-    assert "500海里" in captured["prompt_override"]
+    assert "地点、远近关系" in captured["repair_hint"]
+    assert "500海里" in captured["prompt_hint"]
     assert captured["image_policy"] == "ai_required"
 
 
@@ -245,8 +244,8 @@ def test_repair_passes_full_override_with_clean_event(monkeypatch, tmp_path):
 def test_minimax_receives_complete_prompt_and_only_one_image(monkeypatch, tmp_path, repair):
     post = _post()
     event = post.platform["news"]["image_event"]
-    expected = auto_image._build_aliyun_image_prompt(
-        title=post.title, body=post.body, topics=post.topics, prompt_hint=event,
+    expected = auto_image._build_minimax_news_image_prompt(
+        title=post.title, body=post.body, prompt_hint=event,
         repair_hint=create_post._daily_news_image_repair_hint("船体状态不对") if repair else "",
     )
     requests = []
@@ -262,12 +261,13 @@ def test_minimax_receives_complete_prompt_and_only_one_image(monkeypatch, tmp_pa
     paths, metas, fallback = create_post._fetch_daily_news_related_images(
         title=post.title, body=post.body, topics=post.topics, prompt_hint=event,
         dest_dir=tmp_path / "assets", ai_first=True, provider="minimax", image_policy="ai_required",
-        prompt_override=expected if repair else None,
+        repair_hint=create_post._daily_news_image_repair_hint("船体状态不对") if repair else "",
     )
     assert len(requests) == len(paths) == 1
     assert requests[0]["prompt"] == expected == metas[0]["prompt"]
     assert requests[0]["n"] == 1 and requests[0]["prompt_optimizer"] is False
-    assert metas[0]["prompt_version"] == auto_image.NEWS_IMAGE_PROMPT_VERSION
+    assert metas[0]["prompt_version"] == auto_image.MINIMAX_NEWS_IMAGE_PROMPT_VERSION
+    assert requests[0]["prompt"].startswith("One full-bleed, completely wordless illustration.")
     assert fallback is None
 
 
@@ -325,10 +325,36 @@ def test_minimax_draws_visual_scene_not_copied_statement_provenance(monkeypatch,
         provider="minimax", image_policy="ai_required",
     )
     assert len(paths) == len(requests) == 1 and fallback is None
-    assert requests[0]["prompt"].startswith(scene + "\n")
+    assert scene in requests[0]["prompt"]
     assert fact not in requests[0]["prompt"]
     assert "动用一切武器" not in requests[0]["prompt"]
     assert auto_image._news_image_fact_context(body) == fact
+
+
+def test_minimax_strips_rejected_document_copy_and_legacy_boilerplate():
+    prompt = auto_image._build_minimax_news_image_prompt(
+        title="发言人回应芯片限令", body="",
+        prompt_hint="11月17日，发言人回应《限制远程获取先进半导体》并称“这不是最终决定”的概念示意，"
+                    "采用非写实新闻插画，围绕上述主体、动作和对象构图，背景简洁。保持事实中的计划、归因或否定状态。",
+    )
+    assert "发言人回应" in prompt
+    assert "completely wordless" in prompt and "glyphs" in prompt
+    for raw in ("11月17日", "限制远程获取先进半导体", "这不是最终决定", "采用非写实新闻插画", "保持事实中的"):
+        assert raw not in prompt
+
+
+def test_minimax_honors_explicit_column_prompt(monkeypatch, tmp_path):
+    received = []
+    def fake_fetch(**kwargs):
+        received.append(kwargs["prompt_override"])
+        return [tmp_path / "mock.png"], [{"provider": "minimax"}]
+
+    monkeypatch.setattr(create_post, "fetch_and_download_related_images", fake_fetch)
+    create_post._fetch_daily_news_related_images(
+        title="专栏", body="", topics=[], prompt_hint="场景", dest_dir=tmp_path,
+        ai_first=True, provider="minimax", prompt_override="栏目单独指定的配图",
+    )
+    assert received == ["栏目单独指定的配图"]
 
 
 def test_unverified_provenance_and_nonconcept_scenes_are_not_silently_removed():

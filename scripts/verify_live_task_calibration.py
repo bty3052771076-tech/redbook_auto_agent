@@ -130,7 +130,7 @@ def verify(runtime: Path, resume: Path | None = None) -> dict:
                 page = browser.new_page(viewport={'width': 1440, 'height': 1000})
                 page_errors = []
                 page.on('pageerror', lambda error: page_errors.append(str(error)))
-                page.goto(f'http://127.0.0.1:{port}')
+                page.goto(f'http://127.0.0.1:{port}/#manual')
                 result['stage'] = 'calibration'
                 if previous:
                     rows = store.list()

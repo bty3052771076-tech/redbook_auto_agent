@@ -683,11 +683,12 @@ def _build_graph(
                 "STAGE_PENDING_OR_UNKNOWN", "STAGE_LEASE_LOST", "MODEL_CAPACITY_UNCERTAIN", "IMAGE_CACHE_INVALID",
                 'CONTEXT_REQUIRED_INPUT_TOO_LARGE', 'CONTEXT_COMPACTION_REQUIRED',
             ))
-            material_exhausted = job.kind == "daily_ai_digest" and repeated >= 3 and any(
+            collection_exhausted = job.kind == "daily_ai_digest" and "AI_DIGEST_MATERIAL_EXHAUSTED:" in state["last_failure"]
+            material_exhausted = collection_exhausted or (job.kind == "daily_ai_digest" and repeated >= 3 and any(
                 marker in state["last_failure"] for marker in (
                     "daily ai digest material insufficient", "daily ai digest official material insufficient",
                     "daily ai digest high-impact material insufficient", "SOURCE_DIVERSITY_REQUIRED",
-                    "AI讯息材料不足"))
+                    "AI讯息材料不足")))
             verification_incomplete = "WOOL_VERIFICATION_INCOMPLETE" in state["last_failure"]
             if verification_incomplete:
                 record["wool_notice"] = state["last_failure"].split("WOOL_VERIFICATION_INCOMPLETE:", 1)[-1].strip()
@@ -698,6 +699,8 @@ def _build_graph(
                           if capability_denied else
                           "AI_DIGEST_BODY_RESOLUTION_REQUIRED: 正文无法满足800字符上限，已保留进度；请修正正文排版后续跑，不重采资讯；"
                           if body_budget_failed else
+                          "SOURCE_REFRESH_REQUIRED: 已完成本轮信源采集和补搜，暂无合格资讯；已保留其他进度，请检查信源诊断后仅恢复缺失栏目；"
+                          if collection_exhausted else
                           "SOURCE_REFRESH_REQUIRED: 连续三次相同资讯材料错误，需补充或修正可核验材料后续跑；"
                           if material_exhausted else
                           "SOURCE_VERIFICATION_REQUIRED: 请检查福利信源状态，恢复后续跑；"

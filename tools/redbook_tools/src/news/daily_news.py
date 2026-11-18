@@ -3807,7 +3807,7 @@ def _fetch_news_provider(
                     "gl": "CN" if is_cn_rss else (os.getenv("GOOGLE_NEWS_RSS_GL") or "US").strip(),
                 }
                 candidates = _google_rss_fetch_articles(
-                    query=query,
+                    query=f"{query} when:{max(1, (end_dt - start_dt).days + 1)}d",
                     max_records=max_records,
                     timeout_s=provider_timeout_s,
                     language="zh-CN" if is_cn_rss else None,
@@ -4658,7 +4658,7 @@ def fetch_daily_news_candidates(
                         "gl": "CN" if is_cn_rss else (os.getenv("GOOGLE_NEWS_RSS_GL") or "US").strip(),
                     }
                     candidates = _google_rss_fetch_articles(
-                        query=q,
+                        query=f"{q} when:{search_days}d",
                         max_records=max_records,
                         timeout_s=provider_timeout_s,
                         language="zh-CN" if is_cn_rss else None,

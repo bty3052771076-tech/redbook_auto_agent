@@ -168,7 +168,7 @@ def prepare(browser, scenario):
     page = context.new_page()
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
-    page.goto(BASE)
+    page.goto(BASE + '/#manual')
     page.wait_for_load_state("networkidle")
     expect(page.locator("#conversation-select")).to_have_value(CID)
     return context, page, errors
@@ -195,7 +195,7 @@ def test_continue_keeps_plan_counts_and_pending_turn_survive_reopen(browser, tmp
     expect(page.get_by_label("对话指令状态")).to_contain_text("待生效")
     page.close()
     page = context.new_page()
-    page.goto(BASE)
+    page.goto(BASE + '/#manual')
     expect(page.get_by_label("对话指令状态")).to_contain_text("待生效")
     scenario.conversation["turns"][-1].update(state="applied", result={"revision": 4, "applied_at": 1792022400})
     expect(page.get_by_label("对话指令状态")).to_contain_text("已应用", timeout=8000)

@@ -540,7 +540,7 @@ def test_live_gui_continuation_uuid_original_pg_thread_and_refresh(live):
             page.on("response", lambda response: failed_api.append({"url": response.url, "status": response.status})
                     if "/api/" in response.url and response.status >= 400 else None)
             try:
-                page.goto(live.base_url, wait_until="networkidle")
+                page.goto(live.base_url.rstrip('/') + '/#manual', wait_until="networkidle")
                 row["served_script_urls"] = page.locator("script[src]").evaluate_all("nodes => nodes.map(node => node.src)")
                 page.locator("#conversation-select").select_option(live.cid)
                 expect(page.get_by_label("当前目标", exact=True)).to_have_value(live.goal["goal_id"])
@@ -621,7 +621,7 @@ def test_live_unstarted_goal_and_saved_candidate_survive_refresh(live):
             page = browser.new_page(viewport={'width': 1366, 'height': 900})
             errors = []
             page.on('pageerror', lambda error: errors.append(str(error)))
-            page.goto(live.base_url, wait_until='networkidle')
+            page.goto(live.base_url.rstrip('/') + '/#manual', wait_until='networkidle')
             page.locator('#prompt').fill('生成1条每日新闻，仅生成本地稿')
             page.get_by_role('button', name='发送', exact=True).click()
             expect(page.locator('.plan-pane .plan-list')).to_contain_text('1 条')

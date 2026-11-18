@@ -1,0 +1,5 @@
+# Private worker overlay only; do not install into the shared virtualenv.
+# Verified with langchain-core 1.6.5 and the project's existing PostgreSQL saver.
+langchain==1.2.0
+langgraph==1.0.5
+langgraph-prebuilt==1.0.5

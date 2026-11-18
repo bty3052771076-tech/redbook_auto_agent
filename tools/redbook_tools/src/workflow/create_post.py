@@ -54,7 +54,9 @@ from src.ai_digest.render import render_ai_digest_cards
 from src.images.auto_image import (
     ImageGenerationAbandoned,
     NEWS_IMAGE_PROMPT_VERSION,
+    MINIMAX_NEWS_IMAGE_PROMPT_VERSION,
     _build_aliyun_image_prompt,
+    _build_minimax_news_image_prompt,
     _news_image_fact_context,
     clean_news_image_event,
     fetch_and_download_related_images,
@@ -4186,6 +4188,7 @@ def _fetch_daily_news_related_images(
     provider: Optional[str] = None,
     image_policy: str = "ai_preferred",
     prompt_override: Optional[str] = None,
+    repair_hint: str = "",
 ) -> tuple[list[Path], list[dict[str, Any]], dict[str, Any] | None]:
     if not ai_first:
         paths, metas = fetch_and_download_related_images(
@@ -4214,6 +4217,17 @@ def _fetch_daily_news_related_images(
             provider="pexels",
         )
         return paths, metas, None
+    prompt_version = NEWS_IMAGE_PROMPT_VERSION
+    if prompt_override is None:
+        if primary_provider in {"minimax", "mini-max", "tokenplan", "token-plan"}:
+            prompt_override = _build_minimax_news_image_prompt(
+                title=title, body=body, prompt_hint=prompt_hint, repair_hint=repair_hint,
+            )
+            prompt_version = MINIMAX_NEWS_IMAGE_PROMPT_VERSION
+        elif repair_hint:
+            prompt_override = _build_aliyun_image_prompt(
+                title=title, body=body, topics=topics, prompt_hint=prompt_hint, repair_hint=repair_hint,
+            )
     try:
         paths, metas = fetch_and_download_related_images(
             title=title,
@@ -4227,7 +4241,7 @@ def _fetch_daily_news_related_images(
             prompt_override=prompt_override,
         )
         for meta in metas:
-            meta["prompt_version"] = NEWS_IMAGE_PROMPT_VERSION
+            meta["prompt_version"] = prompt_version
         return paths, metas, None
     except Exception as exc:
         if required_ai:
@@ -4307,13 +4321,6 @@ def regenerate_daily_news_post_image(
     )
     if image_event:
         news_meta["image_event"] = image_event
-    prompt_override = _build_aliyun_image_prompt(
-        title=post.title,
-        body=post.body,
-        topics=post.topics,
-        prompt_hint=image_event,
-        repair_hint=_daily_news_image_repair_hint(retry_prompt),
-    )
     image_paths, image_metas, image_fallback = _fetch_daily_news_related_images(
         title=_preferred_image_title(post, post.title),
         body=post.body,
@@ -4324,7 +4331,7 @@ def regenerate_daily_news_post_image(
         ai_first=True,
         provider=provider,
         image_policy=str(news_meta.get("image_policy") or "ai_required"),
-        prompt_override=prompt_override,
+        repair_hint=_daily_news_image_repair_hint(retry_prompt),
     )
     if not image_paths:
         return False
@@ -6982,7 +6989,24 @@ def create_daily_ai_digest_posts(
                 if lookback_meta["mode"] == "auto_expand"
                 else f"fixed {max(lookback_windows)}-day window"
             )
-            raise RuntimeError(f"daily ai digest material insufficient: {window_label}; {exc}") from exc
+            diagnostics = dict(auto_collection_meta.get("pool_diagnostics") or {})
+            diagnostics["impact_candidates"] = len(evaluation_pool)
+            diagnostics["high_impact"] = sum(bool(row.get("high_impact")) for row in impact_scores.values())
+            if progress is not None:
+                progress("selection_diagnostics", json.dumps(diagnostics, ensure_ascii=False))
+                for item in evaluation_pool[:100]:
+                    progress("impact_candidate", json.dumps({
+                        "title": item.title[:160], "url": item.url, "published_at": item.published_at,
+                        "category": ai_update_category(item),
+                        "historical": ai_update_history_key(item) in selection_historical_keys,
+                        **(impact_scores.get(item.dedupe_key) or {}),
+                    }, ensure_ascii=False))
+            # Collection has already tried the configured backfills. Repeating
+            # this whole pass immediately cannot repair the missing evidence.
+            raise RuntimeError(
+                f"AI_DIGEST_MATERIAL_EXHAUSTED: daily ai digest material insufficient: {window_label}; {exc}; "
+                f"diagnostics={json.dumps(diagnostics, ensure_ascii=False, sort_keys=True)}"
+            ) from exc
         target_count = len(items)
         fallback_tiers = adaptive_selection_meta.get("fallback_tiers") or {}
         if (

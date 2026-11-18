@@ -637,6 +637,8 @@ async def model_platforms(path: str, request: Request):
                                    data, request.headers.get("Idempotency-Key", ""))
 
 app.include_router(create_wool_library_router(service), dependencies=[Depends(authenticated)])
+from .dialogue_api import create_dialogue_router
+app.include_router(create_dialogue_router(service, app), dependencies=[Depends(authenticated)])
 from .capabilities import create_capability_router
 app.include_router(create_capability_router(service, runtime_root=RUNTIME), dependencies=[Depends(authenticated)])
 
@@ -683,6 +685,9 @@ def startup():
 
 @app.on_event('shutdown')
 def shutdown_goal_control():
+    dialogue = getattr(app.state, 'dialogue', None)
+    if dialogue is not None:
+        dialogue.close()
     stop = getattr(app.state, 'goal_control_stop', None)
     if stop is not None:
         stop.set()

@@ -107,3 +107,32 @@ def test_first_source_failure_does_not_inherit_unrelated_retry_count(tmp_path):
     )
     assert result.status == "completed"
     assert len(calls) == 5
+
+
+def test_exhausted_collection_stops_once_and_resume_only_generates_missing_digest(tmp_path):
+    ready = [False]
+    generated, delivered = [], []
+
+    def generate(job, context):
+        generated.append(job.kind)
+        if job.kind == "daily_ai_digest" and not ready[0]:
+            raise RuntimeError("AI_DIGEST_MATERIAL_EXHAUSTED: daily ai digest material insufficient")
+        return [Post(job.kind)]
+
+    jobs = [agent.AgentJob("daily_news", "News"), agent.AgentJob("daily_ai_digest", "AI")]
+    tools = agent.EditorialAgentTools(lambda job: {}, generate, lambda *a: [],
+        lambda job, post, ctx: (delivered.append(post.id) or True, "saved"),
+        load_posts=lambda ids: [Post(post_id) for post_id in ids])
+    first = agent.run_editorial_agent(jobs, tools=tools,
+        config=agent.EditorialAgentConfig(checkpoint_dir=tmp_path, retry_delay_s=0))
+    assert first.status == "partial"
+    assert generated == ["daily_news", "daily_ai_digest"]
+    assert delivered == ["daily_news"]
+    assert any("SOURCE_REFRESH_REQUIRED" in error for error in first.errors)
+    ready[0] = True
+    resumed = agent.run_editorial_agent(jobs, tools=tools,
+        config=agent.EditorialAgentConfig(checkpoint_dir=tmp_path, retry_delay_s=0,
+            resume_from=first.checkpoint_path))
+    assert resumed.status == "completed"
+    assert generated == ["daily_news", "daily_ai_digest", "daily_ai_digest"]
+    assert delivered == ["daily_news", "daily_ai_digest"]

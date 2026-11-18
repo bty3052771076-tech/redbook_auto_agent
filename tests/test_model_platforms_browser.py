@@ -75,7 +75,7 @@ def test_agent_model_management_and_per_plan_selection_with_real_backend(tmp_pat
             page.get_by_role('tab', name='模型目录', exact=True).click()
             page.get_by_role('button', name='测试结构化', exact=True).click()
             expect(page.get_by_text('验证通过', exact=True)).to_be_visible(timeout=15000)
-            page.get_by_role('button', name='对话任务', exact=True).click()
+            page.get_by_role('navigation', name='主导航').get_by_role('button', name='人工计划', exact=True).click()
             page.locator('#prompt').fill('生成1条每日新闻，不上传')
             page.get_by_role('button', name='发送', exact=True).click()
             page.get_by_text('本次模型', exact=True).click()

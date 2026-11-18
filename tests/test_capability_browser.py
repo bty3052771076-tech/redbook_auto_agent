@@ -235,7 +235,7 @@ def ui(frontend_url):
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.route("**/api/**", contract)
-        page.goto(frontend_url)
+        page.goto(frontend_url.rstrip('/') + '/#manual')
         yield page, requests, state, errors, frontend_url
         browser.close()
 
@@ -277,7 +277,7 @@ def test_cold_browser_can_enter_readonly_capabilities_when_business_data_is_unav
     page.goto(url+'#capabilities/tools')
     expect(page.get_by_role('button',name='检索新闻',exact=True)).to_be_visible()
     expect(page.get_by_role('switch',name='启用检索新闻',exact=True)).to_be_disabled()
-    page.get_by_role('button',name='对话任务',exact=True).click()
+    page.get_by_role('navigation', name='主导航').get_by_role('button',name='人工计划',exact=True).click()
     expect(page.get_by_label('任务要求',exact=True)).to_have_count(0)
     state.update(database_unavailable=False, business_unavailable=False)
     page.get_by_role('button',name='重新读取业务数据',exact=True).click()

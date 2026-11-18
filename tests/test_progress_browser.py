@@ -52,7 +52,7 @@ class Scenario:
 
     def route(self, route):
         request = route.request
-        path = request.url.split("8786", 1)[1]
+        path = urlsplit(request.url).path
         self.calls.append((request.method, path))
         if path == f"/api/runs/{RID}" and self.offline:
             route.abort("connectionfailed")
@@ -72,6 +72,8 @@ class Scenario:
             data = {"rows": [{**self.run(), "status_label": "执行中", "display_message": "生成内容与配图"}]}
         elif path == f"/api/runs/{RID}":
             data = self.run()
+        elif path == f"/api/runs/{RID}/log":
+            data = {'rows': self.run()['events'], 'has_more': False, 'truncated': False}
         elif path == "/api/drafts":
             data = {"rows": []}
         elif path == "/api/connections":
@@ -123,9 +125,9 @@ def prepare(browser, scenario, *, restore=True):
     page = context.new_page()
     errors = []
     page.on("pageerror", lambda error: errors.append(str(error)))
-    page.goto(BASE)
+    page.goto(BASE + '/#manual')
     page.wait_for_load_state("networkidle")
-    expect(page.get_by_role("heading", name="任务对话", exact=True)).to_be_visible()
+    expect(page.get_by_role("heading", name="人工计划", exact=True)).to_be_visible()
     return context, page, errors
 
 
